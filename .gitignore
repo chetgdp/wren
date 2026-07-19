@@ -1,0 +1,21 @@
+.DS_Store
+
+# env / caches
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# models are fetched, not committed (./fetch-models.sh, or HF hub for torch)
+models/
+
+# audio; everything in samples/ stays tracked
+archived_samples/
+outputs/
+
+# scratch, vendored checkouts, tool state
+research/
+parakeet.cpp/
+.giverny/
+
+.DS_Store

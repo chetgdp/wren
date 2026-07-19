@@ -1,0 +1,36 @@
+[project]
+name = "voice-ml"
+version = "0.1.0"
+description = "Voice cloning (tts/) + speech-to-text (transcribe/) on Apple Silicon"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "soundfile>=0.14.0",
+    "tqdm>=4.68.1",
+    "mlx-whisper>=0.4.3",
+    "yt-dlp>=2026.3.17",
+    "sounddevice>=0.5.5",
+    "pedalboard>=0.9.24",
+]
+
+# mlx (mlx-audio) and torch (qwen-tts) pin incompatible transformers majors,
+# so they are conflicting groups. mlx is on by default; for the legacy
+# PyTorch path use: uv run --no-group mlx --group torch tts/clone.py ...
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]
+mlx = [
+    "mlx-audio>=0.4.4",
+]
+torch = [
+    "torch>=2.12.0",
+    "qwen-tts>=0.1.1",
+]
+
+[tool.uv]
+package = false
+default-groups = ["dev", "mlx"]
+conflicts = [
+    [{ group = "mlx" }, { group = "torch" }],
+]

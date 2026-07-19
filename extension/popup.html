@@ -1,0 +1,21 @@
+<!doctype html>
+<meta charset="utf-8" />
+<style>
+  body { font: 13px system-ui; margin: 0; min-width: 240px; }
+  #greeting { padding: 10px 12px; }
+  form { display: flex; gap: 6px; padding: 0 12px 10px; }
+  input { font: inherit; padding: 4px 6px; border: 1px solid #bbb; border-radius: 3px; min-width: 0; }
+  #host { flex: 3; }
+  #port { flex: 1; width: 5ch; }
+  form button { padding: 4px 10px; border: 1px solid #bbb; border-radius: 3px; background: #f5f5f5; font: inherit; cursor: pointer; }
+  #stop { display: block; width: 100%; padding: 8px 12px; border: 0; border-top: 1px solid #ddd; background: none; font: inherit; text-align: left; cursor: pointer; }
+  #stop:hover { background: #eee; }
+</style>
+<div id="greeting">checking daemon…</div>
+<form id="addr">
+  <input id="host" placeholder="host" />
+  <input id="port" placeholder="port" inputmode="numeric" />
+  <button type="submit">Save</button>
+</form>
+<button id="stop">Stop speaking</button>
+<script src="popup.js"></script>
