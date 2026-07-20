@@ -12,13 +12,12 @@ const BLOCK_SELECTOR =
 const SKIP_ANCESTORS = "nav, aside, footer, header, form, [role=navigation]";
 
 
-function extractReadable() {
-  const root = document.body;
+// Shared tail of every extractor: normalize whitespace, drop empties and
+// nested duplicates, ensure terminal punctuation.
+function toBlocks(candidates) {
   const collected = [];
   const blocks = [];
-  for (const el of root.querySelectorAll(BLOCK_SELECTOR)) {
-    if (el.tagName === "PRE") continue; // code: server drops fences, we drop pre
-    if (el.closest(SKIP_ANCESTORS)) continue;
+  for (const el of candidates) {
     if (collected.some((a) => a.contains(el))) continue; // e.g. p inside li
     const text = el.innerText.replace(/\s+/g, " ").trim();
     if (text.length < 2) continue;
@@ -28,6 +27,38 @@ function extractReadable() {
     blocks.push(/[.!?:;,]$/.test(text) ? text : text + ".");
   }
   return { blocks, elements: collected };
+}
+
+// X (Twitter) articles render the body as Draft.js divs with no semantic
+// tags, so the generic selector finds nothing. Title + each data-block div,
+// scoped to the article view so reply composers and sidebar stay out.
+function extractXArticle() {
+  const view = document.querySelector(
+    '[data-testid="twitterArticleReadView"]'
+  );
+  if (!view) return null;
+  const candidates = [
+    ...view.querySelectorAll(
+      '[data-testid="twitter-article-title"], ' +
+        '[data-testid="longformRichTextComponent"] [data-block="true"]'
+    ),
+  ];
+  const out = toBlocks(candidates);
+  return out.blocks.length ? out : null;
+}
+
+function extractGeneric() {
+  const candidates = [];
+  for (const el of document.body.querySelectorAll(BLOCK_SELECTOR)) {
+    if (el.tagName === "PRE") continue; // code: server drops fences, we drop pre
+    if (el.closest(SKIP_ANCESTORS)) continue;
+    candidates.push(el);
+  }
+  return toBlocks(candidates);
+}
+
+function extractReadable() {
+  return extractXArticle() ?? extractGeneric();
 }
 
 // --- highlight of the block range currently being spoken ---
