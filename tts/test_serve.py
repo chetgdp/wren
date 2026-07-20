@@ -929,3 +929,305 @@ def test_token_required_on_every_endpoint():
             assert e.code == 401
     finally:
         server.shutdown()
+# --- qwentts.cpp backend tests ---
+
+import base64
+import subprocess
+from unittest.mock import patch
+
+import pytest
+
+
+def _make_wav_bytes(sr=24000, duration=0.5, freq=440):
+    """Generate minimal WAV file bytes for testing."""
+    import struct
+    n_samples = int(sr * duration)
+    data = b"".join(
+        struct.pack("<h", int(32767 * 0.3 * ((i % 100) - 50) / 50))
+        for i in range(n_samples)
+    )
+    return (
+        b"RIFF"
+        + struct.pack("<I", 36 + len(data))
+        + b"WAVE"
+        + b"fmt "
+        + struct.pack("<IHHIIHH", 16, 1, sr, sr * 2, 2, 16, 0)
+        + b"data"
+        + struct.pack("<I", len(data))
+        + data
+    )
+
+
+def _wav_b64(wav_bytes=None):
+    """Base64-encode a minimal WAV for voice registration."""
+    if wav_bytes is None:
+        wav_bytes = _make_wav_bytes()
+    return base64.b64encode(wav_bytes).decode("ascii")
+
+
+class MockSubprocessProc:
+    """Stub subprocess.Popen return value for mocking."""
+    def __init__(self):
+        self.returncode = 0
+
+    def poll(self):
+        return None
+
+    def terminate(self):
+        pass
+
+    def wait(self, timeout=None):
+        pass
+
+
+def _make_qwentts_mock_server(port, ref_wav_b64, ref_text, stop_event=None):
+    """Create a mock tts-server that mimics the real qwentts.cpp API.
+
+    Endpoints:
+      GET  /health                     -> {"status": "ok"}
+      POST /v1/audio/voices            -> registers voice, returns {"name": ..., "status": "registered"}
+      POST /v1/audio/speech            -> returns WAV audio bytes
+      GET  /v1/audio/voices            -> returns voices list
+      GET  /v1/models                  -> returns model list
+    """
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+    import json as _json
+
+    class MockHandler(BaseHTTPRequestHandler):
+        def log_message(self, format, *args):
+            pass
+
+        def do_GET(self):
+            if self.path == "/health":
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"status":"ok"}')
+            elif self.path == "/v1/audio/voices":
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                body = _json.dumps({
+                    "voices": [{"name": "serve_clone", "kind": "registered"}],
+                })
+                self.wfile.write(body.encode())
+            elif self.path == "/v1/models":
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                body = _json.dumps({
+                    "object": "list",
+                    "data": [{"id": "mock-talker", "object": "model", "owned_by": "local"}],
+                })
+                self.wfile.write(body.encode())
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length) if length else b""
+
+            if self.path == "/v1/audio/voices":
+                parsed = _json.loads(body)
+                name = parsed.get("name", "")
+                if name == "serve_clone":
+                    assert parsed.get("ref_text") == ref_text
+                    assert parsed.get("wav_b64") == ref_wav_b64
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(f'{{"name":"{name}","status":"registered"}}'.encode())
+            elif self.path == "/v1/audio/speech":
+                parsed = _json.loads(body)
+                voice = parsed.get("voice", "")
+                fmt = parsed.get("response_format", "wav")
+                assert voice == "serve_clone"
+                wav_data = _make_wav_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", "audio/wav" if fmt == "wav" else "audio/pcm")
+                self.end_headers()
+                self.wfile.write(wav_data)
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+    server = HTTPServer(("127.0.0.1", port), MockHandler)
+    server.timeout = 1
+    def serve_loop():
+        while not stop_event.is_set():
+            server.handle_request()
+    t = threading.Thread(target=serve_loop, daemon=True)
+    t.start()
+    return server
+
+
+def test_qwentts_backend_pick_backend_choice():
+    assert pick_backend("qwentts") == "qwentts"
+
+
+def test_qwentts_load_synth_sends_correct_http_requests(tmp_path):
+    """Test that load_qwentts_synth correctly communicates with tts-server."""
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+
+    stop_event = threading.Event()
+    server = _make_qwentts_mock_server(port, _wav_b64(), "ref text here", stop_event)
+    try:
+        ref_wav = tmp_path / "ref.wav"
+        ref_wav.write_bytes(_make_wav_bytes())
+
+        from serve import load_qwentts_synth
+
+        # Mock subprocess.Popen so it doesn't actually spawn a process.
+        with patch("serve.subprocess.Popen", return_value=MockSubprocessProc()):
+            synth = load_qwentts_synth(
+                model_id="mock-talker",
+                ref_audio=ref_wav,
+                ref_text="ref text here",
+                language="English",
+                device="auto",
+                qwentts_bin="/fake/path",
+                qwentts_model="/fake/model.gguf",
+                qwentts_codec="/fake/codec.gguf",
+                qwentts_port=port,
+            )
+
+        # Run synth.
+        output_files = []
+        for path in synth("Hello world.", lambda: str(tmp_path / f"out_{id(synth)}.wav")):
+            output_files.append(path)
+            assert Path(path).exists()
+            with open(path, "rb") as f:
+                assert f.read(4) == b"RIFF"
+
+        assert len(output_files) == 1
+    finally:
+        stop_event.set()
+        server.server_close()
+
+
+def test_qwentts_load_synth_child_death_error(tmp_path):
+    """Test that synth raises when tts-server is not reachable."""
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+
+    ref_wav = tmp_path / "ref.wav"
+    ref_wav.write_bytes(_make_wav_bytes())
+
+    from serve import load_qwentts_synth
+
+    # Mock Popen: the child "runs" but nothing listens on the port, and the
+    # startup poll bails as soon as poll() reports the child exited.
+    class DeadProc(MockSubprocessProc):
+        def __init__(self):
+            super().__init__()
+            self._polls = 0
+
+        def poll(self):
+            # Alive for the first few polls, then dead.
+            self._polls += 1
+            return None if self._polls < 3 else 1
+
+    with patch("serve.subprocess.Popen", return_value=DeadProc()):
+        with pytest.raises(RuntimeError) as exc_info:
+            load_qwentts_synth(
+                model_id="mock-talker",
+                ref_audio=ref_wav,
+                ref_text="ref text here",
+                language="English",
+                device="auto",
+                qwentts_bin="/fake/path",
+                qwentts_model="/fake/model.gguf",
+                qwentts_codec="/fake/codec.gguf",
+                qwentts_port=port,
+            )
+    assert "exited during startup" in str(exc_info.value)
+
+
+def test_qwentts_cleanup_qwentts():
+    """Test that _cleanup_qwentts terminates a running process."""
+    from serve import _cleanup_qwentts
+    import serve
+
+    mock_proc = MockSubprocessProc()
+    original = serve._qwentts_process
+    serve._qwentts_process = mock_proc
+
+    # poll() returns None (still alive), so terminate() is called.
+    _cleanup_qwentts()
+
+    assert serve._qwentts_process is None
+    serve._qwentts_process = original
+
+
+def test_qwentts_load_synth_requires_all_flags(tmp_path):
+    """Test that load_qwentts_synth fails if any required flag is missing."""
+    ref_wav = tmp_path / "ref.wav"
+    ref_wav.write_bytes(_make_wav_bytes())
+
+    from serve import load_qwentts_synth
+
+    with pytest.raises(RuntimeError) as exc_info:
+        load_qwentts_synth(
+            model_id="mock",
+            ref_audio=ref_wav,
+            ref_text="ref",
+            language="English",
+            qwentts_bin="/path",
+        )
+    assert "qwentts backend requires" in str(exc_info.value)
+
+
+def test_qwentts_pick_free_port():
+    from serve import _pick_free_port
+    import socket
+
+    port = _pick_free_port()
+    assert 0 < port < 65536
+    # The port is actually bindable after being picked.
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", port))
+
+
+def test_qwentts_synth_failure_after_server_stops(tmp_path):
+    """synth raises RuntimeError (not SystemExit) once tts-server is gone,
+    so Speaker's except-Exception paths can handle it."""
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+
+    stop_event = threading.Event()
+    server = _make_qwentts_mock_server(port, _wav_b64(), "ref text here", stop_event)
+    try:
+        ref_wav = tmp_path / "ref.wav"
+        ref_wav.write_bytes(_make_wav_bytes())
+
+        from serve import load_qwentts_synth
+
+        with patch("serve.subprocess.Popen", return_value=MockSubprocessProc()):
+            synth = load_qwentts_synth(
+                model_id="mock-talker",
+                ref_audio=ref_wav,
+                ref_text="ref text here",
+                language="English",
+                device="auto",
+                qwentts_bin="/fake/path",
+                qwentts_model="/fake/model.gguf",
+                qwentts_codec="/fake/codec.gguf",
+                qwentts_port=port,
+            )
+    finally:
+        stop_event.set()
+        server.server_close()
+
+    with pytest.raises(RuntimeError):
+        list(synth("Hello.", lambda: str(tmp_path / "out.wav")))

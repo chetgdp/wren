@@ -495,6 +495,7 @@ class Speaker:
                 import traceback
                 traceback.print_exc()
                 print("model load failed; exiting", file=sys.stderr)
+                _cleanup_qwentts()  # os._exit skips atexit; no-op unless qwentts
                 os._exit(1)
             self.ready.set()
         carry = None
@@ -887,6 +888,145 @@ def load_mlx_synth(model_id, ref_audio, ref_text, language):
     return synth
 
 
+# Global reference to the qwentts child process, set once by load_qwentts_synth.
+_qwentts_process: subprocess.Popen | None = None
+
+
+def _pick_free_port():
+    """Bind an ephemeral localhost port and return its number."""
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _cleanup_qwentts():
+    """Terminate the tts-server child if it's still running."""
+    global _qwentts_process
+    if _qwentts_process and _qwentts_process.poll() is None:
+        _qwentts_process.terminate()
+        try:
+            _qwentts_process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            _qwentts_process.kill()
+            _qwentts_process.wait()
+        _qwentts_process = None
+
+
+def load_qwentts_synth(model_id, ref_audio, ref_text, language, device="auto",
+                       qwentts_bin=None, qwentts_model=None,
+                       qwentts_codec=None, qwentts_port=None):
+    """qwentts.cpp backend: spawns tts-server as a child process and proxies
+    synthesis via its OpenAI-compatible HTTP API.
+    """
+    global _qwentts_process
+
+    import atexit
+    import base64
+    import urllib.request
+
+    # RuntimeError, not SystemExit: this runs in the Speaker synth thread,
+    # whose error paths catch Exception only (SystemExit would silently kill
+    # the thread and leave the daemon serving 503 forever).
+    if not all([qwentts_bin, qwentts_model, qwentts_codec, qwentts_port]):
+        raise RuntimeError(
+            "qwentts backend requires --qwentts-bin, --qwentts-model, "
+            "--qwentts-codec, and --qwentts-port"
+        )
+
+    # Read the reference WAV and encode it for voice registration.
+    ref_wav_bytes = ref_audio.read_bytes()
+    ref_wav_b64 = base64.b64encode(ref_wav_bytes).decode("ascii")
+
+    # Build the tts-server command line.
+    cmd = [
+        qwentts_bin,
+        "--model", qwentts_model,
+        "--codec", qwentts_codec,
+        "--host", "127.0.0.1",
+        "--port", str(qwentts_port),
+        "--lang", language,
+    ]
+
+    print(f"starting tts-server on 127.0.0.1:{qwentts_port}")
+    # stderr is inherited so model-load failures are visible in the daemon log.
+    _qwentts_process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL)
+    atexit.register(_cleanup_qwentts)
+
+    # Poll until the server answers /health, the child dies, or we time out.
+    startup_timeout = 60
+    def _is_ready(port, timeout):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if _qwentts_process.poll() is not None:
+                return False
+            try:
+                urllib.request.urlopen(
+                    f"http://127.0.0.1:{port}/health", timeout=1
+                ).read()
+                return True
+            except OSError:
+                time.sleep(0.2)
+        return False
+
+    if not _is_ready(qwentts_port, startup_timeout):
+        exited = _qwentts_process.poll() is not None
+        _cleanup_qwentts()
+        raise RuntimeError(
+            "tts-server exited during startup (see its stderr above)" if exited
+            else f"tts-server did not become ready on port {qwentts_port} "
+                 f"within {startup_timeout}s"
+        )
+    print(f"tts-server ready on port {qwentts_port}")
+
+    # Register the clone voice once via POST /v1/audio/voices.
+    voice_url = f"http://127.0.0.1:{qwentts_port}/v1/audio/voices"
+    voice_body = json.dumps({
+        "name": "serve_clone",
+        "ref_text": ref_text,
+        "wav_b64": ref_wav_b64,
+    }).encode("utf-8")
+    voice_req = urllib.request.Request(
+        voice_url, data=voice_body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        resp = urllib.request.urlopen(voice_req, timeout=30)
+        resp.read()
+        print("voice 'serve_clone' registered with tts-server")
+    except OSError as exc:
+        _cleanup_qwentts()
+        raise RuntimeError(f"failed to register voice: {exc}") from exc
+
+    def synth(text, make_path):
+        """Synthesize text via tts-server's POST /v1/audio/speech."""
+        speech_url = f"http://127.0.0.1:{qwentts_port}/v1/audio/speech"
+        body = json.dumps({
+            "input": text,
+            "voice": "serve_clone",
+            "response_format": "wav",
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            speech_url, data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            resp = urllib.request.urlopen(req, timeout=120)
+            audio_data = resp.read()
+        except OSError as exc:
+            if _qwentts_process and _qwentts_process.poll() is not None:
+                raise RuntimeError("tts-server exited unexpectedly") from exc
+            raise RuntimeError(f"synthesis request failed: {exc}") from exc
+
+        path = make_path()
+        Path(path).write_bytes(audio_data)
+        yield path
+
+    return synth
+
+
 def wrap_fx(synth, ring_freq, ring_mix):
     """Post-process every synthesized segment through the droid chain.
 
@@ -926,15 +1066,24 @@ def pick_backend(backend):
     raise SystemExit(
         "neither mlx_audio nor qwen_tts is installed; run via\n"
         "  uv run tts/serve.py ...                       (mlx, default)\n"
-        "  uv run --no-group mlx --group torch tts/serve.py ...  (PyTorch)"
+        "  uv run --no-group mlx --group torch tts/serve.py ...  (PyTorch)\n"
+        "  uv run tts/serve.py -b qwentts ...                (qwentts.cpp)"
     )
 
 
-def load_synth(backend, model_id, ref_audio, ref_text, language, device="auto"):
+def load_synth(backend, model_id, ref_audio, ref_text, language, device="auto",
+               qwentts_bin=None, qwentts_model=None,
+               qwentts_codec=None, qwentts_port=None):
     backend = pick_backend(backend)
     print(f"model: {model_id} (backend: {backend})")
     if backend == "mlx":
         return load_mlx_synth(model_id, ref_audio, ref_text, language)
+    if backend == "qwentts":
+        return load_qwentts_synth(
+            model_id, ref_audio, ref_text, language, device,
+            qwentts_bin=qwentts_bin, qwentts_model=qwentts_model,
+            qwentts_codec=qwentts_codec, qwentts_port=qwentts_port,
+        )
     return load_qwen_tts_synth(model_id, ref_audio, ref_text, language, device)
 
 
@@ -960,7 +1109,7 @@ def parse_args():
                    help="transcript of --ref-audio (default: its sibling .txt)")
     p.add_argument("-m", "--model", default=DEFAULT_MODEL,
                    help="TTS model id (HF repo)")
-    p.add_argument("-b", "--backend", choices=["auto", "mlx", "qwen-tts"],
+    p.add_argument("-b", "--backend", choices=["auto", "mlx", "qwen-tts", "qwentts"],
                    default="auto",
                    help="auto picks whichever backend library is installed")
     p.add_argument("-l", "--language", default="English",
@@ -986,6 +1135,15 @@ def parse_args():
     p.add_argument("--token", default=os.environ.get("VOICE_ML_TOKEN"),
                    help="require 'Authorization: Bearer <token>' on every "
                         "request (default: $VOICE_ML_TOKEN)")
+    # qwentts.cpp backend options
+    p.add_argument("--qwentts-bin", type=Path,
+                   help="path to qwentts.cpp tts-server binary")
+    p.add_argument("--qwentts-model", type=Path,
+                   help="talker GGUF path (qwen-talker-*.gguf)")
+    p.add_argument("--qwentts-codec", type=Path,
+                   help="codec GGUF path (qwen-tokenizer-*.gguf)")
+    p.add_argument("--qwentts-port", type=int, default=0,
+                   help="localhost port for tts-server (0 = pick a free port)")
     return p.parse_args()
 
 
@@ -1000,6 +1158,26 @@ def main():
               "the network can drive synthesis", file=sys.stderr)
     store = SegmentStore() if args.playback == "client" else None
 
+    # qwentts: validate required flags and pick a free port if needed.
+    if args.backend == "qwentts":
+        missing = [a for a in ("qwentts_bin", "qwentts_model", "qwentts_codec")
+                   if not getattr(args, a)]
+        if missing:
+            raise SystemExit(
+                f"--qwentts-{missing[0].split('_', 1)[1]} is required with -b qwentts"
+            )
+        if args.qwentts_port == 0:
+            args.qwentts_port = _pick_free_port()
+        # atexit alone doesn't run on SIGTERM; route it through sys.exit so
+        # the tts-server child is terminated when the daemon is killed.
+        import signal
+        signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(0))
+    else:
+        args.qwentts_bin = None
+        args.qwentts_model = None
+        args.qwentts_codec = None
+        args.qwentts_port = None
+
     # Serve immediately so clients can see "loading" via /health; /speak
     # returns 503 until the model is loaded. The model loads inside the
     # Speaker's synth thread because MLX streams are thread-local.
@@ -1010,8 +1188,14 @@ def main():
           f"(POST /speak, /stop; GET /health; playback: {args.playback})")
 
     def factory():
-        synth = load_synth(args.backend, args.model, args.ref_audio, ref_text,
-                           args.language, args.device)
+        synth = load_synth(
+            args.backend, args.model, args.ref_audio, ref_text,
+            args.language, args.device,
+            qwentts_bin=args.qwentts_bin,
+            qwentts_model=args.qwentts_model,
+            qwentts_codec=args.qwentts_codec,
+            qwentts_port=args.qwentts_port,
+        )
         if args.fx:
             synth = wrap_fx(synth, args.fx_ring_freq, args.fx_ring_mix)
         # Warm up before reporting ready: the first generation pays JIT and
