@@ -796,10 +796,16 @@ def load_qwen_tts_synth(model_id, ref_audio, ref_text, language, device="auto"):
 
     device = resolve_device(device)
     print(f"device: {device}")
+    if device == "cpu":
+        dtype = torch.float32
+    elif device == "cuda" and torch.cuda.get_device_capability()[0] < 8:
+        dtype = torch.float16  # pre-Ampere: no native bf16
+    else:
+        dtype = torch.bfloat16
     model = Qwen3TTSModel.from_pretrained(
         model_id,
         device_map=device,
-        dtype=torch.float32 if device == "cpu" else torch.bfloat16,
+        dtype=dtype,
         attn_implementation="sdpa",
     )
     attach_progress_bar(model)
