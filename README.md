@@ -2,7 +2,6 @@
 i let the model geenrate so much garbage its so sad
 
 fix glitches
-speed
 
 ## Command line options
 

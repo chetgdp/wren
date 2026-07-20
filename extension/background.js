@@ -2,7 +2,7 @@
 // context menus, and manages the offscreen audio player used when the
 // daemon runs with --playback client (e.g. a remote CUDA box).
 
-const DEFAULTS = { base: "http://127.0.0.1:8765", token: "" };
+const DEFAULTS = { base: "http://127.0.0.1:8765", token: "", rate: 1 };
 
 const config = () => chrome.storage.sync.get(DEFAULTS);
 
@@ -44,7 +44,7 @@ async function ensureClientPlayback(flush) {
     return;
   }
   if (health.playback !== "client") return;
-  const { base, token } = await config();
+  const { base, token, rate } = await config();
   try {
     if (!(await chrome.offscreen.hasDocument()))
       await chrome.offscreen.createDocument({
@@ -59,7 +59,7 @@ async function ensureClientPlayback(flush) {
   // invalidated it server-side, but the player only notices the epoch bump
   // when the next segment arrives.
   chrome.runtime
-    .sendMessage({ cmd: "player", action: "start", base, token, flush })
+    .sendMessage({ cmd: "player", action: "start", base, token, rate, flush })
     .catch(() => {});
 }
 

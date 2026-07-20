@@ -1,5 +1,7 @@
 // Persistent keybinds on every page: p with a selection speaks it, p
-// without toggles pause on the active overlay, o stops. The overlay
+// without toggles pause on the active overlay, o stops, j/k seek by
+// sentence, J/K by paragraph, </> slow down / speed up (client playback
+// only). The overlay
 // (injected by the background worker after a speak) shares this isolated
 // world and exposes its controls on window.__voiceMlOverlay.
 
@@ -197,7 +199,11 @@ window.__voiceMlClientState = { playing: false, paused: false };
 chrome.runtime.onMessage.addListener((msg) => {
   if (msg.cmd === "read-page") readPage();
   else if (msg.cmd === "position") {
-    window.__voiceMlClientState = { playing: msg.playing, paused: msg.paused };
+    window.__voiceMlClientState = {
+      playing: msg.playing,
+      paused: msg.paused,
+      rate: msg.rate,
+    };
     if (msg.block && !(window.__voiceMlSeekHold > performance.now()))
       highlight(msg.block);
   }
@@ -223,6 +229,9 @@ document.addEventListener(
     } else if (e.key === "J" || e.key === "K") {
       if (!window.__voiceMlOverlay) return;
       paragraphSeek(e.key === "J" ? -1 : 1);
+    } else if (e.key === "<" || e.key === ">") {
+      if (!window.__voiceMlOverlay) return;
+      window.__voiceMlOverlay.rateDelta(e.key === ">" ? 1 : -1);
     } else return;
     e.preventDefault();
     e.stopPropagation();

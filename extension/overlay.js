@@ -34,9 +34,19 @@
       #pause .play { display: none; }
       #pause.paused .play { display: block; }
       #pause.paused .bars { display: none; }
+      .ratectl { display: none; }
+      .box.client button.ratectl {
+        display: flex; font-size: 15px; font-family: inherit; color: #ddd;
+      }
+      .box.client span.ratectl {
+        display: inline-block; min-width: 34px; text-align: center; color: #aaa;
+      }
     </style>
     <div class="box">
       <span class="status">speaking</span>
+      <button id="rdown" class="ratectl" title="Slower (<)">-</button>
+      <span id="rate" class="ratectl">1x</span>
+      <button id="rup" class="ratectl" title="Faster (>)">+</button>
       <button id="pause" title="Pause (p)">
         <svg class="bars" viewBox="0 0 16 16"><rect x="3" y="2" width="4" height="12" rx="1"/><rect x="9" y="2" width="4" height="12" rx="1"/></svg>
         <svg class="play" viewBox="0 0 16 16"><path d="M4 2.5v11a.6.6 0 0 0 .9.5l9-5.5a.6.6 0 0 0 0-1l-9-5.5a.6.6 0 0 0-.9.5z"/></svg>
@@ -49,6 +59,8 @@
 
   const statusEl = root.querySelector(".status");
   const pauseBtn = root.querySelector("#pause");
+  const boxEl = root.querySelector(".box");
+  const rateEl = root.querySelector("#rate");
   let paused = false;
   let idlePolls = 0;
   let timer = null;
@@ -82,11 +94,13 @@
     }
     if (!h || h.error) return remove();
     clientMode = h.playback === "client";
+    boxEl.classList.toggle("client", clientMode); // rate is client-side only
     if (clientMode) {
       // /health knows synthesis, not local playback; the offscreen player's
-      // position broadcasts (via content.js) carry paused/playing/block.
+      // position broadcasts (via content.js) carry paused/playing/block/rate.
       const st = window.__voiceMlClientState || {};
       h = { ...h, paused: st.paused, speaking: h.speaking || st.playing };
+      showRate(st.rate);
     }
     render(h);
     // Keep the last highlight through synthesis gaps (block is null between
@@ -99,6 +113,26 @@
     // consecutive idle reads before concluding playback is done.
     idlePolls = !h.paused && !h.speaking && h.pending === 0 ? idlePolls + 1 : 0;
     if (idlePolls >= 6) remove();
+  }
+
+  function showRate(r) {
+    if (r) rateEl.textContent = Math.round(r * 100) / 100 + "x";
+  }
+
+  let persistTimer = null;
+  async function rateDelta(dir) {
+    if (!clientMode) return; // local playback ignores rate
+    const r = await chrome.runtime
+      .sendMessage({ cmd: "player", action: "rate", delta: dir })
+      .catch(() => null);
+    if (!r) return;
+    showRate(r.rate);
+    // Persisted here because the offscreen player can't touch chrome.storage
+    // (offscreen documents only get runtime messaging). Debounced: sync
+    // throttles writes and a held key would blow the quota.
+    clearTimeout(persistTimer);
+    persistTimer = setTimeout(
+      () => chrome.storage.sync.set({ rate: r.rate }), 500);
   }
 
   async function togglePause() {
@@ -124,8 +158,11 @@
 
   pauseBtn.addEventListener("click", togglePause);
   root.querySelector("#stop").addEventListener("click", stop);
+  root.querySelector("#rdown").addEventListener("click", () => rateDelta(-1));
+  root.querySelector("#rup").addEventListener("click", () => rateDelta(1));
 
   timer = setInterval(poll, 500);
   // Keybinds live in content.js and drive the overlay through this handle.
-  window.__voiceMlOverlay = { reset: () => (idlePolls = 0), togglePause, stop };
+  window.__voiceMlOverlay =
+    { reset: () => (idlePolls = 0), togglePause, stop, rateDelta };
 })();
