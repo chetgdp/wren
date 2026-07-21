@@ -1,7 +1,9 @@
-highlights lagging
-doesnt stop generating when pausd
-select and start read page from there
+---highlights lagging
+---doesnt stop generating when pausd
+---select and start read page from there
 fix keybinds
+fix play after paused for a long time
+fix origin
 sometimes p does not show highlight
 audit the daemon serve "api"
 better voice clone (wintermute)

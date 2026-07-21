@@ -7,8 +7,9 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from serve import (App, PCMPlayer, SegmentStore, Speaker, block_span,
-                   chunk_text, make_server, pick_backend, sanitize_markdown)
+from serve import (MAX_BODY_BYTES, App, PCMPlayer, SegmentStore, Speaker,
+                   block_span, chunk_text, make_server, pick_backend,
+                   sanitize_markdown)
 
 
 def wait_for(cond, timeout=5.0):
@@ -473,6 +474,49 @@ def test_speak_rejects_missing_text_and_bad_json():
             assert False, "expected 400"
         except urllib.error.HTTPError as e:
             assert e.code == 400
+    finally:
+        server.shutdown()
+
+
+def test_web_origin_rejected_extension_and_no_origin_pass():
+    played = []
+    server, port = start_server(played)
+    try:
+        for path, body in (("/speak", {"text": "hi"}), ("/stop", {}),
+                           ("/health", None)):
+            try:
+                request(port, path, body,
+                        headers={"Origin": "https://evil.example"})
+                assert False, "expected 403"
+            except urllib.error.HTTPError as e:
+                assert e.code == 403
+        status, _ = request(port, "/speak", {"text": "One."},
+                            headers={"Origin": "chrome-extension://abcdef"})
+        assert status == 200
+        status, _ = request(port, "/speak", {"text": "Two.", "append": True})
+        assert status == 200
+        assert wait_for(lambda: played == ["One.", "Two."])
+    finally:
+        server.shutdown()
+
+
+def test_oversize_and_negative_content_length_rejected():
+    server, port = start_server([])
+    try:
+        try:
+            request(port, "/speak", {"text": "x" * (MAX_BODY_BYTES + 1)})
+            assert False, "expected 413"
+        except urllib.error.HTTPError as e:
+            assert e.code == 413
+
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/speak", data=b"", method="POST")
+        req.add_header("Content-Length", "-1")
+        try:
+            urllib.request.urlopen(req, timeout=5)
+            assert False, "expected 413"
+        except urllib.error.HTTPError as e:
+            assert e.code == 413
     finally:
         server.shutdown()
 

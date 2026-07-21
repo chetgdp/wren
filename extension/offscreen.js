@@ -286,9 +286,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       sendResponse({ paused: false });
       return;
     }
-    (ctx.state === "suspended" ? ctx.resume() : ctx.suspend()).then(() =>
-      sendResponse({ paused: ctx.state === "suspended" })
-    );
+    (ctx.state === "suspended" ? ctx.resume() : ctx.suspend()).then(() => {
+      // The audible block rides along on a pause so the background worker
+      // can restore the position if Chrome closes this document before the
+      // resume (AUDIO_PLAYBACK docs die after ~30s without audible output).
+      const now = ctx.currentTime;
+      const cur = scheduled.find((s) => s.start <= now && s.end > now);
+      sendResponse({
+        paused: ctx.state === "suspended",
+        block: cur?.block?.[0] ?? null,
+      });
+    });
     return true; // async response
   } else if (msg.action === "rate") {
     const target = msg.value ?? rate + (msg.delta ?? 0) * 0.25;

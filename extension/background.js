@@ -63,6 +63,39 @@ async function ensureClientPlayback(flush) {
     .catch(() => {});
 }
 
+// Pause/resume of client playback routes through here rather than straight
+// to the offscreen player: a suspended AudioContext produces no audio, so
+// Chrome closes the AUDIO_PLAYBACK document ~30s into a pause. Resume must
+// then rebuild - /seek the daemon back to the paused block (seek preempts
+// and resumes server-side) and recreate the player document.
+let lastBlock = null; // most recent audible block, from position messages
+
+async function togglePlayer() {
+  if (await chrome.offscreen.hasDocument()) {
+    const r = await chrome.runtime
+      .sendMessage({ cmd: "player", action: "toggle" })
+      .catch(() => null);
+    if (r) {
+      if (r.paused)
+        chrome.storage.session.set({ pausedBlock: r.block ?? lastBlock });
+      else chrome.storage.session.remove("pausedBlock");
+      await post(r.paused ? "/pause" : "/resume");
+      return r;
+    }
+  }
+  // No player document: Chrome closed it during a long pause, taking the
+  // scheduled audio with it. Requeue server-side from the paused block;
+  // plain-text speaks aren't seekable, so /resume is the fallback (the
+  // daemon un-gates and synthesis continues from its queue).
+  const { pausedBlock } = await chrome.storage.session.get("pausedBlock");
+  chrome.storage.session.remove("pausedBlock");
+  let res = null;
+  if (pausedBlock != null) res = await post("/seek", { block: pausedBlock });
+  if (!res?.ok) await post("/resume");
+  await ensureClientPlayback(false);
+  return { paused: false };
+}
+
 // Cached copy of speakTabId: position messages arrive every 250ms and a
 // storage.session read on each hop adds latency to the highlight. Session
 // storage stays the durable copy for service-worker restarts.
@@ -70,6 +103,11 @@ let speakTabId = null;
 
 function afterSpeak(res, tabId, append) {
   if (!res || !(res.queued > 0)) return;
+  if (!append) {
+    // A preempting speak invalidates any position saved by an earlier pause.
+    lastBlock = null;
+    chrome.storage.session.remove("pausedBlock");
+  }
   if (tabId != null) {
     speakTabId = tabId;
     chrome.storage.session.set({ speakTabId: tabId });
@@ -117,6 +155,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // Playhead updates from the offscreen player -> content script of the
   // tab that last spoke (runtime.sendMessage can't reach content scripts).
   if (msg.cmd === "position") {
+    if (msg.block) lastBlock = msg.block[0];
     if (speakTabId != null) {
       chrome.tabs.sendMessage(speakTabId, msg).catch(() => {});
       return;
@@ -128,7 +167,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     });
     return;
   }
-  if (msg.cmd === "player") return; // overlay -> offscreen; not for us
+  if (msg.cmd === "player-toggle") {
+    togglePlayer()
+      .catch((err) => {
+        console.warn("voice-ml toggle:", err.message);
+        return null;
+      })
+      .then(sendResponse);
+    return true; // async response
+  }
+  if (msg.cmd === "player") return; // overlay/self -> offscreen; not for us
   if (!msg.path) return;
   // Content scripts proxy daemon calls through here (they hit CORS directly).
   // A successful /speak also injects the overlay into the sending tab.

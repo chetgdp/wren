@@ -29,6 +29,10 @@ With --token (or $VOICE_ML_TOKEN), every request must carry
 "Authorization: Bearer <token>"; use it whenever --host exposes the daemon
 beyond loopback.
 
+Requests with an http(s) Origin header are rejected (403): web pages can
+otherwise CSRF the loopback port. Browser-extension origins and clients
+that send no Origin (curl, scripts) pass. Bodies over 1 MiB return 413.
+
 "append" queues after what is already speaking instead of preempting it;
 streaming clients send the first piece without it and the rest with it.
 
@@ -69,6 +73,15 @@ DEFAULT_PORT = 8765
 # /health block position (read-mode highlight) and of /seek responsiveness.
 MAX_CHUNK_CHARS = 300
 FIRST_CHUNK_CHARS = 200
+# Requests carry short prose; anything near this is abuse, and an uncapped
+# read is a memory/CPU (sanitize regex) hole for whatever can reach the port.
+MAX_BODY_BYTES = 1 * 1024 * 1024
+# Browsers stamp cross-site requests with the page's Origin and JS cannot
+# strip or spoof it, so rejecting http(s) origins kills drive-by CSRF from
+# web pages against the loopback port. Extension clients pass (their Origin
+# is an extension scheme) and non-browser clients send no Origin at all.
+ALLOWED_ORIGIN_SCHEMES = (
+    "chrome-extension:", "moz-extension:", "safari-web-extension:")
 
 
 def sanitize_markdown(text):
@@ -672,6 +685,13 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _origin_allowed(self):
+        origin = self.headers.get("Origin", "")
+        if not origin or origin.startswith(ALLOWED_ORIGIN_SCHEMES):
+            return True
+        self._json(403, {"error": "origin not allowed"})
+        return False
+
     def _authorized(self):
         token = self.app.token
         if not token:
@@ -711,7 +731,7 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self):
-        if not self._authorized():
+        if not self._origin_allowed() or not self._authorized():
             return
         url = urlsplit(self.path)
         if url.path == "/health":
@@ -734,7 +754,7 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(404, {"error": "not found"})
 
     def do_POST(self):
-        if not self._authorized():
+        if not self._origin_allowed() or not self._authorized():
             return
         speaker = self.app.speaker
         if speaker is None or not speaker.ready.is_set():
@@ -742,6 +762,22 @@ class _Handler(BaseHTTPRequestHandler):
             return
         try:
             length = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            self._json(400, {"error": "invalid Content-Length"})
+            return
+        if length < 0 or length > MAX_BODY_BYTES:
+            # Drain (bounded, discarded in chunks) before responding, else
+            # the close mid-upload turns into a RST and the client sees a
+            # connection reset instead of the 413.
+            remaining = min(length, 8 * MAX_BODY_BYTES)
+            while remaining > 0:
+                read = self.rfile.read(min(remaining, 65536))
+                if not read:
+                    break
+                remaining -= len(read)
+            self._json(413, {"error": "body too large"})
+            return
+        try:
             body = json.loads(self.rfile.read(length) or b"{}")
         except (ValueError, json.JSONDecodeError):
             self._json(400, {"error": "invalid JSON"})

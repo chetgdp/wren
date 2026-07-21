@@ -3,6 +3,19 @@ i let the model geenrate so much garbage its so sad
 
 fix glitches
 
+```
+llama-server \
+                                            -m ~/models/Qwen3.5-9B-VLM-Q4_K_M.gguf \
+                                            --mmproj ~/models/qwen3.5-9B-mmproj-F16.gguf --no-mmproj-offload \
+                                            --host 0.0.0.0 --port 8888 \
+                                            -ngl 99 \
+                                            --parallel 2 --ctx-size 262144 --kv-unified \
+                                            -fa on -ctk q8_0 -ctv q8_0 \
+                                            --batch-size 2048 --ubatch-size 512 \
+                                            --threads 16 --threads-batch 16 \
+                                            --jinja
+```
+
 ## Command line options
 
 All tools run via `uv run <script>`. On Linux/CUDA use the torch dependency

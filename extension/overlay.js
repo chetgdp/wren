@@ -137,14 +137,19 @@
 
   async function togglePause() {
     if (clientMode) {
+      // Via the background worker, which gates the daemon (/pause keeps it
+      // from synthesizing the whole page while paused) and rebuilds the
+      // player when Chrome closed it during a long pause.
       const r = await chrome.runtime
-        .sendMessage({ cmd: "player", action: "toggle" })
+        .sendMessage({ cmd: "player-toggle" })
         .catch(() => null);
       if (!r) return;
-      // Also gate the daemon: otherwise it keeps synthesizing the rest of
-      // the page while paused (it stalls after a short lookahead, keeping
-      // a couple of segments buffered so resume stays smooth).
-      call(r.paused ? "/pause" : "/resume");
+      // Position broadcasts stall while paused or rebuilding; sync the
+      // cached state so the next poll doesn't repaint the stale value.
+      window.__voiceMlClientState = {
+        ...window.__voiceMlClientState,
+        paused: r.paused,
+      };
       render({ paused: r.paused, pending: 0 });
       return;
     }
