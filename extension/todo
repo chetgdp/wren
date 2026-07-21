@@ -1,9 +1,10 @@
 highlights lagging
+doesnt stop generating when pausd
+select and start read page from there
 fix keybinds
 sometimes p does not show highlight
 audit the daemon serve "api"
+better voice clone (wintermute)
 figure out how to wasm integrate
-better voice clone
-stream to browser?
 
 

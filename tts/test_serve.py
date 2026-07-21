@@ -451,7 +451,49 @@ def test_block_span_interpolates_sentences_by_time():
     assert block_span(layout, 2.5, 4.0) == (0, 1)
     assert block_span(layout, 50.0, 60.0) == (2, 2)  # past estimate: tail
 
-def test_speak_blocks_plays_in_order_and_tracks_current_block():
+
+def test_block_span_uses_given_speech_rate():
+    layout = [(0, 10), (1, 10)]
+    # At 10 chars/sec sentence 0 covers 0..1s; the default ~13.3 would
+    # already have moved on by 1.2s.
+    assert block_span(layout, 0.0, 0.9, chars_per_sec=10) == (0, 0)
+    assert block_span(layout, 1.2, 2.0, chars_per_sec=10) == (1, 1)
+
+
+def _write_wav(path, seconds, sr=16000):
+    import wave
+    with wave.open(path, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(sr)
+        w.writeframes(b"\x00\x00" * int(seconds * sr))
+
+
+def test_completed_batch_recalibrates_speech_rate():
+    import serve
+    try:
+        import soundfile  # noqa: F401  (_wav_seconds needs it)
+    except ImportError:
+        return
+    measured_rate = 10.0  # this fake voice speaks 10 chars/sec
+
+    def synth(text, make_path):
+        path = make_path()
+        _write_wav(path, seconds=len(text) / measured_rate)
+        yield path
+
+    class Handle:
+        def terminate(self):
+            pass
+
+        def wait(self):
+            pass
+
+    sp = Speaker(synth, lambda path: Handle())
+    assert sp._chars_per_sec == serve.CHARS_PER_SEC
+    sp.speak(blocks=[(0, "x" * 40 + ".")])
+    expected = 0.5 * serve.CHARS_PER_SEC + 0.5 * measured_rate
+    assert wait_for(lambda: abs(sp._chars_per_sec - expected) < 0.2)
     release = threading.Event()
     played = []
     seen_blocks = []

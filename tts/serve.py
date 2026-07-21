@@ -105,12 +105,12 @@ def estimate_frames(text):
 CHARS_PER_SEC = 12 / 0.9  # inverse of the estimate_frames heuristic
 
 
-def block_span(layout, sec0, sec1):
+def block_span(layout, sec0, sec1, chars_per_sec=CHARS_PER_SEC):
     """Sentence-index range estimated audible between sec0..sec1 of a synth
     batch's audio. layout is [(block_idx, char_count), ...] in speech order;
-    position is interpolated by character share at ~13 chars/sec."""
-    c0 = sec0 * CHARS_PER_SEC
-    c1 = sec1 * CHARS_PER_SEC
+    position is interpolated by character share at chars_per_sec."""
+    c0 = sec0 * chars_per_sec
+    c1 = sec1 * chars_per_sec
     sel = []
     pos = 0.0
     for idx, chars in layout:
@@ -357,6 +357,12 @@ class Speaker:
         self._last_played = None  # block index most recently started
         self._counter = 0
         self._last_synth_epoch = -1
+        # Speech rate used to place the read-mode highlight inside a batch
+        # (block_span). Starts at the heuristic and is recalibrated from
+        # each completed batch, because the fixed value drifts by whole
+        # sentences over a ~20s batch when the active voice speaks faster
+        # or slower than ~13 chars/sec.
+        self._chars_per_sec = CHARS_PER_SEC
         self._tmpdir = tempfile.mkdtemp(prefix="voice-serve-")
         threading.Thread(target=self._synth_loop, daemon=True).start()
         threading.Thread(target=self._play_loop, daemon=True).start()
@@ -556,7 +562,8 @@ class Speaker:
                     seg_start = audio_s
                     audio_s += _wav_seconds(path)
                     # Unknown/zero segment duration: report the whole batch.
-                    seg_block = (block_span(layout, seg_start, audio_s)
+                    seg_block = (block_span(layout, seg_start, audio_s,
+                                            self._chars_per_sec)
                                  if layout and audio_s > seg_start else block)
                     self._play_q.put((epoch, path, seg_block))
             except Exception as exc:
@@ -565,6 +572,15 @@ class Speaker:
             wall = time.monotonic() - t0
             print(f"  {audio_s:.1f}s audio in {wall:.1f}s (RTF {audio_s / wall:.2f})",
                   flush=True)
+            # Recalibrate the highlight's speech-rate estimate from this
+            # batch. Only un-preempted batches measure the full text; the
+            # EMA smooths pause/punctuation noise between batches and the
+            # clamp rejects degenerate wavs (silence, decode failures).
+            if epoch == self._epoch and audio_s > 0:
+                measured = len(text) / audio_s
+                if 5.0 <= measured <= 30.0:
+                    self._chars_per_sec = (0.5 * self._chars_per_sec
+                                           + 0.5 * measured)
 
     def _make_path(self):
         self._counter += 1

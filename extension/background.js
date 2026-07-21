@@ -63,9 +63,15 @@ async function ensureClientPlayback(flush) {
     .catch(() => {});
 }
 
+// Cached copy of speakTabId: position messages arrive every 250ms and a
+// storage.session read on each hop adds latency to the highlight. Session
+// storage stays the durable copy for service-worker restarts.
+let speakTabId = null;
+
 function afterSpeak(res, tabId, append) {
   if (!res || !(res.queued > 0)) return;
   if (tabId != null) {
+    speakTabId = tabId;
     chrome.storage.session.set({ speakTabId: tabId });
     chrome.scripting
       .executeScript({ target: { tabId }, files: ["overlay.js"] })
@@ -111,9 +117,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // Playhead updates from the offscreen player -> content script of the
   // tab that last spoke (runtime.sendMessage can't reach content scripts).
   if (msg.cmd === "position") {
-    chrome.storage.session.get("speakTabId").then(({ speakTabId }) => {
-      if (speakTabId != null)
-        chrome.tabs.sendMessage(speakTabId, msg).catch(() => {});
+    if (speakTabId != null) {
+      chrome.tabs.sendMessage(speakTabId, msg).catch(() => {});
+      return;
+    }
+    chrome.storage.session.get("speakTabId").then((stored) => {
+      if (stored.speakTabId == null) return;
+      speakTabId = stored.speakTabId;
+      chrome.tabs.sendMessage(speakTabId, msg).catch(() => {});
     });
     return;
   }

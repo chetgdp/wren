@@ -183,7 +183,10 @@ function schedule(buf, block) {
   const entry = play(buf, start, 0, block);
   if (!entry) return;
   nextTime = entry.end;
-  if (!reportTimer) reportTimer = setInterval(report, 250);
+  if (!reportTimer) {
+    reportTimer = setInterval(report, 250);
+    report(); // highlight the first segment now, not a tick later
+  }
 }
 
 const FADE = 0.005; // 5ms; enough to dodge the splice click, inaudible in speech

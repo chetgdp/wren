@@ -1,5 +1,6 @@
-// Persistent keybinds on every page: p with a selection speaks it, p
-// without toggles pause on the active overlay, o stops, j/k seek by
+// Persistent keybinds on every page: i speaks the selection, p with a
+// selection starts read-page mode from it, p without toggles pause on the
+// active overlay (or starts read-page mode), o stops, j/k seek by
 // sentence, J/K by paragraph, </> slow down / speed up (client playback
 // only). The overlay
 // (injected by the background worker after a speak) shares this isolated
@@ -164,7 +165,7 @@ window.__voiceMlReader = { highlight };
 // server's chunker.
 const SENTENCE_BREAK = /(?<=[.!?;:])\s+/;
 
-function readPage() {
+function readPage(fromSelection) {
   const { blocks, elements } = extractReadable();
   if (blocks.length === 0) return;
   highlight(null);
@@ -178,6 +179,16 @@ function readPage() {
       readElements.push(elements[i]);
     }
   });
+  // Start at the element containing the selection; falls back to the top
+  // when the selection sits outside the extracted blocks (nav, sidebar).
+  if (fromSelection) {
+    const node = window.getSelection().anchorNode;
+    const start = node ? readElements.findIndex((el) => el.contains(node)) : -1;
+    if (start > 0) {
+      sentences.splice(0, start);
+      readElements.splice(0, start);
+    }
+  }
   readSentences = sentences;
   chrome.runtime.sendMessage({ path: "/speak", body: { blocks: sentences } });
 }
@@ -248,9 +259,13 @@ document.addEventListener(
       return; // don't hijack typing
     if (e.key === "p") {
       const sel = window.getSelection().toString().trim();
-      if (sel) chrome.runtime.sendMessage({ path: "/speak", body: { text: sel } });
+      if (sel) readPage(true);
       else if (window.__voiceMlOverlay) window.__voiceMlOverlay.togglePause();
       else readPage();
+    } else if (e.key === "i") {
+      const sel = window.getSelection().toString().trim();
+      if (!sel) return;
+      chrome.runtime.sendMessage({ path: "/speak", body: { text: sel } });
     } else if (e.key === "o") {
       if (!window.__voiceMlOverlay) return;
       window.__voiceMlOverlay.stop();
