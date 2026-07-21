@@ -12,6 +12,8 @@ Endpoints:
                  reports which block range is currently audible (read mode)
     POST /stop                                                  -> {"ok": true}
     POST /pause                                 -> {"ok": true, "paused": true}
+                 pauses local playback and stalls synthesis after a short
+                 lookahead (PAUSE_LOOKAHEAD segments) so resume is smooth
     POST /resume                               -> {"ok": true, "paused": false}
     POST /seek   {"delta": 1} | {"block": n} -> {"ok": true, "block": n};
                  skips relative to what is playing, or to an absolute block
@@ -349,6 +351,8 @@ class Speaker:
         self._first_chars = first_chars
         self._lock = threading.Lock()
         self._epoch = 0
+        self._pause = threading.Event()
+        self._pause_budget = 0
         self._synth_q = queue.Queue()
         self._play_q = queue.Queue()
         self._current = None
@@ -450,22 +454,28 @@ class Speaker:
                 self._play.invalidate()
             self.resume()
 
+    PAUSE_LOOKAHEAD = 2  # segments synthesized past a pause; smooth resume
+
     def pause(self):
-        """Pause playback between blocks. Only the PCM player supports it;
-        with the afplay fallback this is a no-op and returns False."""
+        """Pause playback and stall synthesis. The synth loop may emit up to
+        PAUSE_LOOKAHEAD more segments (so resume has audio ready instead of
+        waiting on a cold generate call), then blocks until resume or a
+        preemption. Local playback pauses via the PCM player; the afplay
+        fallback keeps playing its current segment."""
+        self._pause_budget = self.PAUSE_LOOKAHEAD
+        self._pause.set()
         if hasattr(self._play, "pause"):
             self._play.pause()
-            return True
-        return False
+        return True
 
     def resume(self):
+        self._pause.clear()
         if hasattr(self._play, "resume"):
             self._play.resume()
-            return True
-        return False
+        return True
 
     def paused(self):
-        return bool(getattr(self._play, "paused", False))
+        return self._pause.is_set()
 
     def speaking(self):
         return self._current is not None
@@ -476,6 +486,13 @@ class Speaker:
 
     def pending(self):
         return self._synth_q.qsize() + self._play_q.qsize()
+
+    def _pause_gate(self, epoch):
+        """Block while paused once the lookahead budget is spent; resume or
+        a preemption (epoch bump) releases it."""
+        while (self._pause.is_set() and self._pause_budget <= 0
+               and epoch == self._epoch):
+            time.sleep(0.05)
 
     def _drain(self):
         for q in (self._synth_q, self._play_q):
@@ -543,6 +560,9 @@ class Speaker:
             if epoch != self._epoch:  # preempted during coalesce
                 continue
             self._last_synth_epoch = epoch
+            self._pause_gate(epoch)  # paused between batches: don't start one
+            if epoch != self._epoch:
+                continue
             # A coalesced batch spans several blocks. Each streamed segment
             # is tagged with the sentence range it is estimated to cover, so
             # the reported position tracks the audible sentence, not the
@@ -566,6 +586,11 @@ class Speaker:
                                             self._chars_per_sec)
                                  if layout and audio_s > seg_start else block)
                     self._play_q.put((epoch, path, seg_block))
+                    if self._pause.is_set():
+                        self._pause_budget -= 1
+                        self._pause_gate(epoch)
+                        if epoch != self._epoch:
+                            break
             except Exception as exc:
                 print(f"synth failed: {exc}", file=sys.stderr)
                 continue
@@ -745,14 +770,12 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json(200, {"ok": True, "block": target})
             return
         if self.path == "/pause":
-            ok = speaker.pause()
-            self._json(200 if ok else 501,
-                       {"ok": ok, "paused": speaker.paused()})
+            speaker.pause()
+            self._json(200, {"ok": True, "paused": speaker.paused()})
             return
         if self.path == "/resume":
-            ok = speaker.resume()
-            self._json(200 if ok else 501,
-                       {"ok": ok, "paused": speaker.paused()})
+            speaker.resume()
+            self._json(200, {"ok": True, "paused": speaker.paused()})
             return
         if self.path != "/speak":
             self._json(404, {"error": "not found"})

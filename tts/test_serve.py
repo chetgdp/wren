@@ -154,6 +154,51 @@ def test_preemption_abandons_in_flight_generation():
     assert "eight" not in played  # old generation was abandoned mid-stream
 
 
+def gated_streaming_speaker(played, emitted, go):
+    def synth(text, make_path):
+        go.wait(5)
+        for word in text.split():
+            path = make_path()
+            Path(path).write_text(word)
+            emitted.append(word)
+            yield path
+
+    def play(path):
+        played.append(Path(path).read_text())
+        return FakeHandle()
+
+    return Speaker(synth, play)
+
+
+def test_pause_stalls_synthesis_after_lookahead_and_resume_continues():
+    played, emitted = [], []
+    go = threading.Event()
+    sp = gated_streaming_speaker(played, emitted, go)
+    sp.speak("one two three four five six")
+    sp.pause()  # before go: pause is set for the whole generation
+    go.set()
+    assert wait_for(lambda: len(emitted) == Speaker.PAUSE_LOOKAHEAD)
+    time.sleep(0.3)  # gate holds: no further segments while paused
+    assert len(emitted) == Speaker.PAUSE_LOOKAHEAD
+    sp.resume()
+    assert wait_for(lambda: emitted == "one two three four five six".split())
+    assert wait_for(lambda: played == emitted)
+
+
+def test_preempting_speak_releases_paused_synthesis_gate():
+    played, emitted = [], []
+    go = threading.Event()
+    sp = gated_streaming_speaker(played, emitted, go)
+    sp.speak("one two three four five six")
+    sp.pause()
+    go.set()
+    assert wait_for(lambda: len(emitted) == Speaker.PAUSE_LOOKAHEAD)
+    sp.speak("fresh.")  # preempts: releases the gate, drops the old text
+    assert wait_for(lambda: "fresh." in played)
+    assert sp.paused() is False
+    assert "six" not in emitted  # old generation abandoned at the gate
+
+
 def test_speaker_plays_chunks_in_order():
     played = []
     sp = make_speaker(played, max_chars=12)
@@ -746,14 +791,15 @@ def test_pause_resume_endpoints_and_health_flag():
         server.shutdown()
 
 
-def test_pause_unsupported_player_returns_501():
-    server, port = start_server([])  # make_speaker's play fn has no pause()
+def test_pause_works_without_pausable_player():
+    # The play fn has no pause(); /pause still gates synthesis and reports
+    # paused (client-playback sinks and the afplay fallback hit this path).
+    server, port = start_server([])
     try:
-        try:
-            request(port, "/pause", {})
-            assert False, "expected 501"
-        except urllib.error.HTTPError as e:
-            assert e.code == 501
+        status, body = request(port, "/pause", {})
+        assert status == 200
+        assert body == {"ok": True, "paused": True}
+        assert request(port, "/health")[1]["paused"] is True
     finally:
         server.shutdown()
 

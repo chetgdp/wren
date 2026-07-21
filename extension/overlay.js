@@ -140,7 +140,12 @@
       const r = await chrome.runtime
         .sendMessage({ cmd: "player", action: "toggle" })
         .catch(() => null);
-      if (r) render({ paused: r.paused, pending: 0 });
+      if (!r) return;
+      // Also gate the daemon: otherwise it keeps synthesizing the rest of
+      // the page while paused (it stalls after a short lookahead, keeping
+      // a couple of segments buffered so resume stays smooth).
+      call(r.paused ? "/pause" : "/resume");
+      render({ paused: r.paused, pending: 0 });
       return;
     }
     const r = await call(paused ? "/resume" : "/pause");
