@@ -9,7 +9,7 @@ from pathlib import Path
 
 from serve import (MAX_BODY_BYTES, App, PCMPlayer, SegmentStore, Speaker,
                    block_span, chunk_text, make_server, pick_backend,
-                   sanitize_markdown)
+                   sanitize_markdown, stretch_wav)
 
 
 def wait_for(cond, timeout=5.0):
@@ -912,6 +912,73 @@ def test_droidfx_is_continuous_across_segments():
     split = np.concatenate([fx.process(audio[:half], sr),
                             fx.process(audio[half:], sr)])
     assert np.allclose(whole, split, atol=1e-4)
+
+
+# --- speed ---
+
+def test_stretch_wav_shortens_audio_preserving_sr(tmp_path):
+    import soundfile as sf
+    path = str(tmp_path / "a.wav")
+    sf.write(path, _sine(seconds=2.0), 24000)
+    stretch_wav(path, 2.0)
+    info = sf.info(path)
+    assert info.samplerate == 24000
+    assert abs(info.frames / info.samplerate - 1.0) < 0.1  # ~half as long
+
+
+def test_synth_loop_stretches_segments(tmp_path):
+    import soundfile as sf
+    durations = []
+
+    def synth(text, make_path):
+        path = make_path()
+        sf.write(path, _sine(seconds=1.0), 24000)
+        yield path
+
+    class Handle:
+        def terminate(self):
+            pass
+
+        def wait(self):
+            pass
+
+    def play(path):
+        info = sf.info(path)
+        durations.append(info.frames / info.samplerate)
+        return Handle()
+
+    sp = Speaker(synth, play, speed=2.0)
+    sp.speak("hello.")
+    assert wait_for(lambda: durations)
+    assert abs(durations[0] - 0.5) < 0.1
+
+
+def test_speak_speed_field_updates_speaker_and_health():
+    played = []
+    server, port = start_server(played)
+    try:
+        assert request(port, "/health")[1]["speed"] == 1.0
+        status, _ = request(port, "/speak", {"text": "One.", "speed": 1.5})
+        assert status == 200
+        assert request(port, "/health")[1]["speed"] == 1.5
+        # sticky: a later speak without speed keeps 1.5
+        request(port, "/speak", {"text": "Two."})
+        assert request(port, "/health")[1]["speed"] == 1.5
+    finally:
+        server.shutdown()
+
+
+def test_speak_rejects_out_of_range_speed():
+    server, port = start_server([])
+    try:
+        for bad in (0.1, 5, "fast", True):
+            try:
+                request(port, "/speak", {"text": "hi.", "speed": bad})
+                assert False, f"expected 400 for speed={bad!r}"
+            except urllib.error.HTTPError as e:
+                assert e.code == 400
+    finally:
+        server.shutdown()
 
 
 # --- SegmentStore / client playback ---

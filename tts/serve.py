@@ -7,7 +7,11 @@ after the first chunk instead of after the whole message. A new /speak or
 /stop preempts anything still queued or playing.
 
 Endpoints:
-    POST /speak  {"text": "...", "raw": false, "append": false} -> {"queued": n}
+    POST /speak  {"text": "...", "raw": false, "append": false,
+                  "speed": 1.5} -> {"queued": n}
+                 speed (0.5-3.0) time-stretches output pitch-preserved and
+                 sticks until the next request that sets it (or the --speed
+                 default)
                  {"blocks": ["...", ...], ...}: indexed blocks; /health then
                  reports which block range is currently audible (read mode)
     POST /stop                                                  -> {"ok": true}
@@ -19,7 +23,8 @@ Endpoints:
                  skips relative to what is playing, or to an absolute block
                  index (needs a prior blocks speak)
     GET  /health -> {"ok": true, "pending": n, "speaking": b, "paused": b,
-                     "block": [lo, hi] | null, "playback": "local"|"client"}
+                     "block": [lo, hi] | null, "playback": "local"|"client",
+                     "speed": f}
     GET  /segment?after=n[&timeout=s]  (--playback client only) long-poll for
                  the next synthesized segment: audio/wav with X-Seq, X-Epoch,
                  X-Block headers; 204 + X-Epoch on timeout. An epoch change
@@ -82,6 +87,20 @@ MAX_BODY_BYTES = 1 * 1024 * 1024
 # is an extension scheme) and non-browser clients send no Origin at all.
 ALLOWED_ORIGIN_SCHEMES = (
     "chrome-extension:", "moz-extension:", "safari-web-extension:")
+# Rubber Band artifacts dominate outside this range and extreme values are
+# more likely a client bug than intent.
+SPEED_MIN, SPEED_MAX = 0.5, 3.0
+
+
+def stretch_wav(path, speed):
+    """Time-stretch a wav in place by speed (>1 = faster), preserving pitch.
+    Counterpart of the extension's soundtouch stretch, but server-side so it
+    also covers local playback and the /segment client feed."""
+    import soundfile as sf
+    from pedalboard import time_stretch
+    data, sr = sf.read(path, dtype="float32", always_2d=True)
+    stretched = time_stretch(data.T, sr, stretch_factor=speed)
+    sf.write(path, stretched.T, sr)
 
 
 def sanitize_markdown(text):
@@ -351,7 +370,7 @@ class Speaker:
     """
 
     def __init__(self, synth_fn=None, play_fn=None, max_chars=MAX_CHUNK_CHARS,
-                 first_chars=FIRST_CHUNK_CHARS, synth_factory=None):
+                 first_chars=FIRST_CHUNK_CHARS, synth_factory=None, speed=1.0):
         if (synth_fn is None) == (synth_factory is None):
             raise ValueError("pass exactly one of synth_fn or synth_factory")
         self._synth = synth_fn
@@ -362,6 +381,9 @@ class Speaker:
         self._play = play_fn or default_player()
         self._max_chars = max_chars
         self._first_chars = first_chars
+        # Playback rate; read once per synth batch. Mutated by speak(speed=)
+        # so a request's speed persists for everything after it.
+        self.speed = speed
         self._lock = threading.Lock()
         self._epoch = 0
         self._pause = threading.Event()
@@ -384,10 +406,12 @@ class Speaker:
         threading.Thread(target=self._synth_loop, daemon=True).start()
         threading.Thread(target=self._play_loop, daemon=True).start()
 
-    def speak(self, text=None, append=False, blocks=None):
+    def speak(self, text=None, append=False, blocks=None, speed=None):
         """blocks: list of (index, text) pairs; the index of whatever is
         currently audible is exposed via current_block() so clients can
         highlight it. Plain text is a single index-less block."""
+        if speed is not None:
+            self.speed = speed
         if blocks is None:
             blocks = [(None, text)]
         items = self._chunks_for(blocks)
@@ -588,10 +612,19 @@ class Speaker:
                   flush=True)
             t0 = time.monotonic()
             audio_s = 0.0
+            speed = self.speed  # per batch: mid-stream changes would jump rate
             try:
                 for path in self._synth(text, self._make_path):
                     if epoch != self._epoch:  # preempted: abandon generation
                         break
+                    if speed != 1.0:
+                        try:
+                            # Before _wav_seconds so the block-position math
+                            # and rate calibration see playback durations.
+                            stretch_wav(path, speed)
+                        except Exception as exc:
+                            print(f"time-stretch failed ({exc}); playing at "
+                                  "1.0x", file=sys.stderr)
                     seg_start = audio_s
                     audio_s += _wav_seconds(path)
                     # Unknown/zero segment duration: report the whole batch.
@@ -747,6 +780,7 @@ class _Handler(BaseHTTPRequestHandler):
                 "paused": speaker.paused() if ready else False,
                 "block": list(speaker.current_block())
                          if ready and speaker.current_block() else None,
+                "speed": speaker.speed if ready else None,
             })
         elif url.path == "/segment":
             self._segment(parse_qs(url.query))
@@ -817,6 +851,14 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(404, {"error": "not found"})
             return
         append = bool(body.get("append"))
+        speed = body.get("speed")
+        if speed is not None:
+            if (not isinstance(speed, (int, float)) or isinstance(speed, bool)
+                    or not SPEED_MIN <= speed <= SPEED_MAX):
+                self._json(400, {"error": "speed must be a number in "
+                                          f"[{SPEED_MIN}, {SPEED_MAX}]"})
+                return
+            speed = float(speed)
         blocks = body.get("blocks")
         if blocks is not None:
             if not isinstance(blocks, list) or not all(
@@ -831,7 +873,9 @@ class _Handler(BaseHTTPRequestHandler):
             if not indexed:
                 self._json(200, {"queued": 0})
                 return
-            self._json(200, {"queued": speaker.speak(blocks=indexed, append=append)})
+            self._json(200, {"queued": speaker.speak(blocks=indexed,
+                                                     append=append,
+                                                     speed=speed)})
             return
         text = body.get("text")
         if not isinstance(text, str) or not text.strip():
@@ -842,7 +886,7 @@ class _Handler(BaseHTTPRequestHandler):
         if not text:
             self._json(200, {"queued": 0})
             return
-        queued = speaker.speak(text, append=append)
+        queued = speaker.speak(text, append=append, speed=speed)
         self._json(200, {"queued": queued})
 
 
@@ -1204,6 +1248,10 @@ def parse_args():
     p.add_argument("--host", default=HOST,
                    help="address to bind (0.0.0.0 to serve the LAN; "
                         "set --token when doing so)")
+    p.add_argument("--speed", type=float, default=1.0,
+                   help=f"default playback speed, pitch-preserving "
+                        f"({SPEED_MIN}-{SPEED_MAX}); a /speak with a speed "
+                        f"field overrides it from then on")
     p.add_argument("--playback", choices=["local", "client"], default="local",
                    help="local: play audio on this machine; client: buffer "
                         "segments for clients to fetch via GET /segment")
@@ -1226,6 +1274,8 @@ def main():
     args = parse_args()
     if not args.ref_audio.exists():
         raise SystemExit(f"ref-audio not found: {args.ref_audio}")
+    if not SPEED_MIN <= args.speed <= SPEED_MAX:
+        raise SystemExit(f"--speed must be in [{SPEED_MIN}, {SPEED_MAX}]")
     ref_text = resolve_ref_text(args.ref_audio, args.ref_text)
 
     if args.host not in ("127.0.0.1", "localhost", "::1") and not args.token:
@@ -1287,7 +1337,8 @@ def main():
         print(f"warmup synth: {time.monotonic() - t0:.1f}s")
         return synth
 
-    app.speaker = Speaker(synth_factory=factory, play_fn=store)
+    app.speaker = Speaker(synth_factory=factory, play_fn=store,
+                          speed=args.speed)
     app.speaker.ready.wait()
     print("ready")
     threading.Event().wait()
