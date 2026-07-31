@@ -1242,11 +1242,21 @@ def _make_qwentts_mock_server(port, ref_wav_b64, ref_text, stop_event=None):
                 voice = parsed.get("voice", "")
                 fmt = parsed.get("response_format", "wav")
                 assert voice == "serve_clone"
-                wav_data = _make_wav_bytes()
-                self.send_response(200)
-                self.send_header("Content-Type", "audio/wav" if fmt == "wav" else "audio/pcm")
-                self.end_headers()
-                self.wfile.write(wav_data)
+                if fmt == "pcm":
+                    # 2.5s of s16le 24kHz mono, streamed like the real server
+                    data = b"\x00\x01" * (24000 * 5 // 2)
+                    self.send_response(200)
+                    self.send_header("Content-Type", "audio/pcm")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    for i in range(0, len(data), 16384):
+                        self.wfile.write(data[i:i + 16384])
+                else:
+                    wav_data = _make_wav_bytes()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "audio/wav")
+                    self.end_headers()
+                    self.wfile.write(wav_data)
             else:
                 self.send_response(404)
                 self.end_headers()
@@ -1295,15 +1305,25 @@ def test_qwentts_load_synth_sends_correct_http_requests(tmp_path):
                 qwentts_port=port,
             )
 
-        # Run synth.
+        # Run synth: 2.5s of streamed pcm -> two 1s segments + a 0.5s tail,
+        # each a playable wav.
+        counter = [0]
+
+        def make_path():
+            counter[0] += 1
+            return str(tmp_path / f"out_{counter[0]}.wav")
+
         output_files = []
-        for path in synth("Hello world.", lambda: str(tmp_path / f"out_{id(synth)}.wav")):
+        for path in synth("Hello world.", make_path):
             output_files.append(path)
             assert Path(path).exists()
             with open(path, "rb") as f:
                 assert f.read(4) == b"RIFF"
 
-        assert len(output_files) == 1
+        assert len(output_files) == 3
+        import soundfile as sf
+        total = sum(sf.info(p).frames for p in output_files)
+        assert total == 24000 * 5 // 2  # no samples lost across segments
     finally:
         stop_event.set()
         server.server_close()

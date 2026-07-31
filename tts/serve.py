@@ -1118,13 +1118,31 @@ def load_qwentts_synth(model_id, ref_audio, ref_text, language, device="auto",
         _cleanup_qwentts()
         raise RuntimeError(f"failed to register voice: {exc}") from exc
 
+    import wave
+
+    QWENTTS_SR = 24000  # tts-server pcm is s16le 24 kHz mono
+    SEG_BYTES = QWENTTS_SR * 2  # ~1s per yielded segment, like the mlx path
+
+    def _write_seg(make_path, pcm):
+        path = make_path()
+        with wave.open(path, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(QWENTTS_SR)
+            w.writeframes(pcm)
+        return path
+
     def synth(text, make_path):
-        """Synthesize text via tts-server's POST /v1/audio/speech."""
+        """Stream synthesis via tts-server's POST /v1/audio/speech.
+
+        response_format "pcm" streams s16le as it is generated, so segments
+        yield while generation continues (first audio ~engine TTFA instead
+        of after the whole chunk, which "wav" one-shot forced)."""
         speech_url = f"http://127.0.0.1:{qwentts_port}/v1/audio/speech"
         body = json.dumps({
             "input": text,
             "voice": "serve_clone",
-            "response_format": "wav",
+            "response_format": "pcm",
         }).encode("utf-8")
         req = urllib.request.Request(
             speech_url, data=body,
@@ -1133,15 +1151,22 @@ def load_qwentts_synth(model_id, ref_audio, ref_text, language, device="auto",
         )
         try:
             resp = urllib.request.urlopen(req, timeout=120)
-            audio_data = resp.read()
+            buf = b""
+            while True:
+                chunk = resp.read(65536)
+                if not chunk:
+                    break
+                buf += chunk
+                while len(buf) >= SEG_BYTES:
+                    yield _write_seg(make_path, buf[:SEG_BYTES])
+                    buf = buf[SEG_BYTES:]
+            buf = buf[:len(buf) & ~1]  # drop a trailing half-sample
+            if buf:
+                yield _write_seg(make_path, buf)
         except OSError as exc:
             if _qwentts_process and _qwentts_process.poll() is not None:
                 raise RuntimeError("tts-server exited unexpectedly") from exc
             raise RuntimeError(f"synthesis request failed: {exc}") from exc
-
-        path = make_path()
-        Path(path).write_bytes(audio_data)
-        yield path
 
     return synth
 
