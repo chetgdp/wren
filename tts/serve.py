@@ -1318,6 +1318,9 @@ def main():
             )
         if args.qwentts_port == 0:
             args.qwentts_port = _pick_free_port()
+        # -m goes unused with this backend; /health should name the model
+        # actually synthesizing, not the mlx default.
+        args.model = str(args.qwentts_model)
         # atexit alone doesn't run on SIGTERM; route it through sys.exit so
         # the tts-server child is terminated when the daemon is killed.
         import signal
