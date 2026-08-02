@@ -1,9 +1,13 @@
-# Plan: macOS-native management for the TTS daemon
+# Plan: Wren - macOS-native management for the TTS daemon
 
-Make the TTS side a first-class macOS citizen like cawker: menu bar presence,
-runs in the background, configurable without the command line. Cawker stays
-the STT daemon; this is its output-side sibling. Two daemons, separate
-concerns: cawker owns mic + accessibility + hotkey, this owns the model +
+Names (decided 2026-08-02): the STT daemon (cawker) becomes **Otis** (Greek,
+"keen of hearing"; also a bird genus) and the TTS daemon is **Wren** (the
+tiny bird with the enormous voice). Otis hears, Wren speaks. The cawker
+rename is separate future work in that repo.
+
+Make Wren a first-class macOS citizen like Otis: menu bar presence, runs in
+the background, configurable without the command line. Two daemons, separate
+concerns: Otis owns mic + accessibility + hotkey, Wren owns the model +
 speakers + HTTP.
 
 Constraint that shapes everything: **serve.py stays the server, and it must
@@ -129,17 +133,17 @@ on macOS, `~/.config/voice-ml/config.json` on Linux):
 - Model stays resident (warmup at start); no socket-activation cleverness -
   first-token latency is the product.
 
-## `voice` CLI shim
+## `wren` CLI shim
 
 Thin binary on PATH, curl inside, same body as the daemon's API:
 
-    voice say "hello there"        # POST /speak
-    voice say --append "and this"
-    voice stop | voice pause | voice resume
-    voice speed 1.4                # POST /config
-    voice status                   # GET /health, human-readable
+    wren say "hello there"         # POST /speak
+    wren say --append "and this"
+    wren stop | wren pause | wren resume
+    wren speed 1.4                 # POST /config
+    wren status                    # GET /health, human-readable
 
-Works against localhost or the tailscale box (`VOICE_ML_HOST`/`--host`).
+Works against localhost or the tailscale box (`WREN_HOST`/`--host`).
 Agents and shell scripts discover a binary on PATH more naturally than a
 port number, and it documents the API by existing.
 
