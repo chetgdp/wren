@@ -29,6 +29,23 @@ Endpoints:
                  the next synthesized segment: audio/wav with X-Seq, X-Epoch,
                  X-Block headers; 204 + X-Epoch on timeout. An epoch change
                  means playback was preempted: drop locally queued audio.
+    GET  /config -> live settings (voice, voices_dir, speed, fx, port,
+                 backend) plus "restart_required": true when a persisted
+                 change needs a daemon restart (model reload / rebind) to
+                 take effect - the manager's cue to restart the child
+    POST /config partial update, e.g. {"speed": 1.4}: validates, persists to
+                 the config file atomically, hot-applies speed and fx, marks
+                 voice/voices_dir/port/backend restart_required; responds
+                 with the same shape as GET /config plus "persisted": a
+                 failed file write leaves the change live in memory and
+                 reports "persisted": false with "persist_error". Unknown
+                 keys are 400 and nothing is written.
+
+Settings live in a JSON config file (--config; default
+~/Library/Application Support/voice-ml/config.json on macOS,
+$XDG_CONFIG_HOME/voice-ml/config.json elsewhere). It is read once at launch
+and rewritten on every accepted POST /config; command-line flags override it
+for one run without being written back.
 
 With --token (or $VOICE_ML_TOKEN), every request must carry
 "Authorization: Bearer <token>"; use it whenever --host exposes the daemon
@@ -57,6 +74,7 @@ import sys
 import tempfile
 import threading
 import time
+from dataclasses import asdict, dataclass, fields, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
@@ -67,7 +85,8 @@ os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 # streaming vs ~0.55 for bf16/PyTorch at any size), and 1.7B matches 0.6B
 # 4-bit for speed while sounding better. Regenerate with:
 #   uv run python -m mlx_audio.convert --hf-path Qwen/Qwen3-TTS-12Hz-1.7B-Base \
-#       --mlx-path models/Qwen3-TTS-12Hz-1.7B-Base-4bit -q --q-bits 4 --model-domain tts
+#       --mlx-path models/Qwen3-TTS-12Hz-1.7B-Base-4bit \
+#       -q --q-bits 4 --model-domain tts
 DEFAULT_MODEL = "models/Qwen3-TTS-12Hz-1.7B-Base-4bit"
 HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
@@ -90,6 +109,99 @@ ALLOWED_ORIGIN_SCHEMES = (
 # Rubber Band artifacts dominate outside this range and extreme values are
 # more likely a client bug than intent.
 SPEED_MIN, SPEED_MAX = 0.5, 3.0
+BACKEND_CHOICES = ("auto", "mlx", "qwen-tts", "qwentts")
+# Keys POST /config persists but cannot hot-apply (model reload or rebind);
+# a persisted drift from the launch snapshot is reported as restart_required.
+RESTART_KEYS = ("voice", "voices_dir", "port", "backend")
+
+
+@dataclass
+class Config:
+    """The config surface: exactly these fields, in this order. The file
+    doubles as a hand-edited UI, so daemon rewrites keep it pretty-printed
+    and stably ordered (field order) instead of mangling whatever the user
+    laid out.
+
+    Construction validates types and ranges (ValueError), so a Config in
+    hand is always well-formed. File-existence checks (the voice's wav+txt)
+    are separate via with_changes(check_files=True): POST /config must
+    reject an unresolvable voice, but at load the ref-audio resolution
+    already reports a missing file with the transcribe hint.
+    """
+
+    voice: str | None = None
+    voices_dir: str | None = None
+    speed: float = 1.0
+    fx: bool = False
+    port: int = DEFAULT_PORT
+    backend: str = "auto"
+
+    def __post_init__(self):
+        speed = self.speed
+        if (not isinstance(speed, (int, float)) or isinstance(speed, bool)
+                or not SPEED_MIN <= speed <= SPEED_MAX):
+            raise ValueError(
+                f"speed must be a number in [{SPEED_MIN}, {SPEED_MAX}]")
+        if not isinstance(self.fx, bool):
+            raise ValueError("fx must be a boolean")
+        port = self.port
+        if (not isinstance(port, int) or isinstance(port, bool)
+                or not 1 <= port <= 65535):
+            raise ValueError("port must be an integer in [1, 65535]")
+        if self.backend not in BACKEND_CHOICES:
+            raise ValueError(
+                f"backend must be one of: {', '.join(BACKEND_CHOICES)}")
+        for key in ("voice", "voices_dir"):
+            value = getattr(self, key)
+            if value is not None and not isinstance(value, str):
+                raise ValueError(f"{key} must be a string")
+        if self.voice is not None:
+            # A voice is a bare name resolved inside voices_dir, nothing
+            # else: separators or ".." would let a request read files
+            # outside it.
+            if ("/" in self.voice or "\\" in self.voice
+                    or self.voice in ("", ".", "..")):
+                raise ValueError(
+                    "voice must be a bare name (no path separators or ..)")
+            if self.voices_dir is None:
+                raise ValueError("voice requires voices_dir")
+
+    def with_changes(self, changes, check_files=False):
+        """Error-string API for callers that report instead of raise (POST
+        /config bodies, the config file at load): a partial dict applied on
+        top of self, so voice and voices_dir are checked as the merged
+        pair. Returns (new Config, None) or (None, error message)."""
+        for key in changes:
+            if key not in _CONFIG_FIELDS:
+                return None, f"unknown key: {key}"
+        try:
+            merged = replace(self, **changes)
+        except ValueError as exc:
+            return None, str(exc)
+        if check_files:
+            error = merged.check_voice_files()
+            if error:
+                return None, error
+        return merged, None
+
+    @classmethod
+    def from_dict(cls, raw, check_files=False):
+        """Raw dict merged over the defaults; same return as with_changes."""
+        return cls().with_changes(raw, check_files=check_files)
+
+    def check_voice_files(self):
+        """Error message when the voice's wav or transcript is missing."""
+        if self.voice is None:
+            return None
+        wav = resolve_voice(self.voice, self.voices_dir)
+        if not wav.exists():
+            return f"voice wav not found: {wav}"
+        if not wav.with_suffix(".txt").exists():
+            return f"voice transcript not found: {wav.with_suffix('.txt')}"
+        return None
+
+
+_CONFIG_FIELDS = tuple(f.name for f in fields(Config))
 
 
 def stretch_wav(path, speed):
@@ -104,7 +216,8 @@ def stretch_wav(path, speed):
 
 
 def sanitize_markdown(text):
-    """Strip markdown down to speakable prose. Code blocks are dropped entirely."""
+    """Strip markdown down to speakable prose. Code blocks are dropped
+    entirely."""
     text = re.sub(r"```.*?(```|\Z)", " ", text, flags=re.S)
     text = re.sub(r"~~~.*?(~~~|\Z)", " ", text, flags=re.S)
     text = re.sub(r"!\[[^\]]*\]\([^)]*\)", " ", text)  # images
@@ -114,7 +227,8 @@ def sanitize_markdown(text):
     text = re.sub(r"^\s*[-*+]\s+", "", text, flags=re.M)  # bullets
     text = re.sub(r"^\s*\d+\.\s+", "", text, flags=re.M)  # numbered lists
     text = re.sub(r"^\s*>\s?", "", text, flags=re.M)  # blockquotes
-    text = re.sub(r"^[|+\-=:\s]+$", "", text, flags=re.M)  # hr / table separator rows
+    # hr / table separator rows
+    text = re.sub(r"^[|+\-=:\s]+$", "", text, flags=re.M)
     text = re.sub(r"\*{1,3}|_{2,3}", "", text)  # bold/italic markers
     # emoji and dingbat/symbol/arrow blocks the model would try to vocalize
     text = re.sub(
@@ -132,7 +246,8 @@ _SENTENCE_BREAK = re.compile(r"(?<=[.!?;:])\s+")
 def estimate_frames(text):
     """English speech runs ~12-14 chars/sec and the codec emits 12 frames/sec,
     so frames ~= chars * 0.9. Same heuristic as progress_bar.estimate_frames,
-    duplicated here because that module imports torch (absent in the mlx env)."""
+    duplicated here because that module imports torch (absent in the mlx
+    env)."""
     return round(len(text.strip()) * 0.9)
 
 
@@ -355,7 +470,8 @@ class SegmentStore:
 
 
 class Speaker:
-    """Synth + playback pipeline. speak() preempts whatever is queued or playing.
+    """Synth + playback pipeline. speak() preempts whatever is queued or
+    playing.
 
     synth_fn(text, make_path) is a generator yielding wav paths as audio
     segments complete (streaming backends yield several per text; make_path()
@@ -555,7 +671,8 @@ class Speaker:
                 import traceback
                 traceback.print_exc()
                 print("model load failed; exiting", file=sys.stderr)
-                _cleanup_qwentts()  # os._exit skips atexit; no-op unless qwentts
+                # os._exit skips atexit; no-op unless qwentts
+                _cleanup_qwentts()
                 os._exit(1)
             self.ready.set()
         carry = None
@@ -608,7 +725,8 @@ class Speaker:
             block = (idxs[0], idxs[-1]) if idxs else None
             layout = (list(zip(idxs, (len(p) for p in parts)))
                       if idxs and len(idxs) == len(parts) else None)
-            print(f'synthesizing ({len(text)} chars, {self.pending()} queued): "{text}"',
+            print(f'synthesizing ({len(text)} chars, '
+                  f'{self.pending()} queued): "{text}"',
                   flush=True)
             t0 = time.monotonic()
             audio_s = 0.0
@@ -641,7 +759,8 @@ class Speaker:
                 print(f"synth failed: {exc}", file=sys.stderr)
                 continue
             wall = time.monotonic() - t0
-            print(f"  {audio_s:.1f}s audio in {wall:.1f}s (RTF {audio_s / wall:.2f})",
+            print(f"  {audio_s:.1f}s audio in {wall:.1f}s"
+                  f" (RTF {audio_s / wall:.2f})",
                   flush=True)
             # Recalibrate the highlight's speech-rate estimate from this
             # batch. Only un-preempted batches measure the full text; the
@@ -697,11 +816,23 @@ class App:
     """Shared server state. speaker is attached once the model finishes
     loading, so the server can come up (and report status) immediately."""
 
-    def __init__(self, model_id="", token=None, segments=None):
+    def __init__(self, model_id="", token=None, segments=None,
+                 config_path=None, config=None):
         self.model_id = model_id
         self.token = token
         self.segments = segments  # SegmentStore when --playback client
         self.speaker = None
+        self.config_path = config_path  # None: don't persist (tests)
+        self.config = config if config is not None else Config()
+        # Launch snapshot of the restart-only keys; /config reports
+        # restart_required once the persisted value drifts from it. Flag
+        # overrides stay out of this on purpose: they are one-off and the
+        # file is the truth a restart would come back to.
+        self.applied = {k: getattr(self.config, k) for k in RESTART_KEYS}
+        self.fx_enabled = self.config.fx  # live; read by wrap_fx
+        # POST /config does read-validate-update-save; serialize it so
+        # concurrent posts can't interleave a stale config into a save.
+        self.config_lock = threading.Lock()
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -734,6 +865,20 @@ class _Handler(BaseHTTPRequestHandler):
             return True
         self._json(401, {"error": "unauthorized"})
         return False
+
+    def _config_payload(self):
+        """GET and POST /config both return this: the live settings plus an
+        unambiguous restart_required so a manager (the future Swift app)
+        knows whether the daemon must be restarted to apply what the file
+        now says."""
+        app = self.app
+        live = asdict(app.config)
+        if app.speaker is not None:  # speed is live (also moved by /speak)
+            live["speed"] = app.speaker.speed
+        live["fx"] = app.fx_enabled
+        live["restart_required"] = any(
+            getattr(app.config, k) != app.applied[k] for k in RESTART_KEYS)
+        return live
 
     def _segment(self, query):
         store = self.app.segments
@@ -782,6 +927,8 @@ class _Handler(BaseHTTPRequestHandler):
                          if ready and speaker.current_block() else None,
                 "speed": speaker.speed if ready else None,
             })
+        elif url.path == "/config":
+            self._json(200, self._config_payload())
         elif url.path == "/segment":
             self._segment(parse_qs(url.query))
         else:
@@ -816,6 +963,9 @@ class _Handler(BaseHTTPRequestHandler):
         except (ValueError, json.JSONDecodeError):
             self._json(400, {"error": "invalid JSON"})
             return
+        if not isinstance(body, dict):
+            self._json(400, {"error": "body must be a JSON object"})
+            return
         if self.path == "/stop":
             speaker.stop()
             self._json(200, {"ok": True})
@@ -831,13 +981,44 @@ class _Handler(BaseHTTPRequestHandler):
                 delta = body.get("delta", 1)
                 if (not isinstance(delta, int) or isinstance(delta, bool)
                         or delta == 0):
-                    self._json(400, {"error": "delta must be a non-zero integer"})
+                    self._json(
+                        400, {"error": "delta must be a non-zero integer"})
                     return
                 target = speaker.seek(delta)
             if target is None:
                 self._json(200, {"ok": False, "error": "nothing to seek"})
             else:
                 self._json(200, {"ok": True, "block": target})
+            return
+        if self.path == "/config":
+            app = self.app
+            with app.config_lock:
+                updated, error = app.config.with_changes(body,
+                                                         check_files=True)
+                if error:
+                    self._json(400, {"error": error})
+                    return
+                app.config = updated
+                # Hot-apply what playback picks up mid-flight; the rest sits
+                # in the file and is reported via restart_required.
+                if "speed" in body:
+                    speaker.speed = float(body["speed"])
+                if "fx" in body:
+                    app.fx_enabled = body["fx"]
+                # Persist last: the change is already live in memory, so a
+                # failed write (disk full, permissions) must not undo it or
+                # crash the daemon - it is reported instead.
+                persist_error = None
+                if app.config_path is not None:
+                    try:
+                        save_config(app.config_path, app.config)
+                    except OSError as exc:
+                        persist_error = str(exc)
+                payload = self._config_payload()
+                payload["persisted"] = persist_error is None
+                if persist_error is not None:
+                    payload["persist_error"] = persist_error
+                self._json(200, payload)
             return
         if self.path == "/pause":
             speaker.pause()
@@ -945,7 +1126,8 @@ def load_qwen_tts_synth(model_id, ref_audio, ref_text, language, device="auto"):
 
 
 def load_mlx_synth(model_id, ref_audio, ref_text, language):
-    """MLX backend (mlx-community/Qwen3-TTS-* and other mlx-audio conversions)."""
+    """MLX backend (mlx-community/Qwen3-TTS-* and other mlx-audio
+    conversions)."""
     import numpy as np
     import soundfile as sf
     from mlx_audio.tts.utils import load_model
@@ -995,7 +1177,8 @@ def load_mlx_synth(model_id, ref_audio, ref_text, language):
             if audio.size == 0:
                 continue
             sr = getattr(result, "sample_rate", 24000)
-            cap_samples = (max_tokens - 1) * sr / 12.5  # codec is 12.5 frames/sec
+            # codec is 12.5 frames/sec
+            cap_samples = (max_tokens - 1) * sr / 12.5
             emitted += audio.size
             path = make_path()
             sf.write(path, audio, sr)
@@ -1171,13 +1354,16 @@ def load_qwentts_synth(model_id, ref_audio, ref_text, language, device="auto",
     return synth
 
 
-def wrap_fx(synth, ring_freq, ring_mix):
+def wrap_fx(synth, ring_freq, ring_mix, enabled=None):
     """Post-process every synthesized segment through the droid chain.
 
     One stateful DroidFX per synth call: segments of a stream are played
     gaplessly, so the ring-mod carrier and chorus LFO must continue across
     segment boundaries or the joins click. reset() per call keeps unrelated
     utterances from sharing filter tails.
+
+    enabled is a callable checked per synth call so POST /config can toggle
+    fx live without a model reload; None means always on.
     """
     import soundfile as sf
     from fx import DroidFX
@@ -1185,13 +1371,17 @@ def wrap_fx(synth, ring_freq, ring_mix):
     fx = DroidFX(ring_freq=ring_freq, ring_mix=ring_mix)
 
     def wrapped(text, make_path):
+        if enabled is not None and not enabled():
+            yield from synth(text, make_path)
+            return
         fx.reset()
         for path in synth(text, make_path):
             audio, sr = sf.read(path, dtype="float32")
             if audio.ndim == 2:  # (samples, channels) -> (channels, samples)
                 audio = audio.T
             processed = fx.process(audio, sr)
-            sf.write(path, processed.T if processed.ndim == 2 else processed, sr)
+            sf.write(path,
+                     processed.T if processed.ndim == 2 else processed, sr)
             yield path
 
     return wrapped
@@ -1242,41 +1432,123 @@ def resolve_ref_text(ref_audio, ref_text_path):
     return path.read_text().strip()
 
 
+def default_config_path():
+    if sys.platform == "darwin":
+        return Path.home() / "Library/Application Support/voice-ml/config.json"
+    base = os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config"
+    return Path(base) / "voice-ml/config.json"
+
+
+def resolve_voice(voice, voices_dir):
+    """A voice name resolves to voices_dir/<name>.wav with its transcript in
+    the sibling .txt - the same layout -r + resolve_ref_text expect."""
+    return Path(voices_dir).expanduser() / f"{voice}.wav"
+
+
+def load_config(path):
+    """File contents merged over the Config defaults. A missing file just
+    means defaults; a hand-broken file (bad JSON, unknown key, bad value) is
+    a startup error naming the file, because the file is hand-edited and a
+    traceback would bury the actual problem."""
+    path = Path(path)
+    if not path.exists():
+        return Config()
+    try:
+        data = json.loads(path.read_text())
+    except ValueError as exc:
+        raise SystemExit(f"config file {path} is not valid JSON: {exc}")
+    if not isinstance(data, dict):
+        raise SystemExit(f"config file {path} must contain a JSON object")
+    config, error = Config.from_dict(data)
+    if error:
+        raise SystemExit(f"config file {path}: {error}")
+    return config
+
+
+def save_config(path, config):
+    """Atomic write: full JSON to a temp file in the same directory, fsync,
+    then rename over config.json, so a crash mid-save (daemons die by
+    SIGKILL) never leaves a truncated file. Pretty-printed in Config field
+    order with a trailing newline so rewrites don't mangle a hand-kept file."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".config-",
+                               suffix=".json.tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(asdict(config), f, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def effective_settings(config, args):
+    """Flag-over-file merge for the keys flags can override. The flags
+    default to None so an absent flag is distinguishable from an explicit
+    value; flags are one-off dev overrides and are never written back.
+    A flag value that fails Config validation is a startup error."""
+    overrides = {key: getattr(args, key)
+                 for key in ("speed", "fx", "port", "backend")
+                 if getattr(args, key) is not None}
+    try:
+        return replace(config, **overrides)
+    except ValueError as exc:
+        raise SystemExit(str(exc))
+
+
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Voice-clone TTS daemon (loads the model once, speaks POSTed text).",
+        description=("Voice-clone TTS daemon "
+                     "(loads the model once, speaks POSTed text)."),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("-r", "--ref-audio", required=True, type=Path,
-                   help="reference voice clip (~3s wav)")
+    p.add_argument("-r", "--ref-audio", type=Path,
+                   help="reference voice clip (~3s wav); overrides the "
+                        "config file's voice/voices_dir")
     p.add_argument("--ref-text", type=Path,
                    help="transcript of --ref-audio (default: its sibling .txt)")
+    p.add_argument("--config", type=Path,
+                   help="settings file (default: ~/Library/Application "
+                        "Support/voice-ml/config.json on macOS, "
+                        "$XDG_CONFIG_HOME/voice-ml/config.json elsewhere); "
+                        "flags below override it for this run only")
     p.add_argument("-m", "--model", default=DEFAULT_MODEL,
                    help="TTS model id (HF repo)")
-    p.add_argument("-b", "--backend", choices=["auto", "mlx", "qwen-tts", "qwentts"],
-                   default="auto",
-                   help="auto picks whichever backend library is installed")
+    p.add_argument("-b", "--backend", choices=list(BACKEND_CHOICES),
+                   default=None,
+                   help="auto picks whichever backend library is installed "
+                        "(default: config file, or auto)")
     p.add_argument("-l", "--language", default="English",
                    help="language of the text (qwen-tts backend only)")
     p.add_argument("-d", "--device", choices=["auto", "cuda", "mps", "cpu"],
                    default="auto",
                    help="torch device (qwen-tts backend only); auto picks "
                         "cuda > mps > cpu")
-    p.add_argument("--fx", action="store_true",
-                   help="apply the droid effect chain (fx.py) to all output")
+    p.add_argument("--fx", action="store_true", default=None,
+                   help="apply the droid effect chain (fx.py) to all output "
+                        "(default: config file, or off)")
     p.add_argument("--fx-ring-freq", type=float, default=40.0,
                    help="droid ring modulator carrier Hz")
     p.add_argument("--fx-ring-mix", type=float, default=0.12,
                    help="droid ring modulator wet mix 0-1")
-    p.add_argument("-p", "--port", type=int, default=DEFAULT_PORT,
-                   help="port to listen on")
+    p.add_argument("-p", "--port", type=int, default=None,
+                   help=f"port to listen on (default: config file, or "
+                        f"{DEFAULT_PORT})")
     p.add_argument("--host", default=HOST,
                    help="address to bind (0.0.0.0 to serve the LAN; "
                         "set --token when doing so)")
-    p.add_argument("--speed", type=float, default=1.0,
+    p.add_argument("--speed", type=float, default=None,
                    help=f"default playback speed, pitch-preserving "
                         f"({SPEED_MIN}-{SPEED_MAX}); a /speak with a speed "
-                        f"field overrides it from then on")
+                        f"field overrides it from then on (default: config "
+                        f"file, or 1.0)")
     p.add_argument("--playback", choices=["local", "client"], default="local",
                    help="local: play audio on this machine; client: buffer "
                         "segments for clients to fetch via GET /segment")
@@ -1297,10 +1569,20 @@ def parse_args():
 
 def main():
     args = parse_args()
+    config_path = args.config or default_config_path()
+    config = load_config(config_path)
+    live = effective_settings(config, args)
+    # Downstream code reads args.*; fold the merged values back in.
+    args.speed = live.speed
+    args.port = live.port
+    args.backend = live.backend
+    if args.ref_audio is None:
+        if live.voice is None:
+            raise SystemExit(
+                f"no voice: pass -r, or set voice/voices_dir in {config_path}")
+        args.ref_audio = resolve_voice(live.voice, live.voices_dir)
     if not args.ref_audio.exists():
         raise SystemExit(f"ref-audio not found: {args.ref_audio}")
-    if not SPEED_MIN <= args.speed <= SPEED_MAX:
-        raise SystemExit(f"--speed must be in [{SPEED_MIN}, {SPEED_MAX}]")
     ref_text = resolve_ref_text(args.ref_audio, args.ref_text)
 
     if args.host not in ("127.0.0.1", "localhost", "::1") and not args.token:
@@ -1314,7 +1596,8 @@ def main():
                    if not getattr(args, a)]
         if missing:
             raise SystemExit(
-                f"--qwentts-{missing[0].split('_', 1)[1]} is required with -b qwentts"
+                f"--qwentts-{missing[0].split('_', 1)[1]}"
+                " is required with -b qwentts"
             )
         if args.qwentts_port == 0:
             args.qwentts_port = _pick_free_port()
@@ -1334,7 +1617,9 @@ def main():
     # Serve immediately so clients can see "loading" via /health; /speak
     # returns 503 until the model is loaded. The model loads inside the
     # Speaker's synth thread because MLX streams are thread-local.
-    app = App(model_id=args.model, token=args.token, segments=store)
+    app = App(model_id=args.model, token=args.token, segments=store,
+              config_path=config_path, config=config)
+    app.fx_enabled = live.fx  # --fx overrides the file for this run
     server = make_server(app, args.port, args.host)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     print(f"listening on http://{args.host}:{args.port}  "
@@ -1349,15 +1634,18 @@ def main():
             qwentts_codec=args.qwentts_codec,
             qwentts_port=args.qwentts_port,
         )
-        if args.fx:
-            synth = wrap_fx(synth, args.fx_ring_freq, args.fx_ring_mix)
+        # Always wrapped so POST /config can toggle fx live; the gate makes
+        # it a passthrough while disabled.
+        synth = wrap_fx(synth, args.fx_ring_freq, args.fx_ring_mix,
+                        enabled=lambda: app.fx_enabled)
         # Warm up before reporting ready: the first generation pays JIT and
         # cache costs (observed 4-20s extra) better spent at startup than on
         # the first real request.
         warm_dir = tempfile.mkdtemp(prefix="voice-warmup-")
         t0 = time.monotonic()
         for path in synth("Voice daemon warm up.",
-                          lambda: os.path.join(warm_dir, f"{time.monotonic_ns()}.wav")):
+                          lambda: os.path.join(
+                              warm_dir, f"{time.monotonic_ns()}.wav")):
             try:
                 os.unlink(path)
             except OSError:

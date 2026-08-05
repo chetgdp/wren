@@ -1,15 +1,19 @@
 """Tests for the TTS daemon (model mocked). Run: uv run pytest tts/"""
 
+import argparse
 import json
+import sys
 import threading
 import time
 import urllib.error
 import urllib.request
+from dataclasses import asdict, fields
 from pathlib import Path
 
-from serve import (MAX_BODY_BYTES, App, PCMPlayer, SegmentStore, Speaker,
-                   block_span, chunk_text, make_server, pick_backend,
-                   sanitize_markdown, stretch_wav)
+from serve import (MAX_BODY_BYTES, App, Config, PCMPlayer,
+                   SegmentStore, Speaker, block_span, chunk_text,
+                   default_config_path, effective_settings, load_config,
+                   make_server, pick_backend, sanitize_markdown, stretch_wav)
 
 
 def wait_for(cond, timeout=5.0):
@@ -40,7 +44,8 @@ def test_sanitize_strips_headers_bullets_emphasis():
 
 
 def test_sanitize_strips_emoji():
-    assert sanitize_markdown("Because light attracts bugs. 😄") == "Because light attracts bugs."
+    assert (sanitize_markdown("Because light attracts bugs. 😄")
+            == "Because light attracts bugs.")
     assert sanitize_markdown("done ✅ → next ⚡") == "done next"
 
 
@@ -64,7 +69,8 @@ def test_pick_backend_auto_resolves_to_installed_library():
 # --- chunk_text ---
 
 def test_chunk_short_text_single_chunk():
-    assert chunk_text("Hello there. General Kenobi.") == ["Hello there. General Kenobi."]
+    assert (chunk_text("Hello there. General Kenobi.")
+            == ["Hello there. General Kenobi."])
 
 
 def test_chunk_groups_sentences_under_limit():
@@ -229,7 +235,8 @@ def test_append_does_not_preempt():
     sp.speak("third part.", append=True)
     # Appends behind an in-flight synthesis coalesce, but everything plays
     # in order and nothing is preempted.
-    assert wait_for(lambda: " ".join(played) == "first part. second part. third part.")
+    assert wait_for(
+        lambda: " ".join(played) == "first part. second part. third part.")
 
 
 def test_speaker_factory_loads_in_synth_thread_and_sets_ready():
@@ -437,7 +444,8 @@ def test_speak_sanitizes_and_queues():
     played = []
     server, port = start_server(played)
     try:
-        status, body = request(port, "/speak", {"text": "Hello **world**. ```skip```"})
+        status, body = request(port, "/speak",
+                               {"text": "Hello **world**. ```skip```"})
         assert status == 200
         assert body["queued"] == 1
         assert wait_for(lambda: played == ["Hello world."])
@@ -642,7 +650,8 @@ def test_coalesced_batch_reports_block_range():
     sp = Speaker(synth, lambda path: Handle())
     sp.speak(blocks=[(0, "first.")])
     time.sleep(0.02)  # first synth in flight; the rest coalesce behind it
-    sp.speak(blocks=[(1, "second."), (2, "third."), (3, "fourth.")], append=True)
+    sp.speak(blocks=[(1, "second."), (2, "third."), (3, "fourth.")],
+             append=True)
     assert wait_for(lambda: len(played_blocks) == 2 and sp.pending() == 0)
     assert played_blocks[0] == (0, 0)
     assert played_blocks[1] == (1, 3)  # merged batch spans its blocks
@@ -652,8 +661,9 @@ def test_speak_blocks_endpoint_sanitizes_and_keeps_indices():
     played = []
     server, port = start_server(played)
     try:
-        status, body = request(port, "/speak",
-                               {"blocks": ["One.", "```dropped```", "**Two.**"]})
+        status, body = request(
+            port, "/speak",
+            {"blocks": ["One.", "```dropped```", "**Two.**"]})
         assert status == 200
         assert body["queued"] == 2
         assert wait_for(lambda: played == ["One.", "Two."])
@@ -1184,7 +1194,8 @@ def _make_qwentts_mock_server(port, ref_wav_b64, ref_text, stop_event=None):
 
     Endpoints:
       GET  /health                     -> {"status": "ok"}
-      POST /v1/audio/voices            -> registers voice, returns {"name": ..., "status": "registered"}
+      POST /v1/audio/voices            -> registers voice, returns
+                                          {"name": ..., "status": "registered"}
       POST /v1/audio/speech            -> returns WAV audio bytes
       GET  /v1/audio/voices            -> returns voices list
       GET  /v1/models                  -> returns model list
@@ -1216,7 +1227,8 @@ def _make_qwentts_mock_server(port, ref_wav_b64, ref_text, stop_event=None):
                 self.end_headers()
                 body = _json.dumps({
                     "object": "list",
-                    "data": [{"id": "mock-talker", "object": "model", "owned_by": "local"}],
+                    "data": [{"id": "mock-talker", "object": "model",
+                              "owned_by": "local"}],
                 })
                 self.wfile.write(body.encode())
             else:
@@ -1284,7 +1296,8 @@ def test_qwentts_load_synth_sends_correct_http_requests(tmp_path):
         port = s.getsockname()[1]
 
     stop_event = threading.Event()
-    server = _make_qwentts_mock_server(port, _wav_b64(), "ref text here", stop_event)
+    server = _make_qwentts_mock_server(port, _wav_b64(), "ref text here",
+                                       stop_event)
     try:
         ref_wav = tmp_path / "ref.wav"
         ref_wav.write_bytes(_make_wav_bytes())
@@ -1425,7 +1438,8 @@ def test_qwentts_synth_failure_after_server_stops(tmp_path):
         port = s.getsockname()[1]
 
     stop_event = threading.Event()
-    server = _make_qwentts_mock_server(port, _wav_b64(), "ref text here", stop_event)
+    server = _make_qwentts_mock_server(port, _wav_b64(), "ref text here",
+                                       stop_event)
     try:
         ref_wav = tmp_path / "ref.wav"
         ref_wav.write_bytes(_make_wav_bytes())
@@ -1450,3 +1464,339 @@ def test_qwentts_synth_failure_after_server_stops(tmp_path):
 
     with pytest.raises(RuntimeError):
         list(synth("Hello.", lambda: str(tmp_path / "out.wav")))
+
+
+# --- config file ---
+
+def test_default_config_path_per_platform(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "darwin")
+    assert default_config_path() == (
+        Path.home() / "Library/Application Support/voice-ml/config.json")
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    assert default_config_path() == Path.home() / ".config/voice-ml/config.json"
+    monkeypatch.setenv("XDG_CONFIG_HOME", "/x/cfg")
+    assert default_config_path() == Path("/x/cfg/voice-ml/config.json")
+
+
+def test_load_config_missing_file_is_defaults(tmp_path):
+    assert load_config(tmp_path / "config.json") == Config()
+
+
+def test_load_config_merges_partial_file_over_defaults(tmp_path):
+    path = tmp_path / "config.json"
+    path.write_text('{"speed": 1.4, "fx": true}')
+    cfg = load_config(path)
+    assert cfg.speed == 1.4 and cfg.fx is True
+    assert cfg.port == 8765 and cfg.backend == "auto"  # defaults kept
+
+
+def test_load_config_bad_json_is_a_clear_error_naming_the_file(tmp_path):
+    path = tmp_path / "config.json"
+    path.write_text('{"speed": 1.4,,}')
+    with pytest.raises(SystemExit) as exc_info:
+        load_config(path)
+    assert str(path) in str(exc_info.value)
+
+
+def test_load_config_rejects_unknown_key_and_bad_value(tmp_path):
+    path = tmp_path / "config.json"
+    path.write_text('{"spede": 1.4}')  # typo must not be silently ignored
+    with pytest.raises(SystemExit) as exc_info:
+        load_config(path)
+    assert "unknown key" in str(exc_info.value)
+    path.write_text('{"speed": "fast"}')
+    with pytest.raises(SystemExit):
+        load_config(path)
+    path.write_text('[1, 2]')
+    with pytest.raises(SystemExit):
+        load_config(path)
+
+
+def test_flags_override_file_values():
+    config = Config(speed=1.4, fx=True, port=9111, backend="qwentts")
+    args = argparse.Namespace(speed=2.0, fx=None, port=None, backend=None)
+    live = effective_settings(config, args)
+    assert live.speed == 2.0  # flag wins
+    assert live.fx is True  # file supplies everything not flagged
+    assert live.port == 9111
+    assert live.backend == "qwentts"
+
+
+# --- /config endpoints ---
+
+def _voice_files(voices_dir, name):
+    (voices_dir / f"{name}.wav").write_bytes(b"RIFF")
+    (voices_dir / f"{name}.txt").write_text("ref text")
+
+
+def start_config_server(tmp_path, overrides=None, token=None, ready=True,
+                        config_path=None):
+    voices = tmp_path / "voices"
+    voices.mkdir(exist_ok=True)
+    _voice_files(voices, "alpha")
+    _voice_files(voices, "beta")
+    if isinstance(overrides, Config):
+        config = overrides
+    else:
+        config = Config(voice="alpha", voices_dir=str(voices),
+                        **(overrides or {}))
+    config_path = config_path or tmp_path / "config.json"
+    app = App(model_id="test-model", token=token,
+              config_path=config_path, config=config)
+    if ready:
+        app.speaker = make_speaker([])
+    server = make_server(app, port=0)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, server.server_address[1], app, config_path
+
+
+def test_config_file_read_at_startup_serves_values(tmp_path):
+    voices = tmp_path / "voices"
+    voices.mkdir()
+    _voice_files(voices, "alpha")
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(
+        {"voice": "alpha", "voices_dir": str(voices), "fx": True}))
+    settings = load_config(config_path)
+    server, port, app, _ = start_config_server(tmp_path, overrides=settings)
+    try:
+        body = request(port, "/config")[1]
+        assert body["voice"] == "alpha"
+        assert body["fx"] is True
+        assert body["port"] == 8765  # missing key fell back to the default
+        assert body["restart_required"] is False
+    finally:
+        server.shutdown()
+
+
+def test_get_config_shape(tmp_path):
+    server, port, app, _ = start_config_server(tmp_path)
+    try:
+        status, body = request(port, "/config")
+        assert status == 200
+        assert set(body) == ({f.name for f in fields(Config)}
+                             | {"restart_required"})
+        assert body["voice"] == "alpha"
+        assert body["speed"] == 1.0
+        assert body["restart_required"] is False
+    finally:
+        server.shutdown()
+
+
+def test_post_config_speed_hot_applies_and_persists(tmp_path):
+    server, port, app, config_path = start_config_server(tmp_path)
+    try:
+        status, body = request(port, "/config", {"speed": 1.4})
+        assert status == 200
+        assert body["speed"] == 1.4
+        assert body["persisted"] is True
+        assert "persist_error" not in body
+        assert body["restart_required"] is False  # applied live
+        assert app.speaker.speed == 1.4
+        assert request(port, "/health")[1]["speed"] == 1.4
+        assert json.loads(config_path.read_text())["speed"] == 1.4
+    finally:
+        server.shutdown()
+
+
+def test_post_config_fx_hot_applies(tmp_path):
+    server, port, app, config_path = start_config_server(tmp_path)
+    try:
+        status, body = request(port, "/config", {"fx": True})
+        assert status == 200
+        assert body["fx"] is True
+        assert body["restart_required"] is False
+        assert app.fx_enabled is True  # the wrap_fx gate reads this live
+        assert json.loads(config_path.read_text())["fx"] is True
+    finally:
+        server.shutdown()
+
+
+def test_post_config_voice_change_sets_restart_required(tmp_path):
+    server, port, app, config_path = start_config_server(tmp_path)
+    try:
+        status, body = request(port, "/config", {"voice": "beta"})
+        assert status == 200
+        assert body["voice"] == "beta"
+        assert body["restart_required"] is True  # needs a model reload
+        assert request(port, "/config")[1]["restart_required"] is True
+        assert json.loads(config_path.read_text())["voice"] == "beta"
+        # back to the launch value: nothing pending anymore
+        status, body = request(port, "/config", {"voice": "alpha"})
+        assert body["restart_required"] is False
+    finally:
+        server.shutdown()
+
+
+def test_post_config_port_persists_but_never_hot_applies(tmp_path):
+    server, port, app, config_path = start_config_server(tmp_path)
+    try:
+        status, body = request(port, "/config", {"port": 9333})
+        assert status == 200
+        assert body["restart_required"] is True
+        assert json.loads(config_path.read_text())["port"] == 9333
+        assert request(port, "/health")[0] == 200  # old port still serving
+    finally:
+        server.shutdown()
+
+
+def test_post_config_unknown_key_400_and_nothing_written(tmp_path):
+    server, port, app, config_path = start_config_server(tmp_path)
+    try:
+        try:
+            request(port, "/config", {"speed": 1.4, "volume": 5})
+            assert False, "expected 400"
+        except urllib.error.HTTPError as e:
+            assert e.code == 400
+        assert not config_path.exists()  # rejected posts don't write
+        assert app.config.speed == 1.0
+        assert app.speaker.speed == 1.0
+    finally:
+        server.shutdown()
+
+
+def test_post_config_validation_rejects_bad_values(tmp_path):
+    server, port, app, config_path = start_config_server(tmp_path)
+    (tmp_path / "voices" / "notext.wav").write_bytes(b"RIFF")
+    try:
+        for bad in ({"speed": 5}, {"speed": "fast"}, {"speed": True},
+                    {"fx": "yes"}, {"fx": 1},
+                    {"port": 0}, {"port": "8765"}, {"port": True},
+                    {"backend": "gpt"}, {"voice": 5}, {"voices_dir": 5},
+                    {"voice": "ghost"},  # no such wav
+                    {"voice": "notext"},  # wav without its transcript
+                    {"voice": "alpha", "voices_dir": None}):
+            try:
+                request(port, "/config", bad)
+                assert False, f"expected 400 for {bad!r}"
+            except urllib.error.HTTPError as e:
+                assert e.code == 400
+        assert not config_path.exists()
+    finally:
+        server.shutdown()
+
+
+def test_config_endpoints_enforce_token_and_origin(tmp_path):
+    server, port, app, _ = start_config_server(tmp_path, token="sekrit")
+    try:
+        for body in (None, {"speed": 1.2}):
+            try:
+                request(port, "/config", body)
+                assert False, "expected 401"
+            except urllib.error.HTTPError as e:
+                assert e.code == 401
+        auth = {"Authorization": "Bearer sekrit"}
+        assert request(port, "/config", headers=auth)[0] == 200
+        status, body = request(port, "/config", {"speed": 1.2}, headers=auth)
+        assert status == 200 and body["speed"] == 1.2
+        try:
+            request(port, "/config", {"speed": 1.3},
+                    headers={**auth, "Origin": "https://evil.example"})
+            assert False, "expected 403"
+        except urllib.error.HTTPError as e:
+            assert e.code == 403
+    finally:
+        server.shutdown()
+
+
+def test_config_file_round_trips_pretty_with_no_temp_left(tmp_path):
+    server, port, app, config_path = start_config_server(tmp_path)
+    try:
+        request(port, "/config", {"speed": 1.4})
+        request(port, "/config", {"voice": "beta", "fx": True})
+        text = config_path.read_text()
+        assert text.endswith("\n")
+        assert text.startswith("{\n  ")  # pretty-printed for hand edits
+        on_disk = json.loads(text)
+        assert on_disk == asdict(app.config)  # round-trips the live truth
+        # stable key order (Config field order)
+        assert list(on_disk) == [f.name for f in fields(Config)]
+        leftovers = [p.name for p in tmp_path.iterdir()
+                     if p.name not in ("config.json", "voices")]
+        assert leftovers == []  # atomic replace left no temp files
+    finally:
+        server.shutdown()
+
+
+def test_post_config_rejects_path_traversal_voice(tmp_path):
+    server, port, app, config_path = start_config_server(tmp_path)
+    try:
+        for voice in ("../x", "a/b", "/etc/passwd", "..\\x", "..", ".", ""):
+            try:
+                request(port, "/config", {"voice": voice})
+                assert False, f"expected 400 for {voice!r}"
+            except urllib.error.HTTPError as e:
+                assert e.code == 400
+                assert "bare name" in json.loads(e.read())["error"]
+        assert not config_path.exists()  # rejected posts don't write
+        assert app.config.voice == "alpha"
+    finally:
+        server.shutdown()
+
+
+def test_load_config_rejects_path_traversal_voice(tmp_path):
+    path = tmp_path / "config.json"
+    for voice in ("../x", "a/b", "/etc/passwd"):
+        path.write_text(json.dumps(
+            {"voice": voice, "voices_dir": str(tmp_path)}))
+        with pytest.raises(SystemExit) as exc_info:
+            load_config(path)
+        assert str(path) in str(exc_info.value)
+        assert "bare name" in str(exc_info.value)
+
+
+def test_post_config_write_failure_still_applies_in_memory(tmp_path):
+    ro = tmp_path / "ro"
+    ro.mkdir()
+    ro.chmod(0o500)  # config writes into here must fail
+    server, port, app, config_path = start_config_server(
+        tmp_path, config_path=ro / "config.json")
+    try:
+        status, body = request(port, "/config", {"speed": 1.4, "fx": True})
+        assert status == 200  # persist failure is reported, not fatal
+        assert body["persisted"] is False
+        assert body["persist_error"]
+        assert body["speed"] == 1.4
+        assert app.speaker.speed == 1.4  # hot-applied despite the failure
+        assert app.fx_enabled is True
+        assert not config_path.exists()
+        assert request(port, "/config")[1]["speed"] == 1.4  # memory truth
+        assert request(port, "/health")[0] == 200  # daemon kept running
+    finally:
+        ro.chmod(0o700)
+        server.shutdown()
+
+
+def test_post_non_object_json_body_is_400(tmp_path):
+    server, port, app, _ = start_config_server(tmp_path)
+    try:
+        for path, raw in (("/config", b"5"), ("/config", b"null"),
+                          ("/config", b"true"), ("/config", b"[1, 2]"),
+                          ("/speak", b'"hello"')):
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}{path}", data=raw, method="POST")
+            try:
+                urllib.request.urlopen(req, timeout=5)
+                assert False, f"expected 400 for {raw!r} on {path}"
+            except urllib.error.HTTPError as e:
+                assert e.code == 400
+                assert json.loads(e.read())["error"]
+    finally:
+        server.shutdown()
+
+
+def test_post_config_503_while_model_loading(tmp_path):
+    # /config gets the same loading gate as every other POST route; GET
+    # serves throughout so a manager can read settings during load.
+    server, port, app, _ = start_config_server(tmp_path, ready=False)
+    try:
+        assert request(port, "/config")[0] == 200
+        try:
+            request(port, "/config", {"speed": 1.4})
+            assert False, "expected 503"
+        except urllib.error.HTTPError as e:
+            assert e.code == 503
+            assert "loading" in json.loads(e.read())["error"]
+    finally:
+        server.shutdown()

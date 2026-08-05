@@ -28,6 +28,11 @@ torch = [
     "qwen-tts>=0.1.1",
 ]
 
+# Bare `uv run pytest` must only collect the real suite, never vendored
+# checkouts (qwentts.cpp/ etc.).
+[tool.pytest.ini_options]
+testpaths = ["tts"]
+
 [tool.uv]
 package = false
 default-groups = ["dev", "mlx"]
