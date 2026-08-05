@@ -7,7 +7,8 @@ the original 1.7B baseline.
 
 Example:
     uv run tts/bench.py -r samples/ref.wav
-    uv run tts/bench.py -r samples/ref.wav -m mlx-community/Qwen3-TTS-12Hz-0.6B-Base-bf16
+    uv run tts/bench.py -r samples/ref.wav \
+        -m mlx-community/Qwen3-TTS-12Hz-0.6B-Base-bf16
 """
 
 import argparse
@@ -95,15 +96,18 @@ def bench_model(model_id, backend, ref_audio, ref_text, language, text, runs):
 
 
 def main():
-    p = argparse.ArgumentParser(description="Benchmark voice-clone synthesis speed.")
+    p = argparse.ArgumentParser(
+        description="Benchmark voice-clone synthesis speed.")
     p.add_argument("-r", "--ref-audio", required=True, type=Path)
     p.add_argument("--ref-text", type=Path)
     p.add_argument("-m", "--models", nargs="+", default=DEFAULT_MODELS,
                    help="model ids to benchmark in succession")
-    p.add_argument("-b", "--backend", choices=["auto", "mlx", "qwen-tts"], default="auto")
+    p.add_argument("-b", "--backend", choices=["auto", "mlx", "qwen-tts"],
+                   default="auto")
     p.add_argument("-l", "--language", default="English")
     p.add_argument("-t", "--text", default=BENCH_TEXT)
-    p.add_argument("--runs", type=int, default=2, help="timed runs after 1 warmup")
+    p.add_argument("--runs", type=int, default=2,
+                   help="timed runs after 1 warmup")
     args = p.parse_args()
 
     ref_text = resolve_ref_text(args.ref_audio, args.ref_text)
@@ -113,8 +117,10 @@ def main():
         print(f"\n=== {model_id} ===")
         try:
             load_s, rtf = bench_model(model_id, args.backend, args.ref_audio,
-                                      ref_text, args.language, args.text, args.runs)
-            summary.append((model_id, f"load {load_s:.0f}s, best RTF {rtf:.2f}"))
+                                      ref_text, args.language, args.text,
+                                      args.runs)
+            summary.append(
+                (model_id, f"load {load_s:.0f}s, best RTF {rtf:.2f}"))
         except Exception:
             traceback.print_exc()
             summary.append((model_id, "FAILED"))

@@ -30,8 +30,10 @@ def parse_args():
                    help="transcript of --ref-audio (default: its sibling .txt)")
     text = p.add_mutually_exclusive_group(required=True)
     text.add_argument("-t", "--text", help="text to speak, inline")
-    text.add_argument("-f", "--text-file", type=Path, help="file containing the text to speak")
-    p.add_argument("-o", "--output", type=Path, default=Path("output_voice_clone.wav"),
+    text.add_argument("-f", "--text-file", type=Path,
+                      help="file containing the text to speak")
+    p.add_argument("-o", "--output", type=Path,
+                   default=Path("output_voice_clone.wav"),
                    help="output wav path")
     p.add_argument("-l", "--language", default="English",
                    help="language of the text")

@@ -18,7 +18,8 @@ import argparse
 from pathlib import Path
 
 import numpy as np
-from pedalboard import Pedalboard, Chorus, Distortion, HighpassFilter, LowpassFilter, Gain
+from pedalboard import (Pedalboard, Chorus, Distortion, HighpassFilter,
+                        LowpassFilter, Gain)
 
 
 class DroidFX:
@@ -56,7 +57,8 @@ def main():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("input", type=Path, help="input wav")
-    p.add_argument("-o", "--output", type=Path, help="output wav (default: <input>_droid.wav)")
+    p.add_argument("-o", "--output", type=Path,
+                   help="output wav (default: <input>_droid.wav)")
     p.add_argument("--ring-freq", type=float, default=40.0,
                    help="ring modulator carrier Hz (lower = subtler growl)")
     p.add_argument("--ring-mix", type=float, default=0.12,

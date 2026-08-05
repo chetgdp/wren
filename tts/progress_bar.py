@@ -32,13 +32,14 @@ def attach_progress_bar(tts_model):
     class _BarTick(StoppingCriteria):
         def __init__(self):
             # total=None -> indeterminate: shows frame count, elapsed, rate.
-            # There's no meaningful endpoint (generation stops at a dynamic EOS),
-            # so we just track progress as it happens.
+            # There's no meaningful endpoint (generation stops at a
+            # dynamic EOS), so we just track progress as it happens.
             self.bar = tqdm(total=None, unit="frame", desc="synthesizing")
 
         def __call__(self, input_ids, scores, **kwargs):
             self.bar.update(1)
-            return torch.zeros(input_ids.shape[0], dtype=torch.bool, device=input_ids.device)
+            return torch.zeros(input_ids.shape[0], dtype=torch.bool,
+                               device=input_ids.device)
 
     def patched(*args, **kw):
         tick = _BarTick()

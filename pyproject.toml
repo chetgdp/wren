@@ -33,6 +33,9 @@ torch = [
 [tool.pytest.ini_options]
 testpaths = ["tts"]
 
+[tool.ruff]
+line-length = 80
+
 [tool.uv]
 package = false
 default-groups = ["dev", "mlx"]
