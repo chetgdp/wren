@@ -115,11 +115,56 @@ on macOS, `~/.config/voice-ml/config.json` on Linux):
 
 - serve.py grows `--config` (or reads the default path when flags are
   absent); flags stay as one-off overrides for development.
+- Persistence: read once at launch, live settings held in memory, written
+  back on every change (not at shutdown - daemons die by SIGKILL). Each
+  write is atomic: full content to a temp file in the same directory, then
+  rename over config.json, so a crash mid-save never leaves a truncated
+  file.
 - Menu bar: voice picker (scans voices_dir for wav+txt pairs), speed slider,
-  fx toggle, launch-at-login toggle, pause/stop buttons, "speaking" state in
-  the icon.
+  fx toggle, output-device picker (pure Swift, AVAudioEngine - never touches
+  the daemon), launch-at-login toggle, pause/stop buttons, "speaking" state
+  in the icon.
+- Adding a voice: two pickers, wav and txt, either one auto-fills the other
+  by matching basename (pick c3po.wav -> loads c3po.txt if present, and vice
+  versa); if the counterpart is missing the user picks it by hand.
 - POST /config persists to the file; the manager restarts the child when a
   change (voice) needs a model reload, hot-applies when it doesn't (speed).
+
+## App bundle: mirror Otis
+
+Otis is a single SwiftPM binary (WhisperKit is native Swift, no child);
+its scripts/bundle.sh hand-assembles Otis.app, signs every build with the
+same local identity so TCC grants survive rebuilds, installs via two-rename
+swap, and symlinks the bundle binary into ~/.local/bin. Wren gets the same
+treatment - same script shape, own logo for app icon + menu bar.
+
+Self-contained launch is a Phase A requirement, not Phase B polish. The
+product moment is command-space, "wren", enter - no repo checkout, no
+visible uv, no terminal, ever. `uv run` against the repo checkout remains
+as a dev mode only, never the user path. Phase B is then only about whether
+the Python orchestration layer gets rewritten in Swift, not about
+launchability.
+
+Concrete bundle manifest (inventoried 2026-08-04):
+
+- Engine: tts-server is 1.7 MB + five libggml dylibs (base/cpu/blas/metal),
+  all @rpath-linked - ship them in Contents/Resources/engine/, fix rpath or
+  set DYLD_LIBRARY_PATH when spawning. No .metallib in the build dir, which
+  suggests the Metal shader is embedded in libggml-metal (verify: run
+  tts-server from a path with no build tree next to it).
+- Python: macOS bundles the qwentts backend ONLY - serve.py's needs then
+  shrink to soundfile, pedalboard (fx), numpy, stdlib http (sounddevice
+  excluded: client playback mode). No mlx-audio, no torch - that's the
+  difference between a ~50 MB env and a multi-GB one. MLX stays a dev/Linux
+  backend. Provision the env on first run with a bundled uv binary
+  (single static file in Contents/Resources) into Application Support;
+  serve.py + tts/ support files ship in Resources.
+- Models: the two GGUFs are 2.2 GB (talker Q8_0 1.9 GB + tokenizer 278 MB) -
+  never in the bundle. First-run download into
+  ~/Library/Application Support/voice-ml/models (fetch-models.sh already
+  knows the URLs), with a progress UI in the menu bar popover.
+- Voices: ref wav+txt pairs live in Application Support/voices; the app
+  seeds it with the default voice on first run.
 
 ## Lifecycle: mirror cawker
 
@@ -147,17 +192,28 @@ Works against localhost or the tailscale box (`WREN_HOST`/`--host`).
 Agents and shell scripts discover a binary on PATH more naturally than a
 port number, and it documents the API by existing.
 
+Written in Swift, and it IS the app binary - the Otis pattern: one SwiftPM
+executable that runs as the menu bar app when launched from Spotlight and
+as the CLI when invoked with a subcommand (ArgumentParser), symlinked from
+the bundle into ~/.local/bin. One executable, one codebase, one signed
+identity. Step 2 starts this binary with just the CLI subcommands (HTTP
+client only, no UI); the menu bar app grows in the same executable at step
+4.
+
 ## Steps
 
 1. ~~Benchmark~~ (done; speed passed, quality comparison pending MLX-8bit).
 2. serve.py: config-file support + /config endpoints (+ tests). Benefits
-   Linux immediately, prerequisite for the manager app.
-3. Swift manager skeleton: menu bar app that spawns serve.py --playback
-   client, /health icon, quit-kills-child, LaunchAgent.
-4. Swift segment player: /segment long-poll loop -> AVAudioEngine +
-   AVAudioUnitTimePitch, epoch-aware preemption (port offscreen.js's
-   scheduling logic). Daemon runs speed 1 in client mode by convention;
-   the player owns the rate.
+   Linux immediately, freezes the full API before any Swift is written.
+3. `wren` CLI (first Swift): say/stop/pause/resume/status/speed against the
+   finished server API.
+4. Swift app, player first: the /segment long-poll loop -> AVAudioEngine +
+   AVAudioUnitTimePitch with epoch-aware preemption (port offscreen.js's
+   scheduling logic) is the core of the app, not an add-on - native audio
+   is the reason Swift is here. The app spawns serve.py --playback client
+   from day one (no sounddevice on macOS), /health icon, quit-kills-child,
+   LaunchAgent. Daemon runs speed 1 in client mode by convention; the
+   player owns the rate.
 5. Menu bar controls wired to /config; voice-change restart handling.
-6. `voice` shim, install script, doctor.
+6. Install script, doctor.
 7. Decide on Phase B only after living with Phase A.
