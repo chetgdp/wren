@@ -1,13 +1,20 @@
 // Service worker: proxies daemon calls for content scripts, owns the
-// context menus, and manages the offscreen audio player used when the
-// daemon runs with --playback client (e.g. a remote CUDA box).
+// context menus, and manages the offscreen audio player. The extension is
+// its own daemon channel: every request it makes carries
+// channel "extension" and its audio always streams back via GET /segment,
+// regardless of how the daemon plays the local channel.
 
 const DEFAULTS = { base: "http://127.0.0.1:8765", token: "", rate: 1 };
+const CHANNEL = "extension";
+// Calls that act on a channel; keeping them on the extension's own channel
+// means its pause/stop buttons never silence other channels' speech.
+const CHANNEL_PATHS = ["/speak", "/stop", "/pause", "/resume", "/seek"];
 
 const config = () => chrome.storage.sync.get(DEFAULTS);
 
 async function call(path, body) {
   const { base, token } = await config();
+  if (CHANNEL_PATHS.includes(path)) body = { channel: CHANNEL, ...body };
   const res = await fetch(base + path, {
     method: path === "/health" ? "GET" : "POST",
     headers: token ? { Authorization: `Bearer ${token}` } : {},
@@ -31,19 +38,12 @@ async function post(path, body) {
   }
 }
 
-// --- client playback (daemon started with --playback client) ---
+// --- client playback of the extension channel ---
 // An offscreen document fetches /segment and plays through Web Audio; the
 // service worker can't play audio and in-page playback would hit autoplay
 // blocking on context-menu speaks (no user gesture in the page).
 
 async function ensureClientPlayback(flush) {
-  let health;
-  try {
-    health = await call("/health");
-  } catch {
-    return;
-  }
-  if (health.playback !== "client") return;
   const { base, token, rate } = await config();
   try {
     if (!(await chrome.offscreen.hasDocument()))
@@ -55,13 +55,40 @@ async function ensureClientPlayback(flush) {
   } catch (e) {
     if (!e.message?.includes("single offscreen")) throw e; // create race
   }
-  // flush cuts audio already scheduled locally: a preempting /speak already
-  // invalidated it server-side, but the player only notices the epoch bump
-  // when the next segment arrives.
+  // Chrome reaps AUDIO_PLAYBACK documents after ~30s without audio, and
+  // waiting for the machine queue's turn is silent by design; the alarm
+  // rebuilds the player so an interrupted page read resumes instead of
+  // dying (see onAlarm below).
+  chrome.alarms.create("player-keepalive", { periodInMinutes: 0.5 });
+  // The stream cursor survives document teardown here (offscreen docs get
+  // no chrome.storage); a rebuilt player resumes after what it already
+  // played instead of replaying the server's buffer. A preempting speak
+  // invalidated the buffer server-side, so a flush start needs no cursor
+  // (and skipping it lets a fresh document track a restarted daemon).
+  const { playerCursor } = await chrome.storage.session.get("playerCursor");
   chrome.runtime
-    .sendMessage({ cmd: "player", action: "start", base, token, rate, flush })
+    .sendMessage({ cmd: "player", action: "start", base, token, rate, flush,
+                   cursor: flush ? null : playerCursor })
     .catch(() => {});
 }
+
+chrome.alarms.onAlarm.addListener(async (alarm) => {
+  if (alarm.name !== "player-keepalive") return;
+  if (await chrome.offscreen.hasDocument()) return;
+  let health;
+  try {
+    health = await call("/health");
+  } catch {
+    return; // transient daemon hiccup: stay armed, retry next period
+  }
+  const ch = health.channels?.[CHANNEL];
+  if (ch?.paused) return; // togglePlayer rebuilds on resume, not before
+  // "active" covers what pending/speaking miss: a channel parked waiting
+  // for its machine-queue turn holds a mid-utterance batch with pending 0,
+  // and clearing here would strand the rest of the read.
+  if (ch?.active) await ensureClientPlayback(false);
+  else chrome.alarms.clear("player-keepalive"); // session over; let it rest
+});
 
 // Pause/resume of client playback routes through here rather than straight
 // to the offscreen player: a suspended AudioContext produces no audio, so
@@ -176,8 +203,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       .then(sendResponse);
     return true; // async response
   }
+  if (msg.cmd === "cursor") {
+    // The offscreen player's stream position, persisted so a rebuilt
+    // document resumes where the reaped one left off.
+    chrome.storage.session.set({
+      playerCursor: { seq: msg.seq, played: msg.played },
+    });
+    return;
+  }
   if (msg.cmd === "player") return; // overlay/self -> offscreen; not for us
   if (!msg.path) return;
+  if (msg.path === "/stop") chrome.alarms.clear("player-keepalive");
   // Content scripts proxy daemon calls through here (they hit CORS directly).
   // A successful /speak also injects the overlay into the sending tab.
   call(msg.path, msg.body)

@@ -1,8 +1,7 @@
 // Persistent keybinds on every page: i speaks the selection, p with a
 // selection starts read-page mode from it, p without toggles pause on the
 // active overlay (or starts read-page mode), o stops, j/k seek by
-// sentence, J/K by paragraph, </> slow down / speed up (client playback
-// only). The overlay
+// sentence, J/K by paragraph, </> slow down / speed up. The overlay
 // (injected by the background worker after a speak) shares this isolated
 // world and exposes its controls on window.__voiceMlOverlay.
 
@@ -233,9 +232,10 @@ function paragraphSeek(dir) {
   seek({ block: target });
 }
 
-// Playhead state pushed by the offscreen player (client-playback daemons),
-// forwarded here by the background worker. The overlay reads it instead of
-// /health's block/paused, which only reflect server-side playback.
+// Playhead state pushed by the offscreen player (which plays the
+// extension's channel), forwarded here by the background worker. The
+// overlay reads it instead of /health's block/paused, which only reflect
+// server-side playback.
 window.__voiceMlClientState = { playing: false, paused: false };
 
 chrome.runtime.onMessage.addListener((msg) => {

@@ -1,7 +1,9 @@
-// Offscreen audio player for --playback client daemons: long-polls
+// Offscreen audio player for the daemon's "extension" channel: long-polls
 // GET /segment, decodes each wav, and schedules it gaplessly on one
 // AudioContext. An X-Epoch change means the server preempted (new /speak,
-// /stop, /seek): drop everything scheduled locally.
+// /stop, /seek): drop everything scheduled locally. Each poll reports the
+// played cursor (highest seq finished playing) so the daemon's machine
+// queue can hand the audible turn to the next channel.
 //
 // Reports the playhead (block range of the audible segment) to the
 // background worker every 250ms; it forwards to the speaking tab for the
@@ -19,8 +21,10 @@ let token = "";
 let running = false;
 let lastSeq = 0;
 let lastEpoch = null;
+let playedSeq = 0; // highest seq whose audio finished playing here
+let pollAbort = null; // in-flight /segment poll; .played is what it reported
 let nextTime = 0;
-let scheduled = []; // [{source, gain, raw, rate, offset, start, end, block}]
+let scheduled = []; // [{source, gain, raw, rate, offset, start, end, block, seq}]
 let reportTimer = null;
 // Offscreen documents can only use chrome.runtime messaging, so the rate
 // arrives with the "start" message (background reads storage) and changes
@@ -115,8 +119,27 @@ function flush() {
   nextTime = 0;
 }
 
+// A finished segment moves the played cursor. Turn handoff hangs on this
+// report: the machine queue only passes the mic once the last segment is
+// reported played, so a parked long-poll (carrying a stale cursor) is
+// aborted and re-issued instead of waiting out its timeout.
+function notePlayed(seq) {
+  if (seq == null || seq <= playedSeq) return;
+  playedSeq = seq;
+  sendCursor();
+  if (pollAbort && pollAbort.played < playedSeq) pollAbort.abort();
+}
+
+// Background persists the cursor so a rebuilt document resumes from it.
+function sendCursor() {
+  chrome.runtime
+    .sendMessage({ cmd: "cursor", seq: lastSeq, played: playedSeq })
+    .catch(() => {});
+}
+
 function report() {
   const now = ctx.currentTime;
+  for (const s of scheduled) if (s.end <= now) notePlayed(s.seq);
   scheduled = scheduled.filter((s) => s.end > now);
   const cur = scheduled.find((s) => s.start <= now);
   const playing = scheduled.length > 0;
@@ -150,7 +173,7 @@ function makeSource(buf, when, offset, playbackRate) {
 // Play raw's content from contentSec onward at the current rate, starting
 // at time when. Stretched audio plays at playbackRate 1; if stretching
 // fails, raw plays resampled (pitch shifts) rather than going silent.
-function play(raw, when, contentSec, block) {
+function play(raw, when, contentSec, block, seq) {
   let buf = raw;
   let bufOffset = contentSec;
   let playbackRate = 1;
@@ -173,14 +196,14 @@ function play(raw, when, contentSec, block) {
   }
   const { source, gain } = makeSource(buf, when, bufOffset, playbackRate);
   const end = when + (buf.duration - bufOffset) / playbackRate;
-  const entry = { source, gain, raw, rate, offset: contentSec, start: when, end, block };
+  const entry = { source, gain, raw, rate, offset: contentSec, start: when, end, block, seq };
   scheduled.push(entry);
   return entry;
 }
 
-function schedule(buf, block) {
+function schedule(buf, block, seq) {
   const start = Math.max(ctx.currentTime, nextTime);
-  const entry = play(buf, start, 0, block);
+  const entry = play(buf, start, 0, block, seq);
   if (!entry) return;
   nextTime = entry.end;
   if (!reportTimer) {
@@ -220,8 +243,11 @@ function setRate(target) {
     const audible = s.start < now;
     const offset = s.offset + (audible ? (now - s.start) * s.rate : 0);
     stopEntry(s, now);
-    const entry = play(s.raw, t, offset, s.block);
-    if (!entry) continue; // segment finishes right at the splice
+    const entry = play(s.raw, t, offset, s.block, s.seq);
+    if (!entry) { // segment finishes right at the splice
+      notePlayed(s.seq);
+      continue;
+    }
     if (audible) { // fade in at the splice point
       entry.gain.gain.setValueAtTime(0, t);
       entry.gain.gain.linearRampToValueAtTime(1, t + FADE);
@@ -240,16 +266,23 @@ async function loop() {
   running = true;
   while (running) {
     let resp;
+    pollAbort = new AbortController();
+    pollAbort.played = playedSeq;
     try {
-      resp = await fetch(`${base}/segment?after=${lastSeq}&timeout=20`, {
-        headers: auth(),
-      });
-    } catch {
+      resp = await fetch(
+        `${base}/segment?channel=extension&after=${lastSeq}` +
+          `&played=${playedSeq}&timeout=20`,
+        { headers: auth(), signal: pollAbort.signal }
+      );
+    } catch (e) {
+      pollAbort = null;
+      if (e.name === "AbortError") continue; // played advanced; re-poll now
       await sleep(1000); // daemon restarting/unreachable; keep trying
       continue;
     }
+    pollAbort = null;
     if (!resp.ok && resp.status !== 204) {
-      // 401 bad token / 404 daemon switched to local playback: stop looping
+      // 401 bad token / 400 channel rejected: stop looping
       console.warn("voice-ml player:", resp.status);
       flush();
       running = false;
@@ -260,10 +293,12 @@ async function loop() {
     lastEpoch = epoch;
     if (resp.status === 204) continue; // long-poll timeout; poll again
     lastSeq = Number(resp.headers.get("X-Seq"));
+    sendCursor();
     const blockHdr = resp.headers.get("X-Block");
     const block = blockHdr ? blockHdr.split(",").map(Number) : null;
     try {
-      schedule(await ctx.decodeAudioData(await resp.arrayBuffer()), block);
+      schedule(await ctx.decodeAudioData(await resp.arrayBuffer()), block,
+               lastSeq);
     } catch (e) {
       console.warn("voice-ml player: bad segment,", e.message);
     }
@@ -276,6 +311,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     base = msg.base;
     token = msg.token;
     if (msg.rate != null) rate = clampRate(msg.rate);
+    // A rebuilt document resumes from the persisted played cursor, not
+    // the fetched one: segments the reaped document fetched but never
+    // finished playing must be re-fetched (the server still buffers
+    // seq > after), not skipped. A live document's own counters are
+    // already >= played, so the Math.max never rewinds it.
+    if (msg.cursor) {
+      lastSeq = Math.max(lastSeq, msg.cursor.played || 0);
+      playedSeq = Math.max(playedSeq, msg.cursor.played || 0);
+    }
     if (!ctx) ctx = new AudioContext();
     if (msg.flush) flush();
     if (ctx.state === "suspended") ctx.resume();

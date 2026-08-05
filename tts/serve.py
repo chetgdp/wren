@@ -6,25 +6,37 @@ raw agent output. Text is chunked into sentence groups so playback starts
 after the first chunk instead of after the whole message. A new /speak or
 /stop preempts anything still queued or playing.
 
-Endpoints:
+Endpoints (every playback POST takes an optional "channel"; see Channels):
     POST /speak  {"text": "...", "raw": false, "append": false,
-                  "speed": 1.5} -> {"queued": n}
+                  "speed": 1.5, "channel": "name"} -> {"queued": n}
                  speed (0.5-3.0) time-stretches output pitch-preserved and
                  sticks until the next request that sets it (or the --speed
                  default)
                  {"blocks": ["...", ...], ...}: indexed blocks; /health then
                  reports which block range is currently audible (read mode)
-    POST /stop                                                  -> {"ok": true}
-    POST /pause                                 -> {"ok": true, "paused": true}
-                 pauses local playback; the playhead stops, so synthesis
-                 parks on its own once the lookahead budget is spent
-    POST /resume                               -> {"ok": true, "paused": false}
-    POST /seek   {"delta": 1} | {"block": n} -> {"ok": true, "block": n};
-                 skips relative to what is playing, or to an absolute block
-                 index (needs a prior blocks speak)
-    GET  /health -> {"ok": true, "pending": n, "speaking": b, "paused": b,
+    POST /stop   {"channel": "name"} stops that channel only; without a
+                 channel it stops every channel              -> {"ok": true}
+    POST /pause  {"channel": "name"}           -> {"ok": true, "paused": true}
+                 pauses that channel's playback (omitted = local); the
+                 playhead stops, so synthesis parks on its own once the
+                 lookahead budget is spent
+    POST /resume {"channel": "name"}          -> {"ok": true, "paused": false}
+    POST /seek   {"delta": 1} | {"block": n}, plus optional "channel"
+                 -> {"ok": true, "block": n}; skips relative to what that
+                 channel is playing, or to an absolute block index (needs a
+                 prior blocks speak on the channel)
+    GET  /health -> {"ok": true, "ready": b, "model": "...", "pending": n,
+                     "speaking": b, "paused": b,
                      "block": [lo, hi] | null, "playback": "local"|"client",
-                     "speed": f}
+                     "speed": f, "channels": {name: {"pending": n,
+                     "speaking": b, "paused": b, "block": [lo, hi] | null,
+                     "active": b}}}
+                 top-level pending/speaking are machine-wide sums; paused
+                 and block are the local channel's, so pre-channel clients
+                 keep their old reading. A channel's "active" is true while
+                 it holds ANY unfinished content, including what pending
+                 misses (a batch parked mid-utterance, segments awaiting
+                 the machine turn): waiting must not read as finished
     GET  /segment?after=n[&timeout=s][&channel=name][&played=k]  long-poll
                  for the next synthesized segment of a channel's stream:
                  audio/wav with X-Seq, X-Epoch, X-Block headers; 204 +
@@ -956,7 +968,7 @@ class Speaker:
         self._terminate_current()
         if hasattr(self._play, "invalidate"):  # client segment stream
             self._play.invalidate()
-        self.resume()  # a paused player would sit on the new audio
+        self._resume_locked()  # a paused player would sit on the new audio
         self._last_played = None
         # Stop reporting the preempted segment's position now; waiting for
         # the cancelled handle to unwind leaves /health pointing at audio
@@ -1014,7 +1026,8 @@ class Speaker:
             self._terminate_current()
             if hasattr(self._play, "invalidate"):
                 self._play.invalidate()
-            self.resume()
+            self._resume_locked()
+        self._worker.wake()
 
     def pause(self):
         """Pause playback. The playhead stops, so the worker parks on its
@@ -1033,11 +1046,20 @@ class Speaker:
         return True
 
     def resume(self):
+        # Flag and player state move as one unit under the same lock
+        # pause() takes, so an interleaved pause/resume flurry can never
+        # leave the flag and the player disagreeing.
+        with self._lock:
+            self._resume_locked()
+        self._worker.wake()  # a parked batch is schedulable again
+        return True
+
+    def _resume_locked(self):
+        """resume() for callers already holding self._lock (preempt/stop
+        paths); the lock is not reentrant."""
         self._pause.clear()
         if hasattr(self._play, "resume"):
             self._play.resume()
-        self._worker.wake()  # a parked batch is schedulable again
-        return True
 
     def paused(self):
         return self._pause.is_set()
@@ -1314,6 +1336,13 @@ class MachineQueue:
 
     def holder(self):
         return self._holder
+
+    def queued(self, name):
+        """Turn membership: holding the turn, waiting in line, or parked
+        mid-utterance for a resume."""
+        with self._cond:
+            return (name == self._holder or name in self._line
+                    or name in self._resume)
 
     def may_render(self, name):
         """Synth gate: only the unchallenged holder renders new segments.
@@ -1634,7 +1663,11 @@ class ChannelManager:
                 # over whoever holds the turn. Clear the pause flag (the
                 # arbiter sees the channel as eligible again) but keep
                 # the player muted until the turn actually comes back.
-                speaker._pause.clear()
+                # Under the speaker's lock: pause() moves flag and player
+                # as one unit there, so this clear must too, or a racing
+                # pause lands between them and is silently undone.
+                with speaker._lock:
+                    speaker._pause.clear()
                 self._resume_when_granted(name, speaker)
                 speaker._worker.wake()
             else:
@@ -1717,21 +1750,30 @@ class ChannelManager:
     def snapshot(self):
         """/health's channels dict. A client channel is speaking iff it
         has released segments not yet reported played and is not paused;
-        the daemon-played local channel is speaking when its player is."""
+        the daemon-played local channel is speaking when its player is.
+
+        "active" tells clients whether ANY content is unfinished. pending
+        alone lies about a channel parked waiting for its playback turn:
+        a mid-utterance batch and in-limbo popped segments sit in no
+        queue, and released can be 0, so a waiting channel would read as
+        finished and clients would tear their players down mid-read."""
         with self._lock:
             channels = dict(self._channels)
         out = {}
         for name, ch in channels.items():
             speaker = ch.speaker
+            st = self._state(ch)
             if ch.store is not None:
-                released = ch.store.release_stats()[0]
-                speaking = released > 0 and not speaker.paused()
+                speaking = st["released"] > 0 and not st["paused"]
             else:
                 speaking = speaker.speaking()
+            active = (st["has_text"] or st["rendered"] > 0
+                      or st["released"] > 0 or self.queue.queued(name))
             block = speaker.current_block()
             out[name] = {"pending": speaker.pending(), "speaking": speaking,
-                         "paused": speaker.paused(),
-                         "block": list(block) if block else None}
+                         "paused": st["paused"],
+                         "block": list(block) if block else None,
+                         "active": active}
         return out
 
     def _kill(self, name):
@@ -1786,7 +1828,7 @@ class App:
                  config_path=None, config=None):
         self.model_id = model_id
         self.token = token
-        self.segments = segments  # SegmentStore when --playback client
+        self.segments = segments  # SegmentStore when --local-player client
         self.speaker = None
         self.config_path = config_path  # None: don't persist (tests)
         self.config = config if config is not None else Config()
@@ -1955,6 +1997,8 @@ class _Handler(BaseHTTPRequestHandler):
                     "speaking": payload["speaking"],
                     "paused": payload["paused"],
                     "block": payload["block"],
+                    "active": (payload["pending"] > 0
+                               or payload["speaking"]),
                 }}
             self._json(200, payload)
         elif url.path == "/config":
@@ -2623,9 +2667,6 @@ def parse_args():
                         "this machine (default); client buffers the local "
                         "stream for a player to fetch via GET /segment. "
                         "Named channels are always client-played streams.")
-    p.add_argument("--playback", choices=["local", "client"], default=None,
-                   help="deprecated alias: 'client' means "
-                        "--local-player client")
     p.add_argument("--token", default=os.environ.get("VOICE_ML_TOKEN"),
                    help="require 'Authorization: Bearer <token>' on every "
                         "request (default: $VOICE_ML_TOKEN)")
@@ -2639,17 +2680,6 @@ def parse_args():
     p.add_argument("--qwentts-port", type=int, default=0,
                    help="localhost port for tts-server (0 = pick a free port)")
     return p.parse_args()
-
-
-def resolve_local_player(local_player, playback):
-    """--playback predates channels and stays one more stage so existing
-    launch scripts keep working; an explicit --local-player wins."""
-    if playback is not None:
-        print("--playback is deprecated; use --local-player "
-              "{daemon|client}", file=sys.stderr)
-        if local_player is None:
-            return "client" if playback == "client" else "daemon"
-    return local_player or "daemon"
 
 
 def main():
@@ -2673,7 +2703,7 @@ def main():
     if args.host not in ("127.0.0.1", "localhost", "::1") and not args.token:
         print("warning: binding beyond loopback with no --token; anyone on "
               "the network can drive synthesis", file=sys.stderr)
-    local_player = resolve_local_player(args.local_player, args.playback)
+    local_player = args.local_player or "daemon"
     store = SegmentStore() if local_player == "client" else None
 
     # qwentts: validate required flags and pick a free port if needed.

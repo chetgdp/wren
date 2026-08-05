@@ -42,7 +42,7 @@
         display: inline-block; min-width: 34px; text-align: center; color: #aaa;
       }
     </style>
-    <div class="box">
+    <div class="box client">
       <span class="status">speaking</span>
       <button id="rdown" class="ratectl" title="Slower (<)">-</button>
       <span id="rate" class="ratectl">1x</span>
@@ -59,12 +59,10 @@
 
   const statusEl = root.querySelector(".status");
   const pauseBtn = root.querySelector("#pause");
-  const boxEl = root.querySelector(".box");
   const rateEl = root.querySelector("#rate");
   let paused = false;
   let idlePolls = 0;
   let timer = null;
-  let clientMode = false; // daemon runs --playback client; audio is local
 
   function render(h) {
     paused = !!h.paused;
@@ -93,25 +91,23 @@
       h = null; // extension reloaded; sendMessage throws
     }
     if (!h || h.error) return remove();
-    clientMode = h.playback === "client";
-    boxEl.classList.toggle("client", clientMode); // rate is client-side only
-    if (clientMode) {
-      // /health knows synthesis, not local playback; the offscreen player's
-      // position broadcasts (via content.js) carry paused/playing/block/rate.
-      const st = window.__voiceMlClientState || {};
-      h = { ...h, paused: st.paused, speaking: h.speaking || st.playing };
-      showRate(st.rate);
-    }
+    // The extension is its own client-played channel: /health's top-level
+    // fields are machine-wide, so speaking/pending come from the channel
+    // entry, and paused/playing/block/rate from the offscreen player's
+    // position broadcasts (via content.js), which also drive the highlight.
+    const ch = h.channels?.extension ?? h;
+    const st = window.__voiceMlClientState || {};
+    // "active" covers content pending/speaking miss (a batch parked
+    // waiting for its machine-queue turn), so the overlay survives an
+    // agent's turn mid-read; older daemons lack it, hence the fallback.
+    h = { paused: st.paused, pending: ch.pending,
+          speaking: ch.speaking || st.playing,
+          active: ch.active ?? (ch.speaking || ch.pending > 0) };
+    showRate(st.rate);
     render(h);
-    // Keep the last highlight through synthesis gaps (block is null between
-    // batches); it is cleared when the overlay goes away. Right after a
-    // seek, the seek response owns the highlight (stale polls rubber-band).
-    // In client mode the position broadcasts drive the highlight instead.
-    if (!clientMode && h.block && !(window.__voiceMlSeekHold > performance.now()))
-      window.__voiceMlReader?.highlight(h.block);
     // First chunk takes a moment to synthesize, so require several
     // consecutive idle reads before concluding playback is done.
-    idlePolls = !h.paused && !h.speaking && h.pending === 0 ? idlePolls + 1 : 0;
+    idlePolls = !h.paused && !h.speaking && !h.active ? idlePolls + 1 : 0;
     if (idlePolls >= 6) remove();
   }
 
@@ -121,7 +117,6 @@
 
   let persistTimer = null;
   async function rateDelta(dir) {
-    if (!clientMode) return; // local playback ignores rate
     const r = await chrome.runtime
       .sendMessage({ cmd: "player", action: "rate", delta: dir })
       .catch(() => null);
@@ -136,32 +131,29 @@
   }
 
   async function togglePause() {
-    if (clientMode) {
-      // Via the background worker, which gates the daemon (/pause keeps it
-      // from synthesizing the whole page while paused) and rebuilds the
-      // player when Chrome closed it during a long pause.
-      const r = await chrome.runtime
-        .sendMessage({ cmd: "player-toggle" })
-        .catch(() => null);
-      if (!r) return;
-      // Position broadcasts stall while paused or rebuilding; sync the
-      // cached state so the next poll doesn't repaint the stale value.
-      window.__voiceMlClientState = {
-        ...window.__voiceMlClientState,
-        paused: r.paused,
-      };
-      render({ paused: r.paused, pending: 0 });
-      return;
-    }
-    const r = await call(paused ? "/resume" : "/pause");
-    if (r && !r.error) render({ paused: r.paused, pending: 0 });
+    // Via the background worker, which gates the daemon (/pause keeps it
+    // from synthesizing the whole page while paused) and rebuilds the
+    // player when Chrome closed it during a long pause.
+    const r = await chrome.runtime
+      .sendMessage({ cmd: "player-toggle" })
+      .catch(() => null);
+    if (!r) return;
+    // Position broadcasts stall while paused or rebuilding; sync the
+    // cached state so the next poll doesn't repaint the stale value.
+    window.__voiceMlClientState = {
+      ...window.__voiceMlClientState,
+      paused: r.paused,
+    };
+    render({ paused: r.paused, pending: 0 });
   }
 
+  // /stop goes out with the extension's channel (added by the background
+  // worker), so it only silences this channel, never other channels'
+  // speech.
   async function stop() {
-    if (clientMode)
-      chrome.runtime
-        .sendMessage({ cmd: "player", action: "stop" })
-        .catch(() => {});
+    chrome.runtime
+      .sendMessage({ cmd: "player", action: "stop" })
+      .catch(() => {});
     await call("/stop");
     remove();
   }

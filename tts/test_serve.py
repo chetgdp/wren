@@ -1154,6 +1154,59 @@ def test_stop_and_preempting_speak_clear_pause():
         server.shutdown()
 
 
+class ConsistencyCheckingPlayer(FakePausablePlayer):
+    """Records any call where the speaker's pause flag disagrees with the
+    direction of the call: resume() must only ever run with the flag
+    already cleared (and pause() with it set), which holds exactly when
+    flag and player move as one unit under the speaker lock."""
+
+    def __init__(self):
+        super().__init__()
+        self.speaker = None
+        self.violations = []
+
+    def pause(self):
+        if not self.speaker._pause.is_set():
+            self.violations.append("pause with flag clear")
+        super().pause()
+
+    def resume(self):
+        if self.speaker._pause.is_set():
+            self.violations.append("resume with flag set")
+        super().resume()
+
+
+def test_pause_resume_flurry_keeps_flag_and_player_in_step():
+    # The race: a resume() that clears the flag and resumes the player as
+    # two unlocked steps lets a concurrent pause() land in between,
+    # leaving the flag set with the player running (or the mirror image
+    # with the roles swapped). Hammer both interleaving orders.
+    def synth(text, make_path):
+        return iter(())
+
+    for order in (("pause", "resume"), ("resume", "pause")):
+        player = ConsistencyCheckingPlayer()
+        speaker = Speaker(synth, player)
+        player.speaker = speaker
+        ops = {"pause": speaker.pause, "resume": speaker.resume}
+        barrier = threading.Barrier(2)
+
+        def hammer(first, second):
+            barrier.wait()
+            for _ in range(300):
+                ops[first]()
+                ops[second]()
+
+        threads = [threading.Thread(target=hammer, args=(a, b))
+                   for a, b in (order, order[::-1])]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert player.violations == []
+        assert speaker._pause.is_set() == player.paused
+
+
 def _sine(sr=24000, seconds=1.0, freq=440.0):
     import numpy as np
     t = np.arange(int(sr * seconds)) / sr
@@ -2465,7 +2518,8 @@ def test_health_channels_shape_in_both_local_player_modes():
         assert body["playback"] == "local"
         assert set(body["channels"]) == {"local"}
         assert set(body["channels"]["local"]) == {"pending", "speaking",
-                                                  "paused", "block"}
+                                                  "paused", "block",
+                                                  "active"}
         # daemon-played local has no segment stream, with or without a
         # channel arg
         for path in ("/segment?after=0&timeout=0.05",
@@ -2501,6 +2555,38 @@ def test_health_channels_shape_in_both_local_player_modes():
         server.shutdown()
 
 
+def test_turn_waiting_channel_is_active_with_zero_pending():
+    # The lie this guards against: a holder interrupted mid-utterance
+    # parks its batch outside every queue, so pending reads 0 and
+    # released drains to 0, yet the channel is anything but finished.
+    # Clients keying off pending/speaking tore their players down here.
+    server, port, app, synth = start_channel_server()
+    try:
+        request(port, "/speak", {"text": "a1 a2 a3 a4 a5 a6 a7 a8",
+                                 "channel": "cha", "raw": True})
+        s1, _, _ = fetch_segment(port, "cha", after=0)
+        prime(port, "chb")
+        request(port, "/speak", {"text": "b1 b2.", "channel": "chb",
+                                 "append": True, "raw": True})
+        # drain cha's rendered lookahead (reporting it played): cha parks
+        # mid-utterance in the resume list while chb takes the turn
+        _, seq_a = drain(port, "cha", after=s1)
+
+        def parked():
+            ch = request(port, "/health")[1]["channels"]["cha"]
+            return (ch["pending"] == 0 and not ch["speaking"]
+                    and ch["active"])
+        assert wait_for(parked)
+        # both finish; only then does active drop
+        got_b, _ = drain(port, "chb", quiet=2.0)
+        assert got_b == ["b1", "b2."]
+        drain(port, "cha", after=seq_a, quiet=2.0)
+        assert wait_for(lambda: not request(
+            port, "/health")[1]["channels"]["cha"]["active"])
+    finally:
+        server.shutdown()
+
+
 def test_speak_without_channel_is_local_and_preempts_everything():
     store = SegmentStore()
     server, port = start_server([], store=store)
@@ -2531,13 +2617,16 @@ def test_idle_unpolled_channel_is_garbage_collected():
         server.shutdown()
 
 
-def test_playback_flag_is_a_deprecated_alias_for_local_player():
-    from serve import resolve_local_player
-    assert resolve_local_player(None, None) == "daemon"
-    assert resolve_local_player(None, "client") == "client"
-    assert resolve_local_player(None, "local") == "daemon"
-    assert resolve_local_player("client", None) == "client"
-    assert resolve_local_player("daemon", "client") == "daemon"
+def test_playback_flag_is_removed(monkeypatch, capsys):
+    # Stage B's deprecation window ended: the old spelling must error
+    # loudly instead of being silently ignored by argparse.
+    import pytest
+    from serve import parse_args
+    monkeypatch.setattr(sys, "argv",
+                        ["serve.py", "-r", "x.wav", "--playback", "client"])
+    with pytest.raises(SystemExit):
+        parse_args()
+    assert "--playback" in capsys.readouterr().err
 
 
 # --- stage-B review fixes ---

@@ -18,7 +18,7 @@ llama-server \
 
 for macos
 ```
-uv run tts/serve.py -r samples/c3po_god.wav --fx --playback client
+uv run tts/serve.py -r samples/c3po_god.wav --fx --local-player client
 ```
 
 for linux cuda
@@ -27,7 +27,7 @@ uv run --no-group mlx tts/serve.py -r samples/c3po_god.wav --fx -b qwentts \
                                           --qwentts-bin ~/voice-ml/qwentts.cpp/build/tts-server \
                                           --qwentts-model ~/voice-ml/qwentts.cpp/models/qwen-talker-1.7b-base-Q8_0.gguf \
                                           --qwentts-codec ~/voice-ml/qwentts.cpp/models/qwen-tokenizer-12hz-Q8_0.gguf \
-                                          --host 0.0.0.0 --playback client
+                                          --host 0.0.0.0 --local-player client
 ```
 
 ## Command line options
@@ -57,7 +57,7 @@ uv run tts/serve.py -r samples/c3po_god.wav --fx
 | `--fx-ring-mix` | `0.12` | ring modulator wet mix 0-1 |
 | `-p, --port` | `8765` | port to listen on |
 | `--host` | `127.0.0.1` | bind address; `0.0.0.0` serves the LAN (set `--token`) |
-| `--playback` | `local` | `local` plays on this machine; `client` buffers segments for `GET /segment` (browser playback) |
+| `--local-player` | `daemon` | who plays the local channel: `daemon` plays on this machine; `client` buffers segments for `GET /segment` (browser playback) |
 | `--token` | `$VOICE_ML_TOKEN` | require `Authorization: Bearer <token>` on every request |
 
 ### tts/clone.py - one-shot voice clone (torch backend)
@@ -135,12 +135,12 @@ uv run python tts/fx.py output_voice_clone.wav -o output_droid.wav
 | **`k`** | Seek forward by **sentence** |
 | **`J`** | Seek back by **paragraph** |
 | **`K`** | Seek forward by **paragraph** |
-| **`<`** | Slow down (decrease speed) - client playback only |
-| **`>`** | Speed up (increase speed) - client playback only |
+| **`<`** | Slow down (decrease speed) |
+| **`>`** | Speed up (increase speed) |
 
 ### Notes
 
 - All keybinds require **no modifier keys** (Ctrl/Cmd/Alt are ignored)
 - Keybinds are disabled when typing in editable fields (inputs, textareas, contenteditable)
 - The overlay widget (fixed at bottom-right) provides clickable buttons for pause/stop/speed controls
-- Rate controls (`<` / `>`) only work with **client playback mode** (when daemon is started with `--playback client`)
+- Rate controls (`<` / `>`) adjust the extension's own player; the extension always plays its channel client-side, so no daemon flag is needed
