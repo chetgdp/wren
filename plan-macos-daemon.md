@@ -205,8 +205,12 @@ client only, no UI); the menu bar app grows in the same executable at step
 1. ~~Benchmark~~ (done; speed passed, quality comparison pending MLX-8bit).
 2. serve.py: config-file support + /config endpoints (+ tests). Benefits
    Linux immediately, freezes the full API before any Swift is written.
-3. `wren` CLI (first Swift): say/stop/pause/resume/status/speed against the
-   finished server API.
+3. `wren` scaffold + CLI (first Swift). Scaffold first: SwiftPM package and
+   the Otis-style scripts (bundle.sh with local signing so TCC grants
+   survive rebuilds, install.sh, dev.sh/watch.sh hot reload, gen-icons) -
+   the build/reload story is solved before any interesting code exists.
+   Then the CLI subcommands in that package:
+   say/stop/pause/resume/status/speed against the finished server API.
 4. Swift app, player first: the /segment long-poll loop -> AVAudioEngine +
    AVAudioUnitTimePitch with epoch-aware preemption (port offscreen.js's
    scheduling logic) is the core of the app, not an add-on - native audio
