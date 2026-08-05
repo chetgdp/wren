@@ -8,5 +8,8 @@ sometimes p does not show highlight
 audit the daemon serve "api"
 better voice clone (wintermute)
 figure out how to wasm integrate
+fix j/k out of place after pause and then play
+highlighed text still bad
+is the audio generated for the whole thing or is it at 2 ahead of the current place?
 
 

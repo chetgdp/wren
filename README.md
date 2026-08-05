@@ -16,6 +16,20 @@ llama-server \
                                             --jinja
 ```
 
+for macos
+```
+uv run tts/serve.py -r samples/c3po_god.wav --fx --playback client
+```
+
+for linux cuda
+```
+uv run --no-group mlx tts/serve.py -r samples/c3po_god.wav --fx -b qwentts \
+                                          --qwentts-bin ~/voice-ml/qwentts.cpp/build/tts-server \
+                                          --qwentts-model ~/voice-ml/qwentts.cpp/models/qwen-talker-1.7b-base-Q8_0.gguf \
+                                          --qwentts-codec ~/voice-ml/qwentts.cpp/models/qwen-tokenizer-12hz-Q8_0.gguf \
+                                          --host 0.0.0.0 --playback client
+```
+
 ## Command line options
 
 All tools run via `uv run <script>`. On Linux/CUDA use the torch dependency
@@ -100,3 +114,33 @@ uv run python tts/fx.py output_voice_clone.wav -o output_droid.wav
 | `url` | required | video URL (YouTube, etc.) |
 | `-o, --output` | `audio.wav` | output wav path |
 | `--js-runtime` | `node` | JS runtime for yt-dlp |
+
+---
+
+## Browser Extension Keybinds
+
+### Global Keybinds (on every page)
+
+| Key | Action |
+|-----|--------|
+| **`i`** | Speak selected text |
+| **`p`** | - If there's a selection: start **read-page mode** from selection<br>- If **no selection** and an overlay exists: **toggle pause** on active overlay<br>- If **no selection** and no overlay: start **read-page mode** |
+| **`o`** | Stop speaking |
+
+### Read-Page Mode Keybinds
+
+| Key | Action |
+|-----|--------|
+| **`j`** | Seek back by **sentence** |
+| **`k`** | Seek forward by **sentence** |
+| **`J`** | Seek back by **paragraph** |
+| **`K`** | Seek forward by **paragraph** |
+| **`<`** | Slow down (decrease speed) - client playback only |
+| **`>`** | Speed up (increase speed) - client playback only |
+
+### Notes
+
+- All keybinds require **no modifier keys** (Ctrl/Cmd/Alt are ignored)
+- Keybinds are disabled when typing in editable fields (inputs, textareas, contenteditable)
+- The overlay widget (fixed at bottom-right) provides clickable buttons for pause/stop/speed controls
+- Rate controls (`<` / `>`) only work with **client playback mode** (when daemon is started with `--playback client`)
