@@ -161,6 +161,41 @@ def test_preemption_abandons_in_flight_generation():
     assert "eight" not in played  # old generation was abandoned mid-stream
 
 
+class PausableBlockingPlayer:
+    """Play fn whose handle blocks while paused, like PCMPlayer: nothing is
+    recorded as played until the segment actually gets to run."""
+
+    def __init__(self, played):
+        self.played = played
+        self._paused = threading.Event()
+
+    def pause(self):
+        self._paused.set()
+
+    def resume(self):
+        self._paused.clear()
+
+    def __call__(self, path):
+        player = self
+        text = Path(path).read_text()
+
+        class Handle:
+            def __init__(self):
+                self.cancelled = threading.Event()
+
+            def terminate(self):
+                self.cancelled.set()
+
+            def wait(self):
+                while (player._paused.is_set()
+                       and not self.cancelled.is_set()):
+                    time.sleep(0.01)
+                if not self.cancelled.is_set():
+                    player.played.append(text)
+
+        return Handle()
+
+
 def gated_streaming_speaker(played, emitted, go):
     def synth(text, make_path):
         go.wait(5)
@@ -170,40 +205,44 @@ def gated_streaming_speaker(played, emitted, go):
             emitted.append(word)
             yield path
 
-    def play(path):
-        played.append(Path(path).read_text())
-        return FakeHandle()
-
-    return Speaker(synth, play)
+    return Speaker(synth, PausableBlockingPlayer(played))
 
 
-def test_pause_stalls_synthesis_after_lookahead_and_resume_continues():
+def test_pause_stops_playhead_and_lookahead_budget_parks_synthesis():
+    from serve import SynthWorker
+
     played, emitted = [], []
     go = threading.Event()
     sp = gated_streaming_speaker(played, emitted, go)
     sp.speak("one two three four five six")
-    sp.pause()  # before go: pause is set for the whole generation
+    sp.pause()  # before go: paused for the whole generation
     go.set()
-    assert wait_for(lambda: len(emitted) == Speaker.PAUSE_LOOKAHEAD)
-    time.sleep(0.3)  # gate holds: no further segments while paused
-    assert len(emitted) == Speaker.PAUSE_LOOKAHEAD
+    # One segment sits at the stopped playhead plus LOOKAHEAD rendered
+    # ahead; the budget then parks the worker with no pause-specific rule.
+    limit = 1 + SynthWorker.LOOKAHEAD
+    assert wait_for(lambda: len(emitted) == limit)
+    time.sleep(0.3)  # budget spent: no further segments while paused
+    assert len(emitted) == limit
+    assert played == []  # the playhead really is stopped
     sp.resume()
     assert wait_for(lambda: emitted == "one two three four five six".split())
     assert wait_for(lambda: played == emitted)
 
 
-def test_preempting_speak_releases_paused_synthesis_gate():
+def test_preempting_speak_clears_pause_and_drops_parked_batch():
+    from serve import SynthWorker
+
     played, emitted = [], []
     go = threading.Event()
     sp = gated_streaming_speaker(played, emitted, go)
     sp.speak("one two three four five six")
     sp.pause()
     go.set()
-    assert wait_for(lambda: len(emitted) == Speaker.PAUSE_LOOKAHEAD)
-    sp.speak("fresh.")  # preempts: releases the gate, drops the old text
+    assert wait_for(lambda: len(emitted) == 1 + SynthWorker.LOOKAHEAD)
+    sp.speak("fresh.")  # preempts: clears pause, drops the old text
     assert wait_for(lambda: "fresh." in played)
     assert sp.paused() is False
-    assert "six" not in emitted  # old generation abandoned at the gate
+    assert "six" not in emitted  # old generation abandoned while parked
 
 
 def test_speaker_plays_chunks_in_order():
@@ -302,6 +341,248 @@ def test_stop_clears_queue():
     time.sleep(0.2)
     assert sp.pending() == 0
     assert len(played) < 4
+
+
+# --- SynthWorker: shared worker, lookahead budget ---
+
+def _recording_play(played):
+    def play(path):
+        played.append(Path(path).read_text())
+        return FakeHandle()
+    return play
+
+
+def test_model_loads_once_in_the_worker_thread():
+    load_threads = []
+    synth_threads = []
+
+    def factory():
+        load_threads.append(threading.get_ident())
+
+        def synth(text, make_path):
+            synth_threads.append(threading.get_ident())
+            path = make_path()
+            Path(path).write_text(text)
+            yield path
+
+        return synth
+
+    played = []
+    sp = Speaker(synth_factory=factory, play_fn=_recording_play(played))
+    assert wait_for(sp.ready.is_set)
+    sp.speak("one.")
+    assert wait_for(lambda: played == ["one."])
+    sp.speak("two.")
+    assert wait_for(lambda: played == ["one.", "two."])
+    assert len(load_threads) == 1  # one load, not one per utterance
+    assert set(synth_threads) == set(load_threads)  # MLX: same thread
+    assert load_threads[0] != threading.get_ident()
+
+
+def test_paused_speaker_does_not_stall_the_shared_worker():
+    from serve import SynthWorker
+
+    go = threading.Event()
+    emitted = []
+
+    def synth(text, make_path):
+        go.wait(5)
+        for word in text.split():
+            path = make_path()
+            Path(path).write_text(word)
+            emitted.append(word)
+            yield path
+
+    worker = SynthWorker(synth_fn=synth)
+    played_a, played_b = [], []
+    a = Speaker(play_fn=PausableBlockingPlayer(played_a), worker=worker)
+    b = Speaker(play_fn=_recording_play(played_b), worker=worker)
+
+    a.speak("one two three four five")
+    a.pause()  # before go: paused for the whole generation
+    go.set()
+    # a's stopped playhead spends its budget: one segment blocked at the
+    # player plus LOOKAHEAD rendered ahead, then a parks.
+    limit = 1 + SynthWorker.LOOKAHEAD
+    assert wait_for(lambda: len(emitted) == limit)
+    time.sleep(0.1)
+    assert len(emitted) == limit  # a is parked
+
+    # a's queue holds text but the worker is free to serve b immediately.
+    b.speak("hello there.")
+    assert wait_for(lambda: played_b == ["hello", "there."])
+
+    a.resume()
+    assert wait_for(lambda: played_a == "one two three four five".split())
+
+
+def test_lookahead_budget_caps_rendering_at_playhead_plus_two():
+    from serve import SynthWorker
+
+    emitted = []
+    release = threading.Event()
+
+    def synth(text, make_path):
+        for word in text.split():
+            path = make_path()
+            Path(path).write_text(word)
+            emitted.append(word)
+            yield path
+
+    playing = []
+
+    class SlowHandle:
+        def terminate(self):
+            release.set()
+
+        def wait(self):
+            release.wait(5)
+
+    def play(path):
+        playing.append(Path(path).read_text())
+        return SlowHandle()
+
+    sp = Speaker(synth, play)
+    sp.speak("a b c d e f g h")
+    # one segment playing plus LOOKAHEAD rendered ahead, nothing more
+    limit = 1 + SynthWorker.LOOKAHEAD
+    assert wait_for(lambda: len(playing) == 1 and len(emitted) == limit)
+    time.sleep(0.2)
+    assert len(emitted) == limit  # budget spent: synthesis parked
+    release.set()  # playback drains; rendering follows the playhead
+    assert wait_for(lambda: playing == "a b c d e f g h".split())
+    assert emitted == playing
+
+
+def test_lookahead_pipelining_keeps_next_segment_ready():
+    emitted = []
+    starts = []  # (segment, segments rendered when it started playing)
+    gates = []
+
+    def synth(text, make_path):
+        time.sleep(0.02)  # slow generation the lookahead must hide
+        for word in text.split():
+            path = make_path()
+            Path(path).write_text(word)
+            emitted.append(word)
+            yield path
+            time.sleep(0.02)
+
+    class GatedHandle:
+        def __init__(self):
+            self.event = threading.Event()
+            gates.append(self.event)
+
+        def terminate(self):
+            self.event.set()
+
+        def wait(self):
+            self.event.wait(5)
+
+    def play(path):
+        starts.append((Path(path).read_text(), len(emitted)))
+        return GatedHandle()
+
+    sp = Speaker(synth, play)
+    words = "a b c d e".split()
+    sp.speak(" ".join(words))
+    for i in range(len(words)):
+        assert wait_for(lambda: len(gates) > i)
+        # While segment i plays, the next one gets rendered: when i ends
+        # there is no synthesis gap.
+        assert wait_for(lambda: len(emitted) >= min(i + 2, len(words)))
+        gates[i].set()
+    assert wait_for(lambda: [seg for seg, _ in starts] == words)
+
+
+def test_client_mode_budget_tracks_last_fetched_seq():
+    from serve import SynthWorker
+
+    emitted = []
+
+    def synth(text, make_path):
+        for word in text.split():
+            path = make_path()
+            Path(path).write_text(word)
+            emitted.append(word)
+            yield path
+
+    store = SegmentStore()
+    sp = Speaker(synth, store)
+    sp.speak("a b c d e f")
+    # Nothing fetched: the playhead proxy sits at 0, so only LOOKAHEAD
+    # segments render (no free-running full-message synthesis).
+    assert wait_for(lambda: len(emitted) == SynthWorker.LOOKAHEAD)
+    time.sleep(0.2)
+    assert len(emitted) == SynthWorker.LOOKAHEAD
+
+    seq, _, data, _ = store.next_after(0, timeout=1)
+    assert data == b"a"
+    # The fetch advanced the playhead proxy: one more segment renders.
+    assert wait_for(lambda: len(emitted) == SynthWorker.LOOKAHEAD + 1)
+
+    while True:  # a client draining the stream pulls the rest through
+        seq, _, data, _ = store.next_after(seq, timeout=1)
+        if data is None:
+            break
+    assert emitted == "a b c d e f".split()
+
+
+def test_synth_raising_at_call_time_does_not_kill_the_worker():
+    # The synth callable itself blows up (not its generator): the worker
+    # must log it, drop that batch, and stay alive for the next utterance.
+    played = []
+
+    def synth(text, make_path):
+        if "explode" in text:
+            raise RuntimeError("boom at call time")
+
+        def gen():
+            path = make_path()
+            Path(path).write_text(text)
+            yield path
+
+        return gen()
+
+    sp = Speaker(synth, _recording_play(played))
+    sp.speak("explode.")
+    time.sleep(0.05)  # let the failing batch reach the worker
+    sp.speak("after.")
+    assert wait_for(lambda: played == ["after."])
+
+
+def test_synth_raising_mid_stream_does_not_kill_the_worker():
+    played = []
+
+    def synth(text, make_path):
+        path = make_path()
+        Path(path).write_text(text.split()[0])
+        yield path
+        if "explode" in text:
+            raise RuntimeError("boom mid-stream")
+
+    sp = Speaker(synth, _recording_play(played))
+    sp.speak("explode now")
+    assert wait_for(lambda: "explode" in played)  # segment before the raise
+    sp.speak("after.")
+    assert wait_for(lambda: "after." in played)
+
+
+def test_stale_segment_taken_is_a_noop_after_budget_reset():
+    # The race: a stale-epoch segment popped from the play queue before the
+    # preempting _drain() must not free budget after reset_budget re-based
+    # it, or the worker transiently renders LOOKAHEAD+1 ahead.
+    played = []
+    sp = make_speaker(played)
+    worker = sp._worker
+    stale_epoch = sp._epoch
+    sp._epoch += 1  # a preemption bumps the epoch...
+    worker.reset_budget(sp)  # ...and re-bases the accounting
+    sp._inflight = 1  # one new-epoch segment already rendered
+    worker.segment_taken(sp, stale_epoch)  # late pop of a stale segment
+    assert sp._inflight == 1  # must not free the new epoch's charge
+    worker.segment_taken(sp, sp._epoch)  # a real new-epoch pop still frees
+    assert sp._inflight == 0
 
 
 # --- PCMPlayer ---
@@ -846,8 +1127,9 @@ def test_pause_resume_endpoints_and_health_flag():
 
 
 def test_pause_works_without_pausable_player():
-    # The play fn has no pause(); /pause still gates synthesis and reports
-    # paused (client-playback sinks and the afplay fallback hit this path).
+    # The play fn has no pause(); /pause still reports paused, and synthesis
+    # parks via the lookahead budget once the playhead stops advancing
+    # (client-playback sinks and the afplay fallback hit this path).
     server, port = start_server([])
     try:
         status, body = request(port, "/pause", {})

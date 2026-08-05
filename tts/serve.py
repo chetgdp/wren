@@ -16,8 +16,8 @@ Endpoints:
                  reports which block range is currently audible (read mode)
     POST /stop                                                  -> {"ok": true}
     POST /pause                                 -> {"ok": true, "paused": true}
-                 pauses local playback and stalls synthesis after a short
-                 lookahead (PAUSE_LOOKAHEAD segments) so resume is smooth
+                 pauses local playback; the playhead stops, so synthesis
+                 parks on its own once the lookahead budget is spent
     POST /resume                               -> {"ok": true, "paused": false}
     POST /seek   {"delta": 1} | {"block": n} -> {"ok": true, "block": n};
                  skips relative to what is playing, or to an absolute block
@@ -74,6 +74,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 from dataclasses import asdict, dataclass, fields, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -432,6 +433,11 @@ class SegmentStore:
         self._bytes = 0
         self._seq = 0
         self.epoch = 0
+        # The daemon never learns what the client's player has finished, so
+        # the last seq handed out is the playhead proxy the synth lookahead
+        # budget measures against (a played cursor arrives with channels).
+        self._fetched = 0
+        self.on_fetch = None  # budget freed on fetch; wakes the worker
 
     def submit(self, path, block):
         with open(path, "rb") as f:
@@ -454,24 +460,296 @@ class SegmentStore:
             self._bytes = 0
             self._cond.notify_all()
 
+    def unfetched(self):
+        """Buffered segments past the last-fetched seq: how far synthesis
+        has run ahead of the client-playback playhead proxy."""
+        with self._cond:
+            return sum(1 for s, _, _ in self._segments if s > self._fetched)
+
     def next_after(self, seq, timeout=20.0):
         """First buffered segment with seq > the given one, waiting up to
         timeout. Returns (seq, block, data, epoch); data is None on timeout."""
         deadline = time.monotonic() + timeout
+        found = None
         with self._cond:
-            while True:
+            while found is None:
                 for s, block, data in self._segments:
                     if s > seq:
-                        return s, block, data, self.epoch
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return None, None, None, self.epoch
-                self._cond.wait(remaining)
+                        self._fetched = max(self._fetched, s)
+                        found = (s, block, data, self.epoch)
+                        break
+                else:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return None, None, None, self.epoch
+                    self._cond.wait(remaining)
+        # Outside the lock: the callback takes the worker's lock, and the
+        # worker holds its lock while calling unfetched() - nesting the two
+        # here would be a lock-order inversion.
+        if self.on_fetch is not None:
+            self.on_fetch()
+        return found
+
+
+class _Batch:
+    """One in-flight synthesis call: the streaming generator plus the
+    bookkeeping the worker needs to resume it after parking (owner paused
+    past its budget, or lookahead spent)."""
+
+    __slots__ = ("epoch", "gen", "text", "layout", "block", "speed",
+                 "t0", "audio_s")
+
+    def __init__(self, epoch, gen, text, layout, block, speed):
+        self.epoch = epoch
+        self.gen = gen
+        self.text = text
+        self.layout = layout
+        self.block = block
+        self.speed = speed
+        self.t0 = time.monotonic()
+        self.audio_s = 0.0
+
+
+class SynthWorker:
+    """The one thread that owns the TTS model and renders every Speaker's
+    queued text.
+
+    MLX streams are thread-local, so the model must load and generate on
+    the same thread; synth_factory runs here for that reason. Speakers
+    register themselves and the worker round-robins over whichever of them
+    is schedulable: has work and lookahead budget left. A paused or
+    fully-rendered Speaker simply stops being scheduled - the worker never
+    blocks on one Speaker's state, so several Speakers (per-utterance
+    channels, later) can share it without a stalled one jamming the rest.
+    """
+
+    # Render at most this many segments past the playhead: enough to hide
+    # per-segment synth latency (the next segment is ready before this one
+    # ends) without free-running a whole page of audio into memory.
+    LOOKAHEAD = 2
+
+    def __init__(self, synth_fn=None, synth_factory=None):
+        self._synth = synth_fn
+        self._factory = synth_factory
+        self.ready = threading.Event()
+        if synth_fn is not None:
+            self.ready.set()
+        self._cond = threading.Condition()
+        self._speakers = []
+        self._rr = 0  # round-robin cursor so no Speaker starves
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def register(self, speaker):
+        with self._cond:
+            self._speakers.append(speaker)
+            self._cond.notify_all()
+
+    def wake(self):
+        """Scheduling inputs changed (new work, resume, freed budget):
+        re-evaluate who runs."""
+        with self._cond:
+            self._cond.notify_all()
+
+    def segment_taken(self, speaker, epoch):
+        """Playback pulled a segment off the queue: the playhead advanced,
+        so a unit of lookahead budget is free again. epoch is the popped
+        segment's; a stale segment pulled after reset_budget re-based the
+        accounting must not free budget the new epoch never charged, or the
+        worker transiently renders past LOOKAHEAD."""
+        with self._cond:
+            if epoch == speaker._inflight_epoch and speaker._inflight > 0:
+                speaker._inflight -= 1
+            self._cond.notify_all()
+
+    def reset_budget(self, speaker):
+        """A preemption drained the play queue; nothing is in flight. The
+        accounting re-bases onto the current epoch so charges and frees for
+        older segments become no-ops from here on."""
+        with self._cond:
+            speaker._inflight = 0
+            speaker._inflight_epoch = speaker._epoch
+            self._cond.notify_all()
+
+    def _run(self):
+        if self._factory is not None:
+            try:
+                self._synth = self._factory()
+            except Exception:
+                traceback.print_exc()
+                print("model load failed; exiting", file=sys.stderr)
+                # os._exit skips atexit; no-op unless qwentts
+                _cleanup_qwentts()
+                os._exit(1)
+            self.ready.set()
+        while True:
+            speaker = self._next()
+            # One bad batch must never kill the only synthesis thread: log
+            # it, drop that batch (its generator unwinds here, on the
+            # model's thread), re-base the speaker's budget, and move on.
+            try:
+                self._advance(speaker)
+            except Exception:
+                traceback.print_exc()
+                print("synth failed; batch discarded", file=sys.stderr)
+                batch, speaker._batch = speaker._batch, None
+                if batch is not None:
+                    try:
+                        batch.gen.close()
+                    except Exception:
+                        pass
+                self.reset_budget(speaker)
+
+    def _next(self):
+        """Block until some Speaker is runnable and pick it fairly."""
+        with self._cond:
+            while True:
+                count = len(self._speakers)
+                for i in range(count):
+                    speaker = self._speakers[(self._rr + i) % count]
+                    if speaker._synth_runnable():
+                        self._rr = (self._rr + i + 1) % count
+                        return speaker
+                self._cond.wait()
+
+    def _advance(self, speaker):
+        batch = speaker._batch
+        if batch is not None and batch.epoch != speaker._epoch:
+            self._discard(speaker, batch)
+            return
+        if batch is None:
+            batch = self._start_batch(speaker)
+            if batch is None:
+                return
+            speaker._batch = batch
+        self._pump(speaker, batch)
+
+    def _start_batch(self, speaker):
+        if speaker._carry is not None:
+            epoch, idx, text = speaker._carry
+            speaker._carry = None
+        else:
+            try:
+                epoch, idx, text = speaker._synth_q.get_nowait()
+            except queue.Empty:
+                return None
+        if epoch != speaker._epoch:
+            return None
+        parts = [text]
+        idxs = [] if idx is None else [idx]
+        # Coalesce backlog that queued up behind a previous synthesis:
+        # every generate call pays a prefill proportional to the
+        # reference length, so batching backlog into one call pays it
+        # once instead of per sentence. The first chunk of an epoch is
+        # never coalesced; it is sized small for fast first audio.
+        # Coalescing only ever reads this Speaker's own queue, so
+        # utterances never merge across Speakers.
+        if epoch == speaker._last_synth_epoch:
+            total = len(text)
+            while total < speaker._max_chars:
+                try:
+                    item = speaker._synth_q.get_nowait()
+                except queue.Empty:
+                    break
+                next_epoch, next_idx, next_text = item
+                if next_epoch < epoch:
+                    continue  # stale, drop
+                if next_epoch > epoch:
+                    # A preemption queued this mid-coalesce; it belongs
+                    # to the new epoch, not this dying batch.
+                    speaker._carry = item
+                    break
+                parts.append(next_text)
+                if next_idx is not None:
+                    idxs.append(next_idx)
+                total += len(next_text) + 1
+            text = " ".join(parts)
+        if epoch != speaker._epoch:  # preempted during coalesce
+            return None
+        speaker._last_synth_epoch = epoch
+        # A coalesced batch spans several blocks. Each streamed segment
+        # is tagged with the sentence range it is estimated to cover, so
+        # the reported position tracks the audible sentence, not the
+        # whole batch. Falls back to the full range when the parts/index
+        # pairing is broken (mixed indexed and plain-text chunks).
+        block = (idxs[0], idxs[-1]) if idxs else None
+        layout = (list(zip(idxs, (len(p) for p in parts)))
+                  if idxs and len(idxs) == len(parts) else None)
+        print(f'synthesizing ({len(text)} chars, '
+              f'{speaker.pending()} queued): "{text}"',
+              flush=True)
+        # Speed is read once per batch: mid-stream changes would jump rate.
+        return _Batch(epoch, self._synth(text, speaker._make_path),
+                      text, layout, block, speaker.speed)
+
+    def _pump(self, speaker, batch):
+        """Pull segments from the batch until it finishes, its Speaker
+        stops being schedulable (parked, resumable later), or a preemption
+        makes it stale."""
+        while True:
+            if batch.epoch != speaker._epoch:
+                self._discard(speaker, batch)
+                return
+            if not speaker._synth_schedulable():
+                return  # parked; playback progress or resume re-schedules
+            try:
+                path = next(batch.gen)
+            except StopIteration:
+                self._finish(speaker, batch)
+                return
+            if batch.epoch != speaker._epoch:  # preempted: abandon it
+                self._discard(speaker, batch)
+                return
+            if batch.speed != 1.0:
+                try:
+                    # Before _wav_seconds so the block-position math
+                    # and rate calibration see playback durations.
+                    stretch_wav(path, batch.speed)
+                except Exception as exc:
+                    print(f"time-stretch failed ({exc}); playing at "
+                          "1.0x", file=sys.stderr)
+            seg_start = batch.audio_s
+            batch.audio_s += _wav_seconds(path)
+            # Unknown/zero segment duration: report the whole batch.
+            seg_block = (block_span(batch.layout, seg_start, batch.audio_s,
+                                    speaker._chars_per_sec)
+                         if batch.layout and batch.audio_s > seg_start
+                         else batch.block)
+            with self._cond:
+                # A preemption may have re-based the accounting since the
+                # epoch check above; a segment of the old epoch stays
+                # uncharged (it will be popped as stale, also uncharged).
+                if batch.epoch == speaker._inflight_epoch:
+                    speaker._inflight += 1
+            speaker._play_q.put((batch.epoch, path, seg_block))
+
+    def _discard(self, speaker, batch):
+        speaker._batch = None
+        # close() runs the generator's unwind here, on the model's thread.
+        try:
+            batch.gen.close()
+        except Exception as exc:
+            print(f"synth failed: {exc}", file=sys.stderr)
+
+    def _finish(self, speaker, batch):
+        speaker._batch = None
+        wall = time.monotonic() - batch.t0
+        print(f"  {batch.audio_s:.1f}s audio in {wall:.1f}s"
+              f" (RTF {batch.audio_s / wall:.2f})",
+              flush=True)
+        # Recalibrate the highlight's speech-rate estimate from this
+        # batch. Only un-preempted batches measure the full text; the
+        # EMA smooths pause/punctuation noise between batches and the
+        # clamp rejects degenerate wavs (silence, decode failures).
+        if batch.epoch == speaker._epoch and batch.audio_s > 0:
+            measured = len(batch.text) / batch.audio_s
+            if 5.0 <= measured <= 30.0:
+                speaker._chars_per_sec = (0.5 * speaker._chars_per_sec
+                                          + 0.5 * measured)
 
 
 class Speaker:
-    """Synth + playback pipeline. speak() preempts whatever is queued or
-    playing.
+    """Per-utterance queue and playback state; synthesis itself runs on a
+    SynthWorker. speak() preempts whatever is queued or playing.
 
     synth_fn(text, make_path) is a generator yielding wav paths as audio
     segments complete (streaming backends yield several per text; make_path()
@@ -479,21 +757,24 @@ class Speaker:
     and terminate() (default: afplay Popen). Each speak() bumps an epoch;
     stale-epoch work is dropped at every stage, including mid-generation.
 
-    Pass synth_factory instead of synth_fn to load the model inside the synth
+    Pass synth_factory instead of synth_fn to load the model inside the
     worker thread (MLX streams are thread-local, so the model must be loaded
     and used by the same thread). `ready` is set once synthesis can proceed;
-    a failed load prints the error and exits the process.
+    a failed load prints the error and exits the process. Pass worker to
+    share an existing SynthWorker instead of creating one.
     """
 
     def __init__(self, synth_fn=None, play_fn=None, max_chars=MAX_CHUNK_CHARS,
-                 first_chars=FIRST_CHUNK_CHARS, synth_factory=None, speed=1.0):
-        if (synth_fn is None) == (synth_factory is None):
-            raise ValueError("pass exactly one of synth_fn or synth_factory")
-        self._synth = synth_fn
-        self._synth_factory = synth_factory
-        self.ready = threading.Event()
-        if synth_fn is not None:
-            self.ready.set()
+                 first_chars=FIRST_CHUNK_CHARS, synth_factory=None, speed=1.0,
+                 worker=None):
+        if worker is None:
+            if (synth_fn is None) == (synth_factory is None):
+                raise ValueError(
+                    "pass exactly one of synth_fn or synth_factory")
+            worker = SynthWorker(synth_fn=synth_fn,
+                                 synth_factory=synth_factory)
+        self._worker = worker
+        self.ready = worker.ready
         self._play = play_fn or default_player()
         self._max_chars = max_chars
         self._first_chars = first_chars
@@ -503,7 +784,6 @@ class Speaker:
         self._lock = threading.Lock()
         self._epoch = 0
         self._pause = threading.Event()
-        self._pause_budget = 0
         self._synth_q = queue.Queue()
         self._play_q = queue.Queue()
         self._current = None
@@ -512,6 +792,16 @@ class Speaker:
         self._last_played = None  # block index most recently started
         self._counter = 0
         self._last_synth_epoch = -1
+        # Worker-side synthesis state: the parked in-flight batch, an item
+        # rescued mid-coalesce, and how many rendered segments sit unplayed
+        # (the lookahead budget's measure of "ahead of the playhead").
+        # _inflight only counts segments of _inflight_epoch, the epoch as of
+        # the last reset_budget: a stale segment popped after a preemption
+        # must not free budget the new epoch is charged for.
+        self._batch = None
+        self._carry = None
+        self._inflight = 0
+        self._inflight_epoch = 0
         # Speech rate used to place the read-mode highlight inside a batch
         # (block_span). Starts at the heuristic and is recalibrated from
         # each completed batch, because the fixed value drifts by whole
@@ -519,8 +809,11 @@ class Speaker:
         # or slower than ~13 chars/sec.
         self._chars_per_sec = CHARS_PER_SEC
         self._tmpdir = tempfile.mkdtemp(prefix="voice-serve-")
-        threading.Thread(target=self._synth_loop, daemon=True).start()
+        # In client mode a fetch moves the playhead proxy, freeing budget.
+        if hasattr(self._play, "on_fetch"):
+            self._play.on_fetch = self._worker.wake
         threading.Thread(target=self._play_loop, daemon=True).start()
+        self._worker.register(self)
 
     def speak(self, text=None, append=False, blocks=None, speed=None):
         """blocks: list of (index, text) pairs; the index of whatever is
@@ -539,6 +832,7 @@ class Speaker:
             epoch = self._epoch
             for idx, chunk in items:
                 self._synth_q.put((epoch, idx, chunk))
+        self._worker.wake()
         return len(items)
 
     def _chunks_for(self, blocks):
@@ -552,6 +846,9 @@ class Speaker:
     def _preempt_locked(self):
         self._epoch += 1
         self._drain()
+        # The drained play queue held everything counted in flight; the
+        # wake also lets the worker discard a now-stale parked batch.
+        self._worker.reset_budget(self)
         self._terminate_current()
         if hasattr(self._play, "invalidate"):  # client-playback sink
             self._play.invalidate()
@@ -596,26 +893,25 @@ class Speaker:
             # follow-up relative seek must be based on; leaving it None
             # would send the next j/k back to the start of the document.
             self._last_played = target
+        self._worker.wake()
         return target
 
     def stop(self):
         with self._lock:
             self._epoch += 1
             self._drain()
+            self._worker.reset_budget(self)
             self._terminate_current()
             if hasattr(self._play, "invalidate"):
                 self._play.invalidate()
             self.resume()
 
-    PAUSE_LOOKAHEAD = 2  # segments synthesized past a pause; smooth resume
-
     def pause(self):
-        """Pause playback and stall synthesis. The synth loop may emit up to
-        PAUSE_LOOKAHEAD more segments (so resume has audio ready instead of
-        waiting on a cold generate call), then blocks until resume or a
-        preemption. Local playback pauses via the PCM player; the afplay
-        fallback keeps playing its current segment."""
-        self._pause_budget = self.PAUSE_LOOKAHEAD
+        """Pause playback. The playhead stops, so the worker parks on its
+        own once the LOOKAHEAD budget is spent - resume has that audio ready
+        instead of waiting on a cold generate call. Local playback pauses
+        via the PCM player; the afplay fallback keeps playing its current
+        segment."""
         self._pause.set()
         if hasattr(self._play, "pause"):
             self._play.pause()
@@ -625,6 +921,7 @@ class Speaker:
         self._pause.clear()
         if hasattr(self._play, "resume"):
             self._play.resume()
+        self._worker.wake()  # a parked batch is schedulable again
         return True
 
     def paused(self):
@@ -640,12 +937,34 @@ class Speaker:
     def pending(self):
         return self._synth_q.qsize() + self._play_q.qsize()
 
-    def _pause_gate(self, epoch):
-        """Block while paused once the lookahead budget is spent; resume or
-        a preemption (epoch bump) releases it."""
-        while (self._pause.is_set() and self._pause_budget <= 0
-               and epoch == self._epoch):
-            time.sleep(0.05)
+    def _synth_runnable(self):
+        """Worker-side: anything to do for this Speaker right now? A stale
+        parked batch counts as work - the worker must discard it (the
+        generator's unwind has to run on the model's thread)."""
+        if self._batch is not None and self._batch.epoch != self._epoch:
+            return True
+        has_work = (self._batch is not None or self._carry is not None
+                    or not self._synth_q.empty())
+        return has_work and self._synth_schedulable()
+
+    def _synth_schedulable(self):
+        """May the worker render another segment? Not once LOOKAHEAD
+        segments sit unplayed: synthesis tracks the playhead instead of
+        free-running a whole message's audio into memory. Pause needs no
+        rule of its own - it stops the playhead, so this budget parks the
+        worker a couple of segments later."""
+        return self._lookahead_used() < SynthWorker.LOOKAHEAD
+
+    def _lookahead_used(self):
+        """Segments rendered but not yet reached by the playhead. Local
+        playback: what still sits in the play queue (the playing segment
+        already left it). Client playback: the play queue drains into the
+        segment store immediately, so count what no client has fetched."""
+        used = self._inflight
+        unfetched = getattr(self._play, "unfetched", None)
+        if unfetched is not None:
+            used += unfetched()
+        return used
 
     def _drain(self):
         for q in (self._synth_q, self._play_q):
@@ -663,115 +982,6 @@ class Speaker:
             except Exception:
                 pass
 
-    def _synth_loop(self):
-        if self._synth_factory is not None:
-            try:
-                self._synth = self._synth_factory()
-            except Exception:
-                import traceback
-                traceback.print_exc()
-                print("model load failed; exiting", file=sys.stderr)
-                # os._exit skips atexit; no-op unless qwentts
-                _cleanup_qwentts()
-                os._exit(1)
-            self.ready.set()
-        carry = None
-        while True:
-            if carry is not None:
-                epoch, idx, text = carry
-                carry = None
-            else:
-                epoch, idx, text = self._synth_q.get()
-            if epoch != self._epoch:
-                continue
-            parts = [text]
-            idxs = [] if idx is None else [idx]
-            # Coalesce backlog that queued up behind a previous synthesis:
-            # every generate call pays a prefill proportional to the
-            # reference length, so batching backlog into one call pays it
-            # once instead of per sentence. The first chunk of an epoch is
-            # never coalesced; it is sized small for fast first audio.
-            if epoch == self._last_synth_epoch:
-                total = len(text)
-                while total < self._max_chars:
-                    try:
-                        item = self._synth_q.get_nowait()
-                    except queue.Empty:
-                        break
-                    next_epoch, next_idx, next_text = item
-                    if next_epoch < epoch:
-                        continue  # stale, drop
-                    if next_epoch > epoch:
-                        # A preemption queued this mid-coalesce; it belongs
-                        # to the new epoch, not this dying batch.
-                        carry = item
-                        break
-                    parts.append(next_text)
-                    if next_idx is not None:
-                        idxs.append(next_idx)
-                    total += len(next_text) + 1
-                text = " ".join(parts)
-            if epoch != self._epoch:  # preempted during coalesce
-                continue
-            self._last_synth_epoch = epoch
-            self._pause_gate(epoch)  # paused between batches: don't start one
-            if epoch != self._epoch:
-                continue
-            # A coalesced batch spans several blocks. Each streamed segment
-            # is tagged with the sentence range it is estimated to cover, so
-            # the reported position tracks the audible sentence, not the
-            # whole batch. Falls back to the full range when the parts/index
-            # pairing is broken (mixed indexed and plain-text chunks).
-            block = (idxs[0], idxs[-1]) if idxs else None
-            layout = (list(zip(idxs, (len(p) for p in parts)))
-                      if idxs and len(idxs) == len(parts) else None)
-            print(f'synthesizing ({len(text)} chars, '
-                  f'{self.pending()} queued): "{text}"',
-                  flush=True)
-            t0 = time.monotonic()
-            audio_s = 0.0
-            speed = self.speed  # per batch: mid-stream changes would jump rate
-            try:
-                for path in self._synth(text, self._make_path):
-                    if epoch != self._epoch:  # preempted: abandon generation
-                        break
-                    if speed != 1.0:
-                        try:
-                            # Before _wav_seconds so the block-position math
-                            # and rate calibration see playback durations.
-                            stretch_wav(path, speed)
-                        except Exception as exc:
-                            print(f"time-stretch failed ({exc}); playing at "
-                                  "1.0x", file=sys.stderr)
-                    seg_start = audio_s
-                    audio_s += _wav_seconds(path)
-                    # Unknown/zero segment duration: report the whole batch.
-                    seg_block = (block_span(layout, seg_start, audio_s,
-                                            self._chars_per_sec)
-                                 if layout and audio_s > seg_start else block)
-                    self._play_q.put((epoch, path, seg_block))
-                    if self._pause.is_set():
-                        self._pause_budget -= 1
-                        self._pause_gate(epoch)
-                        if epoch != self._epoch:
-                            break
-            except Exception as exc:
-                print(f"synth failed: {exc}", file=sys.stderr)
-                continue
-            wall = time.monotonic() - t0
-            print(f"  {audio_s:.1f}s audio in {wall:.1f}s"
-                  f" (RTF {audio_s / wall:.2f})",
-                  flush=True)
-            # Recalibrate the highlight's speech-rate estimate from this
-            # batch. Only un-preempted batches measure the full text; the
-            # EMA smooths pause/punctuation noise between batches and the
-            # clamp rejects degenerate wavs (silence, decode failures).
-            if epoch == self._epoch and audio_s > 0:
-                measured = len(text) / audio_s
-                if 5.0 <= measured <= 30.0:
-                    self._chars_per_sec = (0.5 * self._chars_per_sec
-                                           + 0.5 * measured)
-
     def _make_path(self):
         self._counter += 1
         return os.path.join(self._tmpdir, f"{self._counter}.wav")
@@ -780,6 +990,9 @@ class Speaker:
         while True:
             epoch, path, block = self._play_q.get()
             if epoch != self._epoch:
+                # Frees the stale segment's own charge; a no-op once a
+                # preemption re-based the budget onto the new epoch.
+                self._worker.segment_taken(self, epoch)
                 continue
             if hasattr(self._play, "submit"):  # client-playback sink
                 try:
@@ -787,11 +1000,19 @@ class Speaker:
                 except Exception as exc:
                     print(f"segment submit failed: {exc}", file=sys.stderr)
                 finally:
+                    # Only after submit: until then the segment is counted
+                    # by neither the play queue nor the store's unfetched
+                    # tally, and dropping it from the budget early lets
+                    # synthesis run a segment past the lookahead.
+                    self._worker.segment_taken(self, epoch)
                     try:
                         os.unlink(path)
                     except OSError:
                         pass
                 continue
+            # Local playback: dequeue means this segment plays now, so the
+            # playhead advanced and a lookahead slot is free.
+            self._worker.segment_taken(self, epoch)
             try:
                 self._current_block = block
                 if block is not None:
