@@ -25,10 +25,16 @@ Endpoints:
     GET  /health -> {"ok": true, "pending": n, "speaking": b, "paused": b,
                      "block": [lo, hi] | null, "playback": "local"|"client",
                      "speed": f}
-    GET  /segment?after=n[&timeout=s]  (--playback client only) long-poll for
-                 the next synthesized segment: audio/wav with X-Seq, X-Epoch,
-                 X-Block headers; 204 + X-Epoch on timeout. An epoch change
-                 means playback was preempted: drop locally queued audio.
+    GET  /segment?after=n[&timeout=s][&channel=name][&played=k]  long-poll
+                 for the next synthesized segment of a channel's stream:
+                 audio/wav with X-Seq, X-Epoch, X-Block headers; 204 +
+                 X-Epoch on timeout. An epoch change means playback was
+                 preempted: drop locally queued audio. played=k reports the
+                 client finished playing through seq k (the machine queue's
+                 progress signal). Without channel this is the local
+                 channel's stream, which only exists under
+                 --local-player client (404 otherwise, exactly as before
+                 channels).
     GET  /config -> live settings (voice, voices_dir, speed, fx, port,
                  backend) plus "restart_required": true when a persisted
                  change needs a daemon restart (model reload / rebind) to
@@ -57,6 +63,16 @@ that send no Origin (curl, scripts) pass. Bodies over 1 MiB return 413.
 
 "append" queues after what is already speaking instead of preempting it;
 streaming clients send the first piece without it and the rest with it.
+
+Channels: every /speak (and /pause, /resume, /seek, /stop) may carry an
+optional "channel" name ([a-z0-9_-]{1,32}; omitted = "local"). Each channel
+has its own content queue, epoch, and /segment stream, and exactly one
+player; a machine-wide playback queue lets at most one channel be audible
+at a time (see MachineQueue). A /speak without append clears every
+channel - one voice per machine. Channels are created on first use and die
+with the daemon. The local channel is played by the daemon itself unless
+--local-player client; all other channels are always client-played
+streams.
 
 Example:
     uv run tts/serve.py -r samples/bossnass/ref.wav
@@ -114,6 +130,23 @@ BACKEND_CHOICES = ("auto", "mlx", "qwen-tts", "qwentts")
 # Keys POST /config persists but cannot hot-apply (model reload or rebind);
 # a persisted drift from the launch snapshot is reported as restart_required.
 RESTART_KEYS = ("voice", "voices_dir", "port", "backend")
+# GET /segment's default long-poll length. The played-report grace window
+# derives from it: a healthy client may sit a full poll cycle before its
+# next played report, so a deadline shorter than the poll timeout would
+# declare live clients dead; +10s absorbs network and scheduling slack.
+SEGMENT_POLL_TIMEOUT = 20.0
+PLAYED_GRACE = SEGMENT_POLL_TIMEOUT + 10.0
+# A client parked in one long poll is silent for that whole poll, so a
+# poll longer than the grace window would get a healthy client declared
+# dead mid-poll and its queue cleared. /segment therefore caps the
+# accepted timeout a slack under the grace instead of scaling deadlines
+# per client (simpler, and the constant relation is testable).
+MAX_POLL_TIMEOUT = PLAYED_GRACE - 5.0
+# Channels are created on first use by name, so typo'd names must not
+# accumulate speaker threads forever: idle and unpolled ones are deleted.
+CHANNEL_GC_SECONDS = 600.0
+CHANNEL_NAME_RE = re.compile(r"[a-z0-9_-]{1,32}\Z")
+LOCAL_CHANNEL = "local"
 
 
 @dataclass
@@ -414,13 +447,13 @@ def _wav_seconds(path):
 
 
 class SegmentStore:
-    """Client-playback sink: buffers synthesized segments in memory for
+    """Client-playback buffer: holds synthesized segments in memory for
     GET /segment long-polls instead of playing them on this machine.
 
-    Implements the Speaker sink API (submit/invalidate) in place of a
-    play_fn. seq is monotonic across the store's life so a client can always
-    resume with the last seq it saw; invalidate() (preemption/stop) drops
-    buffered segments and bumps epoch so a client knows to also drop
+    Implements the Speaker client-stream API (submit/invalidate) in place
+    of a play_fn. seq is monotonic across the store's life so a client can
+    always resume with the last seq it saw; invalidate() (preemption/stop)
+    drops buffered segments and bumps epoch so a client knows to also drop
     whatever it has scheduled locally.
     """
 
@@ -435,20 +468,33 @@ class SegmentStore:
         self.epoch = 0
         # The daemon never learns what the client's player has finished, so
         # the last seq handed out is the playhead proxy the synth lookahead
-        # budget measures against (a played cursor arrives with channels).
+        # budget measures against; the played cursor below is coarser (one
+        # report per poll cycle) so it stays the machine queue's signal, not
+        # the budget's.
         self._fetched = 0
         self.on_fetch = None  # budget freed on fetch; wakes the worker
+        # Machine-queue progress: highest seq the client reports finished
+        # playing, valid only within the current epoch. Durations of
+        # released-but-unplayed segments back the dead-client deadline.
+        self._played = 0
+        self._epoch_base = 0
+        self._durations = {}  # seq -> seconds
 
     def submit(self, path, block):
+        seconds = _wav_seconds(path)
         with open(path, "rb") as f:
             data = f.read()
         with self._cond:
             self._seq += 1
             self._segments.append((self._seq, block, data))
+            self._durations[self._seq] = seconds
             self._bytes += len(data)
             while self._bytes > self._max_bytes and len(self._segments) > 1:
                 seq, _, dropped = self._segments.pop(0)
                 self._bytes -= len(dropped)
+                # The client can never play a dropped segment, so keeping
+                # its duration would hold the machine queue's turn forever.
+                self._durations.pop(seq, None)
                 print(f"segment buffer full; dropped seq {seq} "
                       f"({len(dropped)} bytes) unfetched", file=sys.stderr)
             self._cond.notify_all()
@@ -458,7 +504,31 @@ class SegmentStore:
             self.epoch += 1
             self._segments.clear()
             self._bytes = 0
+            # Re-base the played cursor: reports about pre-bump seqs are
+            # stale by definition and must not count as progress.
+            self._epoch_base = self._seq
+            self._played = self._seq
+            self._durations.clear()
             self._cond.notify_all()
+
+    def report_played(self, seq):
+        """Client's played cursor: max within the current epoch. Reports
+        about pre-bump seqs (stale epoch) and backward reports are ignored;
+        the cursor never runs past what was actually released."""
+        with self._cond:
+            seq = min(seq, self._seq)
+            if seq <= self._epoch_base or seq <= self._played:
+                return
+            self._played = seq
+            for s in [s for s in self._durations if s <= seq]:
+                del self._durations[s]
+
+    def release_stats(self):
+        """(released-unplayed count, their seconds, last released seq,
+        played seq): the machine queue's view of this stream's progress."""
+        with self._cond:
+            return (len(self._durations), sum(self._durations.values()),
+                    self._seq, self._played)
 
     def unfetched(self):
         """Buffered segments past the last-fetched seq: how far synthesis
@@ -472,7 +542,13 @@ class SegmentStore:
         deadline = time.monotonic() + timeout
         found = None
         with self._cond:
+            entry_epoch = self.epoch
             while found is None:
+                if self.epoch != entry_epoch:
+                    # Preempted while parked: return now (204 + new epoch)
+                    # so the client drops its scheduled audio immediately
+                    # instead of at the end of its poll cycle.
+                    return None, None, None, self.epoch
                 for s, block, data in self._segments:
                     if s > seq:
                         self._fetched = max(self._fetched, s)
@@ -544,6 +620,15 @@ class SynthWorker:
             self._speakers.append(speaker)
             self._cond.notify_all()
 
+    def unregister(self, speaker):
+        """Channel GC: a deleted channel's Speaker must stop being
+        scheduled or the worker would keep probing dead state forever."""
+        with self._cond:
+            if speaker in self._speakers:
+                self._speakers.remove(speaker)
+                self._rr = 0
+            self._cond.notify_all()
+
     def wake(self):
         """Scheduling inputs changed (new work, resume, freed budget):
         re-evaluate who runs."""
@@ -583,6 +668,11 @@ class SynthWorker:
             self.ready.set()
         while True:
             speaker = self._next()
+            # The busy flag covers the instant where text has left the
+            # synth queue but the batch is not visible yet; without it the
+            # machine queue can read "no text, no audio" mid-handoff and
+            # retire a channel that is in fact mid-utterance.
+            speaker._synth_busy = True
             # One bad batch must never kill the only synthesis thread: log
             # it, drop that batch (its generator unwinds here, on the
             # model's thread), re-base the speaker's budget, and move on.
@@ -598,6 +688,8 @@ class SynthWorker:
                     except Exception:
                         pass
                 self.reset_budget(speaker)
+            finally:
+                speaker._synth_busy = False
 
     def _next(self):
         """Block until some Speaker is runnable and pick it fairly."""
@@ -802,6 +894,18 @@ class Speaker:
         self._carry = None
         self._inflight = 0
         self._inflight_epoch = 0
+        # Channel hooks, attached by ChannelManager. Without them (bare
+        # Speaker, pre-channels behavior) nothing is gated. _gate answers
+        # "may this channel render right now"; _turn_wait blocks a release
+        # until the machine queue grants the turn; _on_progress tells the
+        # queue the playhead moved. _popped counts a segment that sits
+        # between the play queue and its player so the machine queue still
+        # sees it as rendered audio.
+        self._gate = None
+        self._turn_wait = None
+        self._on_progress = None
+        self._popped = 0
+        self._synth_busy = False  # worker mid-advance for this Speaker
         # Speech rate used to place the read-mode highlight inside a batch
         # (block_span). Starts at the heuristic and is recalibrated from
         # each completed batch, because the fixed value drifts by whole
@@ -850,7 +954,7 @@ class Speaker:
         # wake also lets the worker discard a now-stale parked batch.
         self._worker.reset_budget(self)
         self._terminate_current()
-        if hasattr(self._play, "invalidate"):  # client-playback sink
+        if hasattr(self._play, "invalidate"):  # client segment stream
             self._play.invalidate()
         self.resume()  # a paused player would sit on the new audio
         self._last_played = None
@@ -858,6 +962,12 @@ class Speaker:
         # the cancelled handle to unwind leaves /health pointing at audio
         # that is no longer meant to play.
         self._current_block = None
+
+    def clear_blocks(self):
+        """Cross-channel preemption: a later /seek must not resurrect text
+        that a preempt-all already nuked."""
+        with self._lock:
+            self._blocks = None
 
     def seek(self, delta=None, target=None):
         """Jump within the last blocks-speak by preempting and requeueing
@@ -912,9 +1022,14 @@ class Speaker:
         instead of waiting on a cold generate call. Local playback pauses
         via the PCM player; the afplay fallback keeps playing its current
         segment."""
-        self._pause.set()
-        if hasattr(self._play, "pause"):
-            self._play.pause()
+        # Flag and player pause move as one unit under the lock: a
+        # deferred cross-channel resume re-checks the flag under this
+        # same lock, so a re-pause can never be undone by a resume that
+        # lost the race.
+        with self._lock:
+            self._pause.set()
+            if hasattr(self._play, "pause"):
+                self._play.pause()
         return True
 
     def resume(self):
@@ -952,8 +1067,32 @@ class Speaker:
         segments sit unplayed: synthesis tracks the playhead instead of
         free-running a whole message's audio into memory. Pause needs no
         rule of its own - it stops the playhead, so this budget parks the
-        worker a couple of segments later."""
+        worker a couple of segments later. The channel gate extends the
+        same idea machine-wide: a channel that does not hold the audible
+        turn keeps its text unrendered instead of piling up audio."""
+        if self._gate is not None and not self._gate():
+            return False
         return self._lookahead_used() < SynthWorker.LOOKAHEAD
+
+    def has_queued_text(self):
+        """Unrendered content: what an interrupted channel resumes with."""
+        return (self._synth_busy or not self._synth_q.empty()
+                or self._carry is not None
+                or (self._batch is not None
+                    and self._batch.epoch == self._epoch))
+
+    def rendered_pending(self):
+        """Rendered segments not yet at (or past) the player: the audio an
+        interrupted channel is allowed to finish before going quiet.
+
+        Read under the play queue's own mutex: _pop_segment moves a
+        segment from the queue's size into _popped under that same lock,
+        so the sum can never transiently read 0 for a segment in hand
+        (the arbiter would retire the channel and its final segment
+        would play after someone else's turn)."""
+        with self._play_q.mutex:
+            limbo = self._play_q._qsize() + self._popped
+        return limbo + (1 if self._current is not None else 0)
 
     def _lookahead_used(self):
         """Segments rendered but not yet reached by the playhead. Local
@@ -986,51 +1125,657 @@ class Speaker:
         self._counter += 1
         return os.path.join(self._tmpdir, f"{self._counter}.wav")
 
+    def close(self):
+        """Channel GC: stop, detach from the shared worker, and end the
+        play loop. The Speaker must not be used afterwards."""
+        self.stop()
+        self._worker.unregister(self)
+        self._play_q.put(None)
+
     def _play_loop(self):
         while True:
-            epoch, path, block = self._play_q.get()
-            if epoch != self._epoch:
-                # Frees the stale segment's own charge; a no-op once a
-                # preemption re-based the budget onto the new epoch.
-                self._worker.segment_taken(self, epoch)
-                continue
-            if hasattr(self._play, "submit"):  # client-playback sink
-                try:
-                    self._play.submit(path, block)
-                except Exception as exc:
-                    print(f"segment submit failed: {exc}", file=sys.stderr)
-                finally:
-                    # Only after submit: until then the segment is counted
-                    # by neither the play queue nor the store's unfetched
-                    # tally, and dropping it from the budget early lets
-                    # synthesis run a segment past the lookahead.
-                    self._worker.segment_taken(self, epoch)
-                    try:
-                        os.unlink(path)
-                    except OSError:
-                        pass
-                continue
-            # Local playback: dequeue means this segment plays now, so the
-            # playhead advanced and a lookahead slot is free.
-            self._worker.segment_taken(self, epoch)
+            item = self._pop_segment()
+            if item is None:  # close(): the channel was deleted
+                return
             try:
-                self._current_block = block
-                if block is not None:
-                    self._last_played = block[0]
-                handle = self._play(path)
-                self._current = handle
-                if epoch != self._epoch:  # preempted between check and start
-                    handle.terminate()
-                handle.wait()
-            except Exception as exc:
-                print(f"playback failed: {exc}", file=sys.stderr)
+                self._deliver(*item)
             finally:
-                self._current = None
-                self._current_block = None
+                with self._play_q.mutex:
+                    self._popped -= 1
+                if self._on_progress is not None:
+                    self._on_progress()
+
+    def _pop_segment(self):
+        """Dequeue plus the in-limbo count as one atomic step. A plain
+        blocking get() opens an instant where the segment is counted by
+        neither qsize nor _popped; rendered_pending() reads under this
+        same mutex, which makes the no-transient-zero invariant
+        structural rather than timing-dependent. Uses queue.Queue's
+        documented-for-subclassing internals (mutex/not_empty/_get) so
+        every other queue operation keeps working unchanged."""
+        q = self._play_q
+        with q.not_empty:
+            while not q._qsize():
+                q.not_empty.wait()
+            item = q._get()
+            q.not_full.notify()
+            if item is not None:
+                self._popped += 1
+        return item
+
+    def _deliver(self, epoch, path, block):
+        if epoch != self._epoch:
+            # Frees the stale segment's own charge; a no-op once a
+            # preemption re-based the budget onto the new epoch.
+            self._worker.segment_taken(self, epoch)
+            return
+        # A channel without the audible turn parks here with its rendered
+        # segment until the machine queue grants it; a preemption (epoch
+        # bump) aborts the wait and the segment is dropped as stale.
+        if self._turn_wait is not None and not self._turn_wait(epoch):
+            self._worker.segment_taken(self, epoch)
+            return
+        if hasattr(self._play, "submit"):  # client segment stream
+            try:
+                self._play.submit(path, block)
+            except Exception as exc:
+                print(f"segment submit failed: {exc}", file=sys.stderr)
+            finally:
+                # Only after submit: until then the segment is counted
+                # by neither the play queue nor the store's unfetched
+                # tally, and dropping it from the budget early lets
+                # synthesis run a segment past the lookahead.
+                self._worker.segment_taken(self, epoch)
                 try:
                     os.unlink(path)
                 except OSError:
                     pass
+            return
+        # Local playback: dequeue means this segment plays now, so the
+        # playhead advanced and a lookahead slot is free.
+        self._worker.segment_taken(self, epoch)
+        try:
+            self._current_block = block
+            if block is not None:
+                self._last_played = block[0]
+            handle = self._play(path)
+            self._current = handle
+            if epoch != self._epoch:  # preempted between check and start
+                handle.terminate()
+            handle.wait()
+        except Exception as exc:
+            print(f"playback failed: {exc}", file=sys.stderr)
+        finally:
+            self._current = None
+            self._current_block = None
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+
+class MachineQueue:
+    """The machine-wide playback line: at most one channel is audible at a
+    time, FIFO by arrival at segment granularity.
+
+    Fresh arrivals wait in _line. A holder that still has unrendered text
+    when an eligible fresh arrival waits finishes only its rendered
+    lookahead, goes quiet, and parks on _resume; _resume drains
+    newest-interruption-first once the line is empty, so interrupted
+    content re-enters behind everything that arrived meanwhile.
+    Enforcement is segment release: a channel's Speaker consults
+    may_render before synthesizing and wait_turn before releasing, so a
+    channel without the turn holds text, not audio.
+
+    Client channels prove liveness with their played cursor: once nothing
+    is progressing and someone else is waiting, the holder gets its
+    remaining released audio duration plus PLAYED_GRACE to report played;
+    silence past that means the client died and the queue moves on. With
+    no one waiting the clock never runs - a sole client that never reports
+    played (today's extension) keeps working.
+
+    Lock ordering: this queue's lock nests inside the manager's and the
+    Speakers' locks (state_fns read Speaker attributes lock-free and take
+    only SegmentStore's condition); worker wakeups happen outside it.
+    """
+
+    def __init__(self, clock=time.monotonic, grace=PLAYED_GRACE):
+        self._clock = clock
+        self._grace = grace
+        self._cond = threading.Condition()
+        self._state_fns = {}
+        self._holder = None
+        self._line = []    # fresh arrivals, FIFO
+        self._resume = []  # interrupted channels, resumed LIFO
+        self._progress = None    # (released seq, played seq) last seen
+        self._progress_t = 0.0   # when it last changed
+        # Lock-free snapshot (holder, challenged) for the synth gate: it is
+        # read under the worker's condition, where taking this queue's lock
+        # would invert the ordering with poke()'s worker wakeup.
+        self._grant = (None, False)
+        self.on_change = None  # SynthWorker.wake; called outside the lock
+        self.on_dead = None    # dead-client cleanup; called outside the lock
+
+    def register(self, name, state_fn):
+        with self._cond:
+            self._state_fns[name] = state_fn
+
+    def unregister(self, name, fn=None):
+        """fn, when given, must match the live registration: GC hands in
+        the state_fn it registered, so a channel recreated under the same
+        name between GC's delete and this call keeps its registration
+        instead of being silently torn down."""
+        with self._cond:
+            if fn is not None and self._state_fns.get(name) is not fn:
+                return
+            self._state_fns.pop(name, None)
+            self._drop_locked(name)
+            kills, changed = self._advance_locked()
+        self._after(kills, changed)
+
+    def enqueue(self, name):
+        """The channel has content and wants the speakers. Already queued
+        (or holding) channels keep their place; their new content simply
+        extends their own queue."""
+        with self._cond:
+            if (name != self._holder and name not in self._line
+                    and name not in self._resume):
+                self._line.append(name)
+            kills, changed = self._advance_locked()
+        self._after(kills, changed)
+
+    def remove(self, name):
+        """Pause/stop took this channel out of contention; /resume or new
+        content re-enters it at the tail."""
+        with self._cond:
+            self._drop_locked(name)
+            kills, changed = self._advance_locked()
+        self._after(kills, changed)
+
+    def clear(self):
+        """Preempt-all: the waiter list and all resume state go; channels
+        whose epochs the caller bumps are out of the line entirely."""
+        with self._cond:
+            self._line.clear()
+            self._resume.clear()
+            self._holder = None
+            self._progress = None
+            self._grant = (None, False)
+            self._cond.notify_all()
+        if self.on_change is not None:
+            self.on_change()
+
+    def poke(self):
+        """Scheduling inputs changed (release, played report, poll, timer
+        tick): re-evaluate whose turn it is."""
+        with self._cond:
+            kills, changed = self._advance_locked()
+        self._after(kills, changed)
+
+    def holder(self):
+        return self._holder
+
+    def may_render(self, name):
+        """Synth gate: only the unchallenged holder renders new segments.
+        A challenged holder finishes its rendered lookahead and yields."""
+        holder, challenged = self._grant
+        return holder == name and not challenged
+
+    def wait_turn(self, name, cancelled):
+        """Block a release until the turn arrives; cancelled() (an epoch
+        bump) aborts. Waits in short slices so preemption paths that
+        cannot reach this condition still land promptly."""
+        with self._cond:
+            while self._holder != name:
+                if cancelled():
+                    return False
+                self._cond.wait(0.05)
+            return True
+
+    def _drop_locked(self, name):
+        if self._holder == name:
+            self._holder = None
+            self._progress = None
+        if name in self._line:
+            self._line.remove(name)
+        if name in self._resume:
+            self._resume.remove(name)
+
+    def _eligible_waiting_locked(self):
+        return any(self._state_fns[n]()["eligible"] for n in self._line
+                   if n in self._state_fns)
+
+    def _advance_locked(self):
+        kills = []
+        now = self._clock()
+        moved = True
+        while moved:
+            moved = False
+            holder = self._holder
+            if holder is not None and holder in self._state_fns:
+                st = self._state_fns[holder]()
+                waiting = self._eligible_waiting_locked()
+                if st["paused"]:
+                    # Explicit pause yields immediately; /resume re-enters
+                    # at the tail via the manager.
+                    self._holder = None
+                elif st["released"] > 0:
+                    progress = (st["released_seq"], st["played_seq"])
+                    if progress != self._progress:
+                        self._progress = progress
+                        self._progress_t = now
+                    elif (waiting and now - self._progress_t
+                            > st["released_s"] + self._grace):
+                        # Duration is the deadline, not the progress
+                        # signal: silence past it means a dead client.
+                        kills.append(holder)
+                        self._holder = None
+                elif st["rendered"] == 0:
+                    if not st["has_text"]:
+                        self._holder = None  # finished; next in line
+                    elif waiting:
+                        # Rendered lookahead is spent and someone eligible
+                        # waits: park with the remaining text.
+                        self._resume.append(holder)
+                        self._holder = None
+                if self._holder != holder:
+                    self._progress = None
+                    moved = True
+            if self._holder is None and self._grant_locked(now):
+                moved = True
+        grant = (self._holder, self._eligible_waiting_locked())
+        changed = grant != self._grant
+        if changed:
+            self._grant = grant
+            self._cond.notify_all()
+        return kills, changed
+
+    def _grant_locked(self, now):
+        # A queued name can outlive its registration (GC racing an
+        # enqueue): granting it would KeyError on every poke from then
+        # on, killing the janitor. Drop such names instead of trusting
+        # every enqueue/unregister interleaving to be airtight.
+        for group in (self._line, self._resume):
+            for name in [n for n in group if n not in self._state_fns]:
+                group.remove(name)
+                print(f"channel {name}: queued without state; dropped",
+                      file=sys.stderr)
+        for i, name in enumerate(self._line):
+            if self._state_fns[name]()["eligible"]:
+                self._holder = self._line.pop(i)
+                break
+        else:
+            # Newest interruption resumes first: it was cut mid-utterance
+            # most recently, like a stack of nested interruptions.
+            for i in range(len(self._resume) - 1, -1, -1):
+                if self._state_fns[self._resume[i]]()["eligible"]:
+                    self._holder = self._resume.pop(i)
+                    break
+            else:
+                # Last resort, self-healing: a channel that lost its queue
+                # slot to a state-read race but still holds content must
+                # not sit silent forever. Only reached when nobody else
+                # wants the machine.
+                for name, fn in self._state_fns.items():
+                    st = fn()
+                    if st["eligible"] and (st["has_text"]
+                                           or st["rendered"] > 0):
+                        self._holder = name
+                        break
+                else:
+                    return False
+        self._progress = None
+        self._progress_t = now
+        return True
+
+    def _after(self, kills, changed):
+        if changed and self.on_change is not None:
+            self.on_change()
+        for name in kills:
+            print(f"channel {name}: client stopped reporting played; "
+                  "cleared", file=sys.stderr)
+            if self.on_dead is not None:
+                self.on_dead(name)
+        if kills:
+            self.poke()
+
+
+class Channel:
+    """One name's queue, stream, and poll liveness. Client channels stream
+    through their own SegmentStore; the daemon-played local channel has
+    none and plays through the machine's speakers directly."""
+
+    __slots__ = ("name", "speaker", "store", "active_polls", "last_poll",
+                 "created", "last_used", "busy", "state_fn")
+
+    def __init__(self, name, speaker, store, created):
+        self.name = name
+        self.speaker = speaker
+        self.store = store
+        self.active_polls = 0
+        self.last_poll = None  # None: never polled -> not turn-eligible
+        self.created = created
+        # GC inputs beyond polls: any request touching the channel is
+        # liveness, and busy pins it while a request is mid-operation so
+        # deletion can never interleave with a speak/pause/seek in hand.
+        self.last_used = created
+        self.busy = 0
+        # The state_fn registered with the MachineQueue, kept so GC can
+        # unregister exactly what it registered (a recreated same-name
+        # channel must keep its own registration).
+        self.state_fn = None
+
+
+class ChannelManager:
+    """Per-utterance routing on top of the one shared SynthWorker: each
+    /speak lands in exactly one channel, each channel has exactly one
+    player, and the MachineQueue arbitrates the single machine voice.
+    Channels are created on first use by name and die with the daemon
+    (idle unpolled ones earlier, via GC)."""
+
+    def __init__(self, local_speaker, local_store, grace=PLAYED_GRACE,
+                 poll_window=PLAYED_GRACE, gc_seconds=CHANNEL_GC_SECONDS,
+                 tick=0.5, clock=time.monotonic):
+        self._lock = threading.Lock()
+        self._clock = clock
+        self._poll_window = poll_window
+        self._gc_seconds = gc_seconds
+        self._tick = tick
+        self._worker = local_speaker._worker
+        # /speak's speed is sticky daemon-wide: one knob, every channel.
+        self.speed = local_speaker.speed
+        self.queue = MachineQueue(clock=clock, grace=grace)
+        self.queue.on_change = self._worker.wake
+        self.queue.on_dead = self._kill
+        local = Channel(LOCAL_CHANNEL, local_speaker, local_store, clock())
+        self._channels = {LOCAL_CHANNEL: local}
+        self._attach(local)
+        # A local speaker already mid-utterance when channels come up owns
+        # the turn it was implicitly using.
+        if self._has_content(local):
+            self.queue.enqueue(LOCAL_CHANNEL)
+        self._janitor = threading.Thread(target=self._maintain, daemon=True)
+        self._janitor.start()
+
+    def channel(self, name):
+        with self._lock:
+            return self._channel_locked(name)
+
+    def _channel_locked(self, name):
+        ch = self._channels.get(name)
+        if ch is None:
+            store = SegmentStore()
+            speaker = Speaker(play_fn=store, worker=self._worker,
+                              speed=self.speed)
+            ch = Channel(name, speaker, store, self._clock())
+            self._channels[name] = ch
+            self._attach(ch)
+        # Any touch is liveness: GC must not collect a channel a request
+        # just used.
+        ch.last_used = self._clock()
+        return ch
+
+    def _acquire(self, name):
+        """Lookup plus an in-use pin in one locked step: GC eligibility
+        and removal take the same lock, so a channel handed out here can
+        never be deleted while the request still operates on it."""
+        with self._lock:
+            ch = self._channel_locked(name)
+            ch.busy += 1
+        return ch
+
+    def _release(self, ch):
+        with self._lock:
+            ch.busy -= 1
+            ch.last_used = self._clock()
+
+    def _attach(self, ch):
+        speaker, name = ch.speaker, ch.name
+        speaker._gate = lambda: self.queue.may_render(name)
+
+        def turn_wait(epoch):
+            # A segment in hand means this channel wants the speakers;
+            # re-enqueueing (idempotent) heals the race where the turn was
+            # released in the instant between queue-empty and this pop.
+            if self.queue.holder() != name:
+                self.queue.enqueue(name)
+            return self.queue.wait_turn(
+                name, lambda: speaker._epoch != epoch)
+
+        speaker._turn_wait = turn_wait
+        speaker._on_progress = self.queue.poke
+        ch.state_fn = lambda: self._state(ch)
+        self.queue.register(name, ch.state_fn)
+
+    def _state(self, ch):
+        """The MachineQueue's per-channel scheduling inputs, read without
+        the Speaker's lock (all are single reads; a stale value only
+        delays a decision to the next poke)."""
+        speaker, store = ch.speaker, ch.store
+        paused = speaker.paused()
+        state = {
+            "rendered": speaker.rendered_pending(),
+            "has_text": speaker.has_queued_text(),
+            "paused": paused,
+            "released": 0, "released_s": 0.0,
+            "released_seq": 0, "played_seq": 0,
+        }
+        if store is None:  # daemon-played local: always poll-eligible
+            state["eligible"] = not paused
+            return state
+        released, released_s, seq, played = store.release_stats()
+        state.update(released=released, released_s=released_s,
+                     released_seq=seq, played_seq=played)
+        # No dead-air turns: a client channel earns eligibility with an
+        # outstanding or recent poll, so a typo'd name just holds text.
+        polled = ch.active_polls > 0 or (
+            ch.last_poll is not None
+            and self._clock() - ch.last_poll < self._poll_window)
+        state["eligible"] = polled and not paused
+        return state
+
+    def _has_content(self, ch):
+        st = self._state(ch)
+        return st["rendered"] > 0 or st["released"] > 0 or st["has_text"]
+
+    def speak(self, name, text=None, blocks=None, append=False, speed=None):
+        if speed is not None:
+            self.set_speed(speed)
+        ch = self._acquire(name)
+        try:
+            if not append:
+                self.preempt_all(keep=name)
+            queued = ch.speaker.speak(text=text, blocks=blocks,
+                                      append=append)
+            self.queue.enqueue(name)
+            return queued
+        finally:
+            self._release(ch)
+
+    def preempt_all(self, keep=None):
+        """One voice per machine: a non-append /speak silences and clears
+        every channel (the keep channel's own preemption happens in its
+        speak()). Lock order: manager -> speaker -> worker/store; the
+        machine queue's lock is never held around any of those."""
+        self.queue.clear()
+        with self._lock:
+            channels = [ch for ch in self._channels.values()
+                        if ch.name != keep]
+        for ch in channels:
+            ch.speaker.stop()
+            ch.speaker.clear_blocks()
+
+    def set_speed(self, speed):
+        with self._lock:
+            self.speed = speed
+            for ch in self._channels.values():
+                ch.speaker.speed = speed
+
+    def pause(self, name):
+        ch = self._acquire(name)
+        try:
+            ch.speaker.pause()
+            # A paused holder yields immediately; a paused waiter leaves
+            # the line and re-enters at the tail on /resume.
+            self.queue.remove(name)
+            return ch.speaker.paused()
+        finally:
+            self._release(ch)
+
+    def resume(self, name):
+        ch = self._acquire(name)
+        try:
+            speaker = ch.speaker
+            if (speaker._current is not None
+                    and hasattr(speaker._play, "resume")
+                    and self.queue.holder() != name):
+                # The in-flight segment already passed wait_turn under an
+                # earlier grant; audibly un-pausing it now would speak
+                # over whoever holds the turn. Clear the pause flag (the
+                # arbiter sees the channel as eligible again) but keep
+                # the player muted until the turn actually comes back.
+                speaker._pause.clear()
+                self._resume_when_granted(name, speaker)
+                speaker._worker.wake()
+            else:
+                speaker.resume()
+            if self._has_content(ch):
+                self.queue.enqueue(name)
+            else:
+                self.queue.poke()
+            return speaker.paused()
+        finally:
+            self._release(ch)
+
+    def _resume_when_granted(self, name, speaker):
+        """Park a mid-segment resume until the machine queue grants the
+        turn back; a preempt/stop (epoch bump, which resumes the player
+        itself) or a re-pause abandons the wait."""
+        epoch = speaker._epoch
+
+        def cancelled():
+            return speaker._epoch != epoch or speaker._pause.is_set()
+
+        def waiter():
+            if not self.queue.wait_turn(name, cancelled):
+                return
+            # Re-check under the Speaker's lock: pause() flips the flag
+            # and pauses the player under it, so a resume that raced a
+            # fresh pause can never audibly override it.
+            with speaker._lock:
+                if speaker._epoch == epoch and not speaker._pause.is_set():
+                    speaker._play.resume()
+
+        threading.Thread(target=waiter, daemon=True).start()
+
+    def seek(self, name, delta=None, target=None):
+        ch = self._acquire(name)
+        try:
+            result = ch.speaker.seek(delta=delta, target=target)
+            if result is not None:
+                # Re-queues content at the tail; a seek lines up but
+                # never steals the turn from whoever holds it.
+                self.queue.enqueue(name)
+            return result
+        finally:
+            self._release(ch)
+
+    def stop(self, name=None):
+        if name is None:  # the hammer: all channels
+            self.queue.clear()
+            with self._lock:
+                channels = list(self._channels.values())
+            for ch in channels:
+                ch.speaker.stop()
+            return
+        ch = self._acquire(name)
+        try:
+            ch.speaker.stop()
+            self.queue.remove(name)
+        finally:
+            self._release(ch)
+
+    def poll_begin(self, name, played=None):
+        """Lookup and poll-mark in one locked step, returning the pinned
+        channel: an outstanding poll blocks GC, so the store the caller
+        long-polls can never belong to a deleted channel."""
+        with self._lock:
+            ch = self._channel_locked(name)
+            ch.active_polls += 1
+            ch.last_poll = self._clock()
+        if played is not None and ch.store is not None:
+            ch.store.report_played(played)
+        self.queue.poke()
+        return ch
+
+    def poll_end(self, ch):
+        with self._lock:
+            ch.active_polls -= 1
+            ch.last_poll = self._clock()
+        self.queue.poke()
+
+    def snapshot(self):
+        """/health's channels dict. A client channel is speaking iff it
+        has released segments not yet reported played and is not paused;
+        the daemon-played local channel is speaking when its player is."""
+        with self._lock:
+            channels = dict(self._channels)
+        out = {}
+        for name, ch in channels.items():
+            speaker = ch.speaker
+            if ch.store is not None:
+                released = ch.store.release_stats()[0]
+                speaking = released > 0 and not speaker.paused()
+            else:
+                speaking = speaker.speaking()
+            block = speaker.current_block()
+            out[name] = {"pending": speaker.pending(), "speaking": speaking,
+                         "paused": speaker.paused(),
+                         "block": list(block) if block else None}
+        return out
+
+    def _kill(self, name):
+        with self._lock:
+            ch = self._channels.get(name)
+        if ch is not None:
+            ch.speaker.stop()
+
+    def _maintain(self):
+        # Timer tick: dead-client deadlines and GC must fire even when no
+        # request arrives to poke the queue.
+        while True:
+            time.sleep(self._tick)
+            # The janitor is load-bearing (dead-client deadlines, GC):
+            # one bad tick must never end it for the daemon's lifetime,
+            # so failures are logged and the next tick retries.
+            try:
+                self.queue.poke()
+                self._gc()
+            except Exception:
+                traceback.print_exc()
+                print("channel maintenance tick failed; retrying",
+                      file=sys.stderr)
+
+    def _gc(self):
+        now = self._clock()
+        dead = []
+        with self._lock:
+            for name, ch in list(self._channels.items()):
+                # busy: a request holds this channel right now; deleting
+                # under it is the race that strands its queued text.
+                if (name == LOCAL_CHANNEL or ch.active_polls > 0
+                        or ch.busy > 0):
+                    continue
+                last_seen = max(ch.last_used, ch.last_poll or 0.0)
+                if now - last_seen <= self._gc_seconds:
+                    continue
+                if self._has_content(ch):
+                    continue
+                dead.append(ch)
+                del self._channels[name]
+        for ch in dead:
+            self.queue.unregister(ch.name, ch.state_fn)
+            ch.speaker.close()
 
 
 class App:
@@ -1054,6 +1799,19 @@ class App:
         # POST /config does read-validate-update-save; serialize it so
         # concurrent posts can't interleave a stale config into a save.
         self.config_lock = threading.Lock()
+        # Channel routing is built on first use (or eagerly by main), so a
+        # server that never sees a channel field behaves exactly as it did
+        # before channels existed.
+        self.channels = None
+        self.channel_opts = {}  # test hook: short clocks and windows
+        self._channels_lock = threading.Lock()
+
+    def ensure_channels(self):
+        with self._channels_lock:
+            if self.channels is None and self.speaker is not None:
+                self.channels = ChannelManager(self.speaker, self.segments,
+                                               **self.channel_opts)
+        return self.channels
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -1102,18 +1860,47 @@ class _Handler(BaseHTTPRequestHandler):
         return live
 
     def _segment(self, query):
-        store = self.app.segments
-        if store is None:
-            self._json(404, {"error": "server-side playback; start the "
-                                      "daemon with --playback client"})
+        channel = query.get("channel", [None])[0]
+        if channel is not None and CHANNEL_NAME_RE.fullmatch(channel) is None:
+            self._json(400, {"error": "invalid channel name"})
             return
         try:
             after = int(query.get("after", ["0"])[0])
-            timeout = min(float(query.get("timeout", ["20"])[0]), 60.0)
+            timeout = min(float(
+                query.get("timeout", [str(SEGMENT_POLL_TIMEOUT)])[0]),
+                MAX_POLL_TIMEOUT)
+            played = query.get("played", [None])[0]
+            played = int(played) if played is not None else None
         except ValueError:
-            self._json(400, {"error": "after/timeout must be numeric"})
+            self._json(400, {"error": "after/timeout/played must be numeric"})
             return
-        seq, block, data, epoch = store.next_after(after, timeout)
+        mgr = self.app.channels
+        if mgr is None and channel is not None:
+            mgr = self.app.ensure_channels()
+        if mgr is None:
+            # Pre-channels server (or model still loading): the local
+            # stream exists only under client playback, exactly as before.
+            store = self.app.segments
+            if store is None:
+                self._json(404, {"error": "server-side playback; start the "
+                                          "daemon with --local-player "
+                                          "client"})
+                return
+            seq, block, data, epoch = store.next_after(after, timeout)
+        else:
+            # poll_begin looks up and pins in one step: a bare channel()
+            # lookup here could hand back an object GC deletes before
+            # the poll marks it in use.
+            ch = mgr.poll_begin(channel or LOCAL_CHANNEL, played)
+            try:
+                if ch.store is None:  # daemon-played local has no stream
+                    self._json(404, {"error": "server-side playback; "
+                                              "start the daemon with "
+                                              "--local-player client"})
+                    return
+                seq, block, data, epoch = ch.store.next_after(after, timeout)
+            finally:
+                mgr.poll_end(ch)
         if data is None:  # long-poll timed out; epoch still lets the
             self.send_response(204)  # client notice a preemption while idle
             self.send_header("X-Epoch", str(epoch))
@@ -1136,7 +1923,7 @@ class _Handler(BaseHTTPRequestHandler):
         if url.path == "/health":
             speaker = self.app.speaker
             ready = speaker is not None and speaker.ready.is_set()
-            self._json(200, {
+            payload = {
                 "ok": True,
                 "ready": ready,
                 "model": self.app.model_id,
@@ -1147,7 +1934,29 @@ class _Handler(BaseHTTPRequestHandler):
                 "block": list(speaker.current_block())
                          if ready and speaker.current_block() else None,
                 "speed": speaker.speed if ready else None,
-            })
+            }
+            mgr = self.app.channels
+            if ready and mgr is not None:
+                channels = mgr.snapshot()
+                local = channels[LOCAL_CHANNEL]
+                # Top-level fields keep their pre-channel meaning for
+                # existing clients: machine-wide activity plus the local
+                # channel's pause/position.
+                payload.update(
+                    pending=sum(c["pending"] for c in channels.values()),
+                    speaking=any(c["speaking"] for c in channels.values()),
+                    paused=local["paused"],
+                    block=local["block"],
+                    channels=channels,
+                )
+            elif ready:
+                payload["channels"] = {LOCAL_CHANNEL: {
+                    "pending": payload["pending"],
+                    "speaking": payload["speaking"],
+                    "paused": payload["paused"],
+                    "block": payload["block"],
+                }}
+            self._json(200, payload)
         elif url.path == "/config":
             self._json(200, self._config_payload())
         elif url.path == "/segment":
@@ -1187,8 +1996,22 @@ class _Handler(BaseHTTPRequestHandler):
         if not isinstance(body, dict):
             self._json(400, {"error": "body must be a JSON object"})
             return
+        channel = body.get("channel")
+        if channel is not None and (
+                not isinstance(channel, str)
+                or CHANNEL_NAME_RE.fullmatch(channel) is None):
+            self._json(400, {"error": "invalid channel name"})
+            return
+        # Channel routing engages on first channelled request; until then
+        # the pre-channels code paths serve no-channel requests unchanged.
+        mgr = self.app.channels
+        if mgr is None and channel is not None:
+            mgr = self.app.ensure_channels()
         if self.path == "/stop":
-            speaker.stop()
+            if mgr is not None:
+                mgr.stop(channel)  # no channel: the hammer, all channels
+            else:
+                speaker.stop()
             self._json(200, {"ok": True})
             return
         if self.path == "/seek":
@@ -1197,15 +2020,20 @@ class _Handler(BaseHTTPRequestHandler):
                 if not isinstance(block, int) or isinstance(block, bool):
                     self._json(400, {"error": "block must be an integer"})
                     return
-                target = speaker.seek(target=block)
+                delta = None
             else:
+                block = None
                 delta = body.get("delta", 1)
                 if (not isinstance(delta, int) or isinstance(delta, bool)
                         or delta == 0):
                     self._json(
                         400, {"error": "delta must be a non-zero integer"})
                     return
-                target = speaker.seek(delta)
+            if mgr is not None:
+                target = mgr.seek(channel or LOCAL_CHANNEL,
+                                  delta=delta, target=block)
+            else:
+                target = speaker.seek(delta=delta, target=block)
             if target is None:
                 self._json(200, {"ok": False, "error": "nothing to seek"})
             else:
@@ -1223,7 +2051,10 @@ class _Handler(BaseHTTPRequestHandler):
                 # Hot-apply what playback picks up mid-flight; the rest sits
                 # in the file and is reported via restart_required.
                 if "speed" in body:
-                    speaker.speed = float(body["speed"])
+                    if mgr is not None:  # one knob, every channel
+                        mgr.set_speed(float(body["speed"]))
+                    else:
+                        speaker.speed = float(body["speed"])
                 if "fx" in body:
                     app.fx_enabled = body["fx"]
                 # Persist last: the change is already live in memory, so a
@@ -1242,12 +2073,20 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json(200, payload)
             return
         if self.path == "/pause":
-            speaker.pause()
-            self._json(200, {"ok": True, "paused": speaker.paused()})
+            if mgr is not None:
+                paused = mgr.pause(channel or LOCAL_CHANNEL)
+            else:
+                speaker.pause()
+                paused = speaker.paused()
+            self._json(200, {"ok": True, "paused": paused})
             return
         if self.path == "/resume":
-            speaker.resume()
-            self._json(200, {"ok": True, "paused": speaker.paused()})
+            if mgr is not None:
+                paused = mgr.resume(channel or LOCAL_CHANNEL)
+            else:
+                speaker.resume()
+                paused = speaker.paused()
+            self._json(200, {"ok": True, "paused": paused})
             return
         if self.path != "/speak":
             self._json(404, {"error": "not found"})
@@ -1275,9 +2114,13 @@ class _Handler(BaseHTTPRequestHandler):
             if not indexed:
                 self._json(200, {"queued": 0})
                 return
-            self._json(200, {"queued": speaker.speak(blocks=indexed,
-                                                     append=append,
-                                                     speed=speed)})
+            if mgr is not None:
+                queued = mgr.speak(channel or LOCAL_CHANNEL, blocks=indexed,
+                                   append=append, speed=speed)
+            else:
+                queued = speaker.speak(blocks=indexed, append=append,
+                                       speed=speed)
+            self._json(200, {"queued": queued})
             return
         text = body.get("text")
         if not isinstance(text, str) or not text.strip():
@@ -1288,7 +2131,11 @@ class _Handler(BaseHTTPRequestHandler):
         if not text:
             self._json(200, {"queued": 0})
             return
-        queued = speaker.speak(text, append=append, speed=speed)
+        if mgr is not None:
+            queued = mgr.speak(channel or LOCAL_CHANNEL, text=text,
+                               append=append, speed=speed)
+        else:
+            queued = speaker.speak(text, append=append, speed=speed)
         self._json(200, {"queued": queued})
 
 
@@ -1770,9 +2617,15 @@ def parse_args():
                         f"({SPEED_MIN}-{SPEED_MAX}); a /speak with a speed "
                         f"field overrides it from then on (default: config "
                         f"file, or 1.0)")
-    p.add_argument("--playback", choices=["local", "client"], default="local",
-                   help="local: play audio on this machine; client: buffer "
-                        "segments for clients to fetch via GET /segment")
+    p.add_argument("--local-player", choices=["daemon", "client"],
+                   default=None,
+                   help="who plays the local channel: daemon plays audio on "
+                        "this machine (default); client buffers the local "
+                        "stream for a player to fetch via GET /segment. "
+                        "Named channels are always client-played streams.")
+    p.add_argument("--playback", choices=["local", "client"], default=None,
+                   help="deprecated alias: 'client' means "
+                        "--local-player client")
     p.add_argument("--token", default=os.environ.get("VOICE_ML_TOKEN"),
                    help="require 'Authorization: Bearer <token>' on every "
                         "request (default: $VOICE_ML_TOKEN)")
@@ -1786,6 +2639,17 @@ def parse_args():
     p.add_argument("--qwentts-port", type=int, default=0,
                    help="localhost port for tts-server (0 = pick a free port)")
     return p.parse_args()
+
+
+def resolve_local_player(local_player, playback):
+    """--playback predates channels and stays one more stage so existing
+    launch scripts keep working; an explicit --local-player wins."""
+    if playback is not None:
+        print("--playback is deprecated; use --local-player "
+              "{daemon|client}", file=sys.stderr)
+        if local_player is None:
+            return "client" if playback == "client" else "daemon"
+    return local_player or "daemon"
 
 
 def main():
@@ -1809,7 +2673,8 @@ def main():
     if args.host not in ("127.0.0.1", "localhost", "::1") and not args.token:
         print("warning: binding beyond loopback with no --token; anyone on "
               "the network can drive synthesis", file=sys.stderr)
-    store = SegmentStore() if args.playback == "client" else None
+    local_player = resolve_local_player(args.local_player, args.playback)
+    store = SegmentStore() if local_player == "client" else None
 
     # qwentts: validate required flags and pick a free port if needed.
     if args.backend == "qwentts":
@@ -1844,7 +2709,7 @@ def main():
     server = make_server(app, args.port, args.host)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     print(f"listening on http://{args.host}:{args.port}  "
-          f"(POST /speak, /stop; GET /health; playback: {args.playback})")
+          f"(POST /speak, /stop; GET /health; local player: {local_player})")
 
     def factory():
         synth = load_synth(
@@ -1876,6 +2741,7 @@ def main():
 
     app.speaker = Speaker(synth_factory=factory, play_fn=store,
                           speed=args.speed)
+    app.ensure_channels()
     app.speaker.ready.wait()
     print("ready")
     threading.Event().wait()

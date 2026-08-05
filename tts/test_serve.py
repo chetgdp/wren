@@ -1129,7 +1129,7 @@ def test_pause_resume_endpoints_and_health_flag():
 def test_pause_works_without_pausable_player():
     # The play fn has no pause(); /pause still reports paused, and synthesis
     # parks via the lookahead budget once the playhead stops advancing
-    # (client-playback sinks and the afplay fallback hit this path).
+    # (client segment streams and the afplay fallback hit this path).
     server, port = start_server([])
     try:
         status, body = request(port, "/pause", {})
@@ -1322,7 +1322,7 @@ def test_segment_store_overflow_drops_oldest(tmp_path):
     assert (seq, data) == (2, b"bbb")  # oldest dropped, newest kept
 
 
-def test_speaker_with_client_sink_buffers_instead_of_playing(tmp_path):
+def test_speaker_with_client_stream_buffers_instead_of_playing(tmp_path):
     store = SegmentStore()
     sp = make_speaker([], store=store)
     sp.speak("hello there.")
@@ -1331,7 +1331,7 @@ def test_speaker_with_client_sink_buffers_instead_of_playing(tmp_path):
     assert wait_for(lambda: sp.pending() == 0)
 
 
-def test_speaker_preempt_invalidates_client_sink(tmp_path):
+def test_speaker_preempt_invalidates_client_stream(tmp_path):
     store = SegmentStore()
     sp = make_speaker([], store=store)
     sp.speak("old text.")  # non-append speak preempts: epoch 1
@@ -2082,3 +2082,638 @@ def test_post_config_503_while_model_loading(tmp_path):
             assert "loading" in json.loads(e.read())["error"]
     finally:
         server.shutdown()
+
+
+# --- channels (stage B) ---
+
+class CountingSynth:
+    """Word-per-segment stub that records every synth call, so tests can
+    assert a waiting channel held text (no call) instead of audio."""
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, text, make_path):
+        self.calls.append(text)
+        for word in text.split():
+            path = make_path()
+            Path(path).write_text(word)
+            yield path
+
+
+def start_channel_server(local_store=None, **opts):
+    synth = CountingSynth()
+    app = App(model_id="test-model", segments=local_store)
+    play = local_store if local_store is not None else _recording_play([])
+    app.speaker = Speaker(synth, play)
+    app.channel_opts = dict(tick=0.02, poll_window=5.0, grace=5.0)
+    app.channel_opts.update(opts)
+    server = make_server(app, port=0)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, server.server_address[1], app, synth
+
+
+def fetch_segment(port, channel=None, after=0, played=None, timeout=2.0):
+    """One /segment poll; (seq, epoch, data), data None on 204."""
+    qs = f"/segment?after={after}&timeout={timeout}"
+    if channel is not None:
+        qs += f"&channel={channel}"
+    if played is not None:
+        qs += f"&played={played}"
+    with raw_request(port, qs) as resp:
+        if resp.status == 204:
+            return None, int(resp.headers["X-Epoch"]), None
+        return (int(resp.headers["X-Seq"]), int(resp.headers["X-Epoch"]),
+                resp.read())
+
+
+def prime(port, channel):
+    """A first (empty) poll: makes the channel eligible for a turn."""
+    fetch_segment(port, channel, after=0, timeout=0.05)
+
+
+def drain(port, channel, after=0, quiet=1.0):
+    """Fetch segments, reporting each played on the next poll, until the
+    stream goes quiet. Returns (decoded segments, last seq seen)."""
+    got = []
+    seq = after
+    while True:
+        s, _, data = fetch_segment(port, channel, after=seq, played=seq,
+                                   timeout=quiet)
+        if s is None:
+            return got, seq
+        seq = s
+        got.append(data.decode())
+
+
+def test_channels_have_isolated_streams_and_epochs():
+    server, port, app, synth = start_channel_server()
+    try:
+        request(port, "/speak", {"text": "aa ab.", "channel": "cha",
+                                 "raw": True})
+        got_a, _ = drain(port, "cha")
+        assert got_a == ["aa", "ab."]
+        request(port, "/speak", {"text": "ba bb.", "channel": "chb",
+                                 "append": True, "raw": True})
+        got_b, _ = drain(port, "chb")
+        assert got_b == ["ba", "bb."]
+        # seq and epoch spaces are per channel: both streams start at seq
+        # 1, and only cha (whose speak preempted) had its epoch bumped.
+        seq_a, epoch_a, data_a = fetch_segment(port, "cha", after=0,
+                                               timeout=0.05)
+        seq_b, epoch_b, data_b = fetch_segment(port, "chb", after=0,
+                                               timeout=0.05)
+        assert (seq_a, data_a) == (1, b"aa")
+        assert (seq_b, data_b) == (1, b"ba")
+        assert epoch_a == 1 and epoch_b == 0
+    finally:
+        server.shutdown()
+
+
+def test_machine_queue_append_slots_in_and_interrupted_resumes():
+    server, port, app, synth = start_channel_server()
+    try:
+        words = "a1 a2 a3 a4 a5 a6 a7 a8"
+        request(port, "/speak", {"text": words, "channel": "cha",
+                                 "raw": True})
+        seq1, _, d1 = fetch_segment(port, "cha", after=0)
+        assert d1 == b"a1"
+        prime(port, "chb")
+        request(port, "/speak", {"text": "b1 b2.", "channel": "chb",
+                                 "append": True, "raw": True})
+        # the interrupted holder releases only its rendered lookahead
+        got_a, seq_a = drain(port, "cha", after=seq1)
+        assert got_a
+        assert len(got_a) < 7
+        got_b, _ = drain(port, "chb")
+        assert got_b == ["b1", "b2."]
+        # the interrupted channel resumes exactly where it stopped
+        got_a2, _ = drain(port, "cha", after=seq_a, quiet=2.0)
+        assert ["a1"] + got_a + got_a2 == words.split()
+    finally:
+        server.shutdown()
+
+
+def test_third_channel_queues_behind_and_resume_is_newest_first():
+    server, port, app, synth = start_channel_server()
+    try:
+        request(port, "/speak", {"text": "a1 a2 a3 a4 a5 a6",
+                                 "channel": "cha", "raw": True})
+        sa, _, _ = fetch_segment(port, "cha", after=0)
+        prime(port, "chb")
+        request(port, "/speak", {"text": "b1 b2 b3 b4 b5 b6",
+                                 "channel": "chb", "append": True,
+                                 "raw": True})
+        got_a, seq_a = drain(port, "cha", after=sa)  # a's lookahead only
+        sb, _, db = fetch_segment(port, "chb", after=0)
+        assert db == b"b1"
+        prime(port, "chc")
+        request(port, "/speak", {"text": "c1.", "channel": "chc",
+                                 "append": True, "raw": True})
+        got_b, seq_b = drain(port, "chb", after=sb)  # b's lookahead only
+        assert len(got_b) < 5
+        got_c, _ = drain(port, "chc", quiet=2.0)
+        assert got_c == ["c1."]
+        # newest interruption resumes first: b continues (and finishes)
+        # before a gets the machine back
+        got_b2, _ = drain(port, "chb", after=seq_b, quiet=2.0)
+        assert ["b1"] + got_b + got_b2 == "b1 b2 b3 b4 b5 b6".split()
+        got_a2, _ = drain(port, "cha", after=seq_a, quiet=2.0)
+        assert ["a1"] + got_a + got_a2 == "a1 a2 a3 a4 a5 a6".split()
+    finally:
+        server.shutdown()
+
+
+def test_waiting_channel_holds_text_not_audio():
+    server, port, app, synth = start_channel_server()
+    try:
+        request(port, "/speak", {"text": "a1 a2 a3 a4", "channel": "cha",
+                                 "raw": True})
+        s, _, _ = fetch_segment(port, "cha", after=0)
+        prime(port, "chb")
+        request(port, "/speak", {"text": "waiting words here.",
+                                 "channel": "chb", "append": True,
+                                 "raw": True})
+        time.sleep(0.3)
+        # b lacks the turn: its text was never handed to the synth
+        assert all("waiting" not in c for c in synth.calls)
+        drain(port, "cha", after=s)
+        got_b, _ = drain(port, "chb", quiet=2.0)
+        assert got_b == "waiting words here.".split()
+        assert any("waiting" in c for c in synth.calls)
+    finally:
+        server.shutdown()
+
+
+def test_played_grace_exceeds_poll_timeout():
+    import serve
+    # Constant relation, not a wall-clock test: a healthy extension only
+    # re-polls after its poll cycle, so the dead-client grace must exceed
+    # the long-poll timeout or live clients get declared dead.
+    assert serve.PLAYED_GRACE == serve.SEGMENT_POLL_TIMEOUT + 10.0
+    assert serve.PLAYED_GRACE > serve.SEGMENT_POLL_TIMEOUT
+
+
+def test_segment_store_played_cursor_is_epoch_scoped(tmp_path):
+    store = SegmentStore()
+    store.submit(_seg_file(tmp_path, "a.wav", b"aaa"), None)
+    store.submit(_seg_file(tmp_path, "b.wav", b"bbb"), None)
+    assert store.release_stats()[0] == 2
+    store.report_played(1)
+    assert store.release_stats()[0] == 1
+    assert store.release_stats()[3] == 1
+    store.report_played(0)  # backward report: ignored
+    assert store.release_stats()[3] == 1
+    store.report_played(99)  # cursor never runs past what was released
+    assert store.release_stats()[3] == 2
+    store.invalidate()  # epoch bump resets the cursor's frame
+    store.submit(_seg_file(tmp_path, "c.wav", b"ccc"), None)
+    store.report_played(2)  # stale: a seq from the old epoch
+    assert store.release_stats()[0] == 1
+    store.report_played(3)
+    assert store.release_stats()[0] == 0
+
+
+def test_dead_client_expires_and_queue_moves_on():
+    server, port, app, synth = start_channel_server(grace=0.3)
+    try:
+        request(port, "/speak", {"text": "a1 a2 a3 a4 a5 a6",
+                                 "channel": "cha", "raw": True})
+        fetch_segment(port, "cha", after=0)  # holder; never reports played
+        prime(port, "chb")
+        request(port, "/speak", {"text": "b1.", "channel": "chb",
+                                 "append": True, "raw": True})
+        # cha goes silent past its released duration + grace: declared
+        # dead, its queue cleared, and the machine moves on to b.
+        got_b, _ = drain(port, "chb", quiet=2.0)
+        assert got_b == ["b1."]
+        assert request(port, "/health")[1]["channels"]["cha"]["pending"] == 0
+        # the dead channel's stream was invalidated (epoch bumped)
+        _, epoch, data = fetch_segment(port, "cha", after=0, timeout=0.05)
+        assert data is None and epoch >= 2
+    finally:
+        server.shutdown()
+
+
+def test_paused_channel_is_skipped_and_resume_reenters():
+    server, port, app, synth = start_channel_server()
+    try:
+        request(port, "/speak", {"text": "a1 a2 a3 a4", "channel": "cha",
+                                 "raw": True})
+        s, _, _ = fetch_segment(port, "cha", after=0)
+        prime(port, "chb")
+        request(port, "/speak", {"text": "b1 b2.", "channel": "chb",
+                                 "append": True, "raw": True})
+        status, body = request(port, "/pause", {"channel": "chb"})
+        assert body == {"ok": True, "paused": True}
+        # b is out of the rotation: a plays out its whole message
+        got_a, _ = drain(port, "cha", after=s)
+        assert ["a1"] + got_a == "a1 a2 a3 a4".split()
+        assert fetch_segment(port, "chb", after=0, timeout=0.2)[2] is None
+        status, body = request(port, "/resume", {"channel": "chb"})
+        assert body == {"ok": True, "paused": False}
+        got_b, _ = drain(port, "chb", quiet=2.0)
+        assert got_b == ["b1", "b2."]
+    finally:
+        server.shutdown()
+
+
+def test_pause_by_holder_yields_turn_immediately():
+    server, port, app, synth = start_channel_server()
+    try:
+        request(port, "/speak", {"text": "a1 a2 a3 a4 a5 a6",
+                                 "channel": "cha", "raw": True})
+        s, _, _ = fetch_segment(port, "cha", after=0)
+        prime(port, "chb")
+        request(port, "/speak", {"text": "b1.", "channel": "chb",
+                                 "append": True, "raw": True})
+        # the holder pauses: the turn passes without draining a's audio
+        request(port, "/pause", {"channel": "cha"})
+        got_b, _ = drain(port, "chb", quiet=2.0)
+        assert got_b == ["b1."]
+        request(port, "/resume", {"channel": "cha"})
+        got_a, _ = drain(port, "cha", after=s, quiet=2.0)
+        assert ["a1"] + got_a == "a1 a2 a3 a4 a5 a6".split()
+    finally:
+        server.shutdown()
+
+
+def test_pollless_channel_gets_no_turn_until_it_polls():
+    server, port, app, synth = start_channel_server()
+    try:
+        request(port, "/speak", {"text": "quiet until polled.",
+                                 "channel": "chx", "raw": True})
+        time.sleep(0.3)
+        assert synth.calls == []  # no dead-air turn: the text is held
+        got, _ = drain(port, "chx", quiet=2.0)
+        assert got == "quiet until polled.".split()
+    finally:
+        server.shutdown()
+
+
+def test_per_channel_stop_clears_only_that_channel():
+    server, port, app, synth = start_channel_server()
+    try:
+        request(port, "/speak", {"text": "a1 a2 a3 a4 a5 a6",
+                                 "channel": "cha", "raw": True})
+        fetch_segment(port, "cha", after=0)
+        prime(port, "chb")
+        request(port, "/speak", {"text": "b1.", "channel": "chb",
+                                 "append": True, "raw": True})
+        request(port, "/stop", {"channel": "cha"})
+        got_b, _ = drain(port, "chb", quiet=2.0)
+        assert got_b == ["b1."]  # b survived and got the turn
+        health = request(port, "/health")[1]
+        assert health["channels"]["cha"]["pending"] == 0
+    finally:
+        server.shutdown()
+
+
+def test_bare_stop_clears_all_channels():
+    server, port, app, synth = start_channel_server()
+    try:
+        request(port, "/speak", {"text": "a1 a2 a3 a4 a5 a6",
+                                 "channel": "cha", "raw": True})
+        fetch_segment(port, "cha", after=0)
+        prime(port, "chb")
+        request(port, "/speak", {"text": "b1 b2.", "channel": "chb",
+                                 "append": True, "raw": True})
+        request(port, "/stop", {})
+        health = request(port, "/health")[1]
+        assert health["pending"] == 0
+        for name in ("cha", "chb"):
+            _, epoch, data = fetch_segment(port, name, after=0, timeout=0.05)
+            assert data is None and epoch >= 1
+    finally:
+        server.shutdown()
+
+
+def test_preempt_all_clears_blocks_and_wakes_parked_polls():
+    server, port, app, synth = start_channel_server()
+    try:
+        request(port, "/speak", {"blocks": ["a1.", "a2."], "channel": "cha"})
+        fetch_segment(port, "cha", after=0)
+        prime(port, "chb")
+        request(port, "/speak", {"blocks": ["b1.", "b2."], "channel": "chb",
+                                 "append": True})
+        parked = []
+        t = threading.Thread(target=lambda: parked.append(
+            fetch_segment(port, "chb", after=99, timeout=5)))
+        t.start()
+        time.sleep(0.1)
+        request(port, "/speak", {"text": "c wins.", "channel": "chc",
+                                 "raw": True})
+        t.join(timeout=2)  # the epoch bump wakes the parked poll now
+        assert not t.is_alive()
+        assert parked[0][2] is None  # 204 with the bumped epoch
+        # blocks were nuked everywhere: /seek cannot resurrect them
+        for name in ("cha", "chb"):
+            status, body = request(port, "/seek",
+                                   {"block": 0, "channel": name})
+            assert body["ok"] is False
+        got_c, _ = drain(port, "chc", quiet=2.0)
+        assert got_c == ["c", "wins."]
+    finally:
+        server.shutdown()
+
+
+def test_seek_rereleases_on_a_client_channel():
+    server, port, app, synth = start_channel_server()
+    try:
+        request(port, "/speak", {"blocks": ["Zero.", "One.", "Two."],
+                                 "channel": "che"})
+        got, seq = drain(port, "che")
+        assert got == ["Zero.", "One.", "Two."]
+        status, body = request(port, "/seek", {"block": 0, "channel": "che"})
+        assert body == {"ok": True, "block": 0}
+        # re-released from the target on the same (seq-monotonic) stream,
+        # under a bumped epoch so the client drops its scheduled audio
+        got2, _ = drain(port, "che", after=seq, quiet=2.0)
+        assert got2 == ["Zero.", "One.", "Two."]
+        assert fetch_segment(port, "che", after=999, timeout=0.05)[1] >= 2
+    finally:
+        server.shutdown()
+
+
+def test_channel_name_validation_rejects_bad_names():
+    server, port = start_server([])
+    try:
+        for bad in ("UPPER", "with space", "a" * 33, "", "sp/it", 5):
+            for path, body in (("/speak", {"text": "hi.", "channel": bad}),
+                               ("/pause", {"channel": bad}),
+                               ("/stop", {"channel": bad}),
+                               ("/seek", {"delta": 1, "channel": bad})):
+                try:
+                    request(port, path, body)
+                    assert False, f"expected 400 for {bad!r} on {path}"
+                except urllib.error.HTTPError as e:
+                    assert e.code == 400
+        try:
+            request(port, "/segment?after=0&timeout=0.05&channel=BAD")
+            assert False, "expected 400"
+        except urllib.error.HTTPError as e:
+            assert e.code == 400
+    finally:
+        server.shutdown()
+
+
+def test_health_channels_shape_in_both_local_player_modes():
+    # daemon-played local: playback stays "local", channels dict present
+    server, port = start_server([])
+    try:
+        body = request(port, "/health")[1]
+        assert body["playback"] == "local"
+        assert set(body["channels"]) == {"local"}
+        assert set(body["channels"]["local"]) == {"pending", "speaking",
+                                                  "paused", "block"}
+        # daemon-played local has no segment stream, with or without a
+        # channel arg
+        for path in ("/segment?after=0&timeout=0.05",
+                     "/segment?after=0&timeout=0.05&channel=local"):
+            try:
+                request(port, path)
+                assert False, "expected 404"
+            except urllib.error.HTTPError as e:
+                assert e.code == 404
+    finally:
+        server.shutdown()
+    # client-played local plus a named channel
+    store = SegmentStore()
+    server, port = start_server([], store=store)
+    try:
+        request(port, "/speak", {"text": "ext words.", "channel": "ext",
+                                 "raw": True})
+        body = request(port, "/health")[1]
+        assert body["playback"] == "client"
+        assert set(body["channels"]) == {"local", "ext"}
+        # nothing released yet (never polled): not speaking
+        assert body["channels"]["ext"]["speaking"] is False
+        seq, _, data = fetch_segment(port, "ext", after=0)
+        assert data == b"ext words."
+        # released but not yet reported played: speaking
+        body = request(port, "/health")[1]
+        assert body["channels"]["ext"]["speaking"] is True
+        assert body["speaking"] is True
+        drain(port, "ext", after=seq)  # report it played
+        assert wait_for(lambda: request(
+            port, "/health")[1]["channels"]["ext"]["speaking"] is False)
+    finally:
+        server.shutdown()
+
+
+def test_speak_without_channel_is_local_and_preempts_everything():
+    store = SegmentStore()
+    server, port = start_server([], store=store)
+    try:
+        request(port, "/speak", {"text": "x words.", "channel": "chx",
+                                 "raw": True})
+        fetch_segment(port, "chx", after=0)
+        # no channel field: today's request shape, lands on local and
+        # preempts every channel (one voice per machine)
+        request(port, "/speak", {"text": "local wins.", "raw": True})
+        _, epoch, data = fetch_segment(port, "chx", after=0, timeout=0.05)
+        assert data is None and epoch >= 2
+        got, _ = drain(port, None, quiet=2.0)
+        assert got == ["local wins."]
+    finally:
+        server.shutdown()
+
+
+def test_idle_unpolled_channel_is_garbage_collected():
+    server, port, app, synth = start_channel_server(gc_seconds=0.1)
+    try:
+        prime(port, "typo")  # a poll alone creates the channel
+        assert "typo" in request(port, "/health")[1]["channels"]
+        assert wait_for(
+            lambda: "typo" not in request(port, "/health")[1]["channels"])
+        assert "local" in request(port, "/health")[1]["channels"]
+    finally:
+        server.shutdown()
+
+
+def test_playback_flag_is_a_deprecated_alias_for_local_player():
+    from serve import resolve_local_player
+    assert resolve_local_player(None, None) == "daemon"
+    assert resolve_local_player(None, "client") == "client"
+    assert resolve_local_player(None, "local") == "daemon"
+    assert resolve_local_player("client", None) == "client"
+    assert resolve_local_player("daemon", "client") == "daemon"
+
+
+# --- stage-B review fixes ---
+
+def test_gc_race_speak_on_idle_channel_never_loses_content():
+    # gc_seconds=0 deletes the channel the tick after it goes idle, so
+    # every /speak races channel recreation against the janitor. The
+    # in-use pin plus atomic lookup must keep every word deliverable and
+    # the janitor alive.
+    server, port, app, synth = start_channel_server(gc_seconds=0.0,
+                                                    tick=0.005)
+    try:
+        for i in range(25):
+            word = f"w{i}."
+            request(port, "/speak", {"text": word, "channel": "hammer",
+                                     "append": True, "raw": True})
+            got, seq = [], 0
+            deadline = time.monotonic() + 5.0
+            while word not in got:
+                assert time.monotonic() < deadline, f"lost {word}"
+                s, _, data = fetch_segment(port, "hammer", after=seq,
+                                           played=seq, timeout=0.5)
+                if s is None:
+                    continue
+                seq = s
+                got.append(data.decode())
+            # report it played so the channel goes contentless and the
+            # janitor collects it before the next round
+            fetch_segment(port, "hammer", after=seq, played=seq,
+                          timeout=0.02)
+        assert app.channels._janitor.is_alive()
+        # the janitor still does its job: a fresh idle channel is
+        # collected, and polls keep answering
+        prime(port, "leftover")
+        assert wait_for(lambda: "leftover" not in
+                        request(port, "/health")[1]["channels"])
+        assert fetch_segment(port, "hammer", after=0, timeout=0.05)
+    finally:
+        server.shutdown()
+
+
+def test_machine_queue_drops_unknown_queued_names(capsys):
+    from serve import MachineQueue
+    q = MachineQueue(grace=1.0)
+    q.enqueue("ghost")  # a GC'd channel's stale slot: no state_fn
+    q.poke()  # must not raise: the janitor calls this forever
+    assert q.holder() is None
+    assert "ghost" in capsys.readouterr().err
+
+
+class GatedPausablePlayer:
+    """Local player whose in-flight segment blocks until released; the
+    events list records audible transitions so a test can pin down when
+    a paused segment actually resumes."""
+
+    def __init__(self):
+        self.events = []
+        self.release = threading.Event()
+
+    def pause(self):
+        self.events.append("pause")
+
+    def resume(self):
+        self.events.append("resume")
+
+    def __call__(self, path):
+        player = self
+        player.events.append(("play", Path(path).read_text()))
+
+        class Handle:
+            def __init__(self):
+                self.cancelled = threading.Event()
+
+            def terminate(self):
+                self.cancelled.set()
+
+            def wait(self):
+                while not (player.release.is_set()
+                           or self.cancelled.is_set()):
+                    time.sleep(0.01)
+
+        return Handle()
+
+
+def test_resume_of_inflight_segment_waits_for_turn():
+    from serve import ChannelManager
+
+    def synth(text, make_path):
+        for word in text.split():
+            path = make_path()
+            Path(path).write_text(word)
+            yield path
+
+    player = GatedPausablePlayer()
+    local = Speaker(synth, player)
+    mgr = ChannelManager(local, None, tick=0.02, poll_window=5.0,
+                         grace=5.0)
+    mgr.speak("local", text="l1 l2 l3", append=True)
+    assert wait_for(lambda: ("play", "l1") in player.events)
+    mgr.pause("local")  # mid-segment: l1's handle is still in wait()
+    chb = mgr.poll_begin("chb")  # prime eligibility
+    mgr.poll_end(chb)
+    mgr.speak("chb", text="b1 b2.", append=True)
+    assert wait_for(lambda: mgr.queue.holder() == "chb")
+    seq, _, data, _ = chb.store.next_after(0, 2.0)
+    assert data is not None
+    # resume while B holds the turn: the pause flag clears, but the
+    # paused in-flight segment must not become audible yet
+    assert mgr.resume("local") is False
+    time.sleep(0.3)
+    assert "resume" not in player.events
+    # B finishes: fetch the rest and report it all played
+    while True:
+        s, _, data, _ = chb.store.next_after(seq, 0.2)
+        if data is None:
+            break
+        seq = s
+    chb.store.report_played(seq)
+    mgr.queue.poke()
+    # only now, with the turn re-granted, does local audio resume
+    assert wait_for(lambda: "resume" in player.events)
+    player.release.set()
+    assert wait_for(lambda: mgr.queue.holder() != "chb")
+
+
+def test_segment_poll_timeout_capped_under_grace():
+    import serve
+    # Constant relation, not a wall-clock test: /segment clamps the
+    # accepted long-poll timeout to MAX_POLL_TIMEOUT, which must sit a
+    # slack under the dead-client grace (a client parked in one poll is
+    # silent for the whole poll) while still admitting the default.
+    assert serve.MAX_POLL_TIMEOUT < serve.PLAYED_GRACE
+    assert serve.MAX_POLL_TIMEOUT >= serve.SEGMENT_POLL_TIMEOUT
+
+
+class InstantHandle:
+    def terminate(self):
+        pass
+
+    def wait(self):
+        pass
+
+
+def test_final_segment_stays_counted_until_delivery_starts(tmp_path):
+    # Structural invariant: _pop_segment moves a segment from the play
+    # queue into _popped under the queue's own mutex, the same lock
+    # rendered_pending() reads under, so the count can never transiently
+    # hit zero mid-pop. The sampling below could only flake against an
+    # implementation with a two-step (get, then count) pop.
+    started = threading.Event()
+    round_done = threading.Event()
+
+    def synth(text, make_path):  # unused: segments are injected directly
+        return iter(())
+
+    def play(path):
+        started.set()
+        return InstantHandle()
+
+    sp = Speaker(synth, play)
+    sp._on_progress = round_done.set
+    for i in range(200):
+        started.clear()
+        round_done.clear()
+        path = tmp_path / f"{i}.wav"
+        path.write_text("x")
+        sp._play_q.put((sp._epoch, str(path), None))
+        deadline = time.monotonic() + 1.0
+        while not started.is_set():
+            count = sp.rendered_pending()
+            # a sample is only about the pre-delivery window if delivery
+            # still had not started after it was taken; started is set
+            # first thing in play(), so a still-clear flag proves the
+            # read happened between enqueue and the player taking over
+            if started.is_set():
+                break
+            assert count >= 1
+            assert time.monotonic() < deadline
+        assert round_done.wait(1.0)
