@@ -24,7 +24,7 @@ config, AND audio playback - Python never touches the speakers on macOS:
 
 ```
 menu bar app (Swift)                       linux box (no Swift)
-  ├─ spawns serve.py --playback client      systemd unit / CLI runs the
+  ├─ spawns serve.py --local-player client      systemd unit / CLI runs the
   ├─ plays audio: long-polls GET /segment,   same serve.py directly
   │    AVAudioEngine + AVAudioUnitTimePitch  (extension is its own
   │    (live rate, epoch-aware preemption)    /segment player there)
@@ -37,18 +37,15 @@ menu bar app (Swift)                       linux box (no Swift)
                 (mlx locally, or -b qwentts for GGUF/Metal/CUDA)
 ```
 
-This reuses the client-playback mode that already exists for the browser
-extension: serve.py buffers synthesized segments (SegmentStore) and the
-Swift app consumes them exactly like offscreen.js does - long-poll
-/segment?after=seq, play, drop everything on an epoch bump. No new server
-code; the Swift app is just a second, native /segment client. sounddevice/
-afplay remain only as the fallback for running serve.py bare.
+The Swift app consumes the local channel's segment stream exactly like
+offscreen.js consumes the extension's - long-poll /segment?after=seq with
+a played cursor, play, drop everything on an epoch bump. sounddevice/
+afplay remain only for running serve.py bare (--local-player daemon).
 
-Speed placement follows playback: the player owns the rate. In client mode
-the daemon simply runs at speed 1 (convention, no enforcement code) and
-each client stretches for itself - the extension with soundtouch, Swift
-with AVAudioUnitTimePitch. The server-side pedalboard stretch exists for
-local-playback mode only.
+Speed knobs are multiplicative (see Channels): the daemon's config speed
+stretches server-side for all channels; the Swift player's
+AVAudioUnitTimePitch rate - like the extension's soundtouch - multiplies
+on top and is client business.
 
 Python stays, but hidden: no terminal, no flags, no uv invocation visible -
 and no Python in the audio path.
@@ -166,6 +163,52 @@ Concrete bundle manifest (inventoried 2026-08-04):
 - Voices: ref wav+txt pairs live in Application Support/voices; the app
   seeds it with the default voice on first run.
 
+## Ports: scan a range, never double-launch
+
+The app owns the daemon - two daemons must never run. On launch, scan
+config port through port+100: a port that answers GET /health already runs
+a wren daemon, so connect to it instead of launching; a port that is busy
+without answering /health belongs to someone else, so try the next one and
+launch there. Clients (wren CLI, extension) discover the daemon by the same
+scan.
+
+## Channels: route per utterance, kill the global playback flag
+
+`--playback client` is a design flaw: it decides "who plays" once per
+daemon lifetime, when the real answer depends on who asked. Replace it
+with per-utterance routing. Each /speak lands in exactly one channel, each
+channel has its own queue, and each channel has exactly one player - double
+playback becomes structurally impossible.
+
+- Default channel `local`: audio the daemon side plays on its own machine.
+  Today that is sounddevice; once Wren.app exists its native player is the
+  local channel's output.
+- The extension requests its own channel and is the only poller of that
+  channel's segment stream; read-page audio, speed, and highlighting stay
+  browser-owned.
+- Preemption: yell/non-append cuts everything, all channels - one voice per
+  machine. (Yell is optional sugar; stop already covers deliberate cuts.)
+- Per-channel queues; pause/resume/seek act on the requester's channel.
+- The machine queue: per-channel queues hold content; one machine-wide
+  playback queue decides whose turn the speakers are, FIFO by arrival at
+  segment granularity. An append /speak from a non-playing channel slots
+  in: the current speaker finishes only its already-rendered lookahead,
+  the newcomer plays, the interrupted channel continues where it stopped
+  (behind any later arrivals). Enforced by segment release; clients
+  report completion with a played cursor on the poll they already make
+  (&played=k), duration + a grace window (> the poll timeout) is the
+  dead-client deadline. Explicit pause yields the turn immediately.
+  Preemption stays the only queue killer.
+- Synthesis lookahead: render at most ~2 segments ahead of the machine
+  playhead across all channels; waiting channels hold text, not audio
+  (generalizes the pause lookahead; kills the free-running full-page
+  render and the memory pileup).
+- Speed: multiplicative knobs. Daemon speed (config) stretches all
+  channels server-side as today; a client player's own rate multiplies
+  on top and never touches daemon config. fx is server-side for all.
+- /stop gains an optional channel field; the extension's stop buttons
+  stop only the extension channel; bare /stop stays the hammer.
+
 ## Lifecycle: mirror cawker
 
 - macOS: LaunchAgent for background + launch-at-login (`install
@@ -211,13 +254,16 @@ client only, no UI); the menu bar app grows in the same executable at step
    the build/reload story is solved before any interesting code exists.
    Then the CLI subcommands in that package:
    say/stop/pause/resume/status/speed against the finished server API.
-4. Swift app, player first: the /segment long-poll loop -> AVAudioEngine +
+4. serve.py channels: per-utterance routing per the Channels section - replaces
+   --playback client. Extension updated to request its channel. Essential
+   before the Swift app is built against the old semantics.
+5. Swift app, player first: the /segment long-poll loop -> AVAudioEngine +
    AVAudioUnitTimePitch with epoch-aware preemption (port offscreen.js's
    scheduling logic) is the core of the app, not an add-on - native audio
-   is the reason Swift is here. The app spawns serve.py --playback client
-   from day one (no sounddevice on macOS), /health icon, quit-kills-child,
-   LaunchAgent. Daemon runs speed 1 in client mode by convention; the
-   player owns the rate.
-5. Menu bar controls wired to /config; voice-change restart handling.
-6. Install script, doctor.
-7. Decide on Phase B only after living with Phase A.
+   is the reason Swift is here. The app spawns serve.py
+   --local-player client from day one (no sounddevice on macOS), /health
+   icon, quit-kills-child, LaunchAgent. The player's rate multiplies on
+   top of the daemon's config speed.
+6. Menu bar controls wired to /config; voice-change restart handling.
+7. Install script, doctor.
+8. Decide on Phase B only after living with Phase A.
