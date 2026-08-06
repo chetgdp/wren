@@ -8,6 +8,7 @@ set -e
 
 cd "$(dirname "$0")/.."
 
+scripts/stamp-logo.sh
 swift test
 swift build -c release
 

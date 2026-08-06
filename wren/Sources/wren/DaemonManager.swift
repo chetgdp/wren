@@ -82,6 +82,19 @@ final class DaemonManager: @unchecked Sendable {
         }
     }
 
+    /// Kill and respawn a spawned child: how a persisted config change that
+    /// needs a model reload (voice, backend) gets applied. Adopted daemons
+    /// are not ours to restart; callers surface that to the user instead.
+    func restart() {
+        queue.async {
+            guard let child = self.child, child.isRunning else { return }
+            // A deliberate restart is not a crash; keep it out of the
+            // rapid-exit counter.
+            self.spawnedAt = .distantPast
+            child.terminate()
+        }
+    }
+
     private func startLocked() {
         if probeHealth() {
             state = .adopted

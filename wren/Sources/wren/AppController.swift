@@ -13,9 +13,18 @@ final class AppController {
     private var healthTimer: Timer?
     private var daemonState = DaemonManager.State.starting
     private var terminationObserver: NSObjectProtocol?
+    private var controls = WrenMenuBar.ControlsState()
+    /// Where the voice picker scans: the config's voices_dir once set, else
+    /// the app's own Application Support/voices (seeded on first run).
+    private var voicesDirInUse: String
+
+    /// Client-side playback multiplier; it never touches daemon config, so
+    /// the app persists it itself.
+    private static let rateKey = "playerRate"
 
     init() {
         let paths = WrenPaths.standard()
+        voicesDirInUse = paths.voices.path
         let port = Self.configPort(at: paths.configFile)
         let host = "127.0.0.1:\(port)"
         let token = DaemonClient.resolveToken(flag: nil)
@@ -32,6 +41,36 @@ final class AppController {
             guard let self else { return }
             Task { let _: StopResponse? = try? await self.client.post("/stop") }
         }
+        menuBar.onMenuOpen = { [weak self] in
+            guard let self else { return }
+            Task { await self.refreshControls() }
+        }
+        menuBar.onVoiceSelect = { [weak self] voice in
+            guard let self else { return }
+            // First pick on a fresh config: voice requires voices_dir, and
+            // the fallback dir the menu scanned is the one to persist.
+            let dir = self.voicesDirInUse
+            Task {
+                await self.applyConfig(ConfigUpdate(voice: voice, voicesDir: dir))
+            }
+        }
+        menuBar.onSpeedChange = { [weak self] speed in
+            guard let self else { return }
+            Task { await self.applyConfig(ConfigUpdate(speed: speed)) }
+        }
+        menuBar.onFxToggle = { [weak self] fx in
+            guard let self else { return }
+            Task { await self.applyConfig(ConfigUpdate(fx: fx)) }
+        }
+        menuBar.onRateChange = { [weak self] rate in
+            guard let self else { return }
+            self.controls.playerRate = rate
+            self.player.setRate(rate)
+            UserDefaults.standard.set(rate, forKey: Self.rateKey)
+        }
+        let savedRate = UserDefaults.standard.double(forKey: Self.rateKey)
+        controls.playerRate = savedRate > 0 ? savedRate : 1.0
+        player.setRate(controls.playerRate)
         daemon.onState = { [weak self] state in
             Task { @MainActor in self?.daemonState = state }
         }
@@ -82,6 +121,40 @@ final class AppController {
         } else {
             menuBar.setState(.idle)
         }
+    }
+
+    /// Menu open: pull /config and rescan the voices folder, so the menu
+    /// shows the daemon's live truth (another client may have changed it).
+    private func refreshControls() async {
+        guard let config: ConfigPayload = try? await client.get("/config") else { return }
+        show(config)
+    }
+
+    private func applyConfig(_ update: ConfigUpdate) async {
+        guard let config: ConfigPayload = try? await client.post("/config", body: update)
+        else { return }
+        show(config)
+    }
+
+    /// Reconcile the menu with the daemon's config, and deliver a persisted
+    /// change the daemon can't hot-apply (voice: model reload) by restarting
+    /// our child. Runs on every /config response, so a change made by any
+    /// client (menu, CLI, extension) gets applied on the next menu open.
+    private func show(_ config: ConfigPayload) {
+        if config.restartRequired, daemonState == .spawned {
+            daemon.restart()
+        }
+        controls.voice = config.voice
+        if let dir = config.voicesDir {
+            voicesDirInUse = dir
+        }
+        controls.voices = VoiceLibrary.voices(in: VoiceLibrary.expand(voicesDirInUse))
+        controls.speed = config.speed
+        controls.fx = config.fx
+        // Auto-restart covers our own child; an adopted daemon's pending
+        // change is the user's to deliver.
+        controls.restartPending = config.restartRequired && daemonState != .spawned
+        menuBar.setControls(controls)
     }
 
     /// /health said nothing; the daemon manager knows why (provisioning, a
