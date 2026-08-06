@@ -60,6 +60,9 @@ final class SliderMenuView: NSView {
     }
 
     @objc private func sliderMoved() {
+        // Snap to 0.05 so the persisted config gets 1.35, not
+        // 1.38882095410628 from raw pixel positions.
+        slider.doubleValue = (slider.doubleValue * 20).rounded() / 20
         showValue()
         debounce?.invalidate()
         // Menu tracking runs the run loop in event-tracking mode, where
@@ -76,6 +79,7 @@ final class SliderMenuView: NSView {
     }
 
     private func showValue() {
-        valueLabel.stringValue = String(format: "%.1f×", slider.doubleValue)
+        // Two decimals so neighboring 0.05 steps read differently.
+        valueLabel.stringValue = String(format: "%.2f×", slider.doubleValue)
     }
 }

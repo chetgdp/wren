@@ -122,6 +122,9 @@ final class WrenMenuBar: NSObject {
             item.state = name == new.voice ? .on : .off
             voiceMenu.addItem(item)
         }
+        // The current voice reads off the closed row, macOS-style ("Voice"
+        // left, name right-aligned in grey) via the badge slot.
+        voiceItem.badge = new.voice.map { NSMenuItemBadge(string: $0) }
         restartNote.isHidden = !new.restartPending
         speedSlider.value = new.speed
         rateSlider.value = new.playerRate
