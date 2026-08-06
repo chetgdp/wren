@@ -43,13 +43,35 @@ func fail(_ error: Error) -> ExitCode {
     return ExitCode(1)
 }
 
+/// Where say/yell text comes from: arguments joined with spaces (fish
+/// substitutions split lines into words, loose typing gives several
+/// arguments), else piped stdin. Injectable so tests need no real pipe.
+enum SpeakInput {
+    static func resolve(
+        arguments: [String],
+        stdinIsTTY: @autoclosure () -> Bool = isatty(0) != 0,
+        readStdin: () -> Data = { FileHandle.standardInput.readDataToEndOfFile() }
+    ) throws -> String {
+        if !arguments.isEmpty { return arguments.joined(separator: " ") }
+        guard !stdinIsTTY() else {
+            throw ValidationFailure("no text to speak: pass words or pipe text in")
+        }
+        let text = String(decoding: readStdin(), as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else {
+            throw ValidationFailure("no text to speak: stdin was empty")
+        }
+        return text
+    }
+}
+
 struct Say: ParsableCommand {
     static let configuration = CommandConfiguration(
         abstract: "Speak text through the daemon (POST /speak)."
     )
 
-    @Argument(help: "Text to speak.")
-    var text: String
+    @Argument(help: "Text to speak; several arguments are joined, none reads stdin.")
+    var text: [String] = []
 
     @Flag(name: .long, help: "Skip the daemon's markdown stripping.")
     var raw: Bool = false
@@ -63,7 +85,7 @@ struct Say: ParsableCommand {
     // other off; preemption is reserved for `wren stop`.
     var body: SpeakRequest {
         SpeakRequest(
-            text: text,
+            text: text.joined(separator: " "),
             append: true,
             raw: raw ? true : nil,
             speed: speed
@@ -72,10 +94,12 @@ struct Say: ParsableCommand {
 
     func run() throws {
         let client = options.client
-        let payload = body
+        var payload = body
+        payload.text = try SpeakInput.resolve(arguments: text)
+        let request = payload
         do {
             let response: SpeakResponse = try blocking {
-                try await client.post("/speak", body: payload)
+                try await client.post("/speak", body: request)
             }
             print("queued \(response.queued)")
         } catch {
@@ -89,8 +113,8 @@ struct Yell: ParsableCommand {
         abstract: "Speak immediately, cutting off the current queue (POST /speak)."
     )
 
-    @Argument(help: "Text to speak.")
-    var text: String
+    @Argument(help: "Text to speak; several arguments are joined, none reads stdin.")
+    var text: [String] = []
 
     @Flag(name: .long, help: "Skip the daemon's markdown stripping.")
     var raw: Bool = false
@@ -104,7 +128,7 @@ struct Yell: ParsableCommand {
     // daemon cuts whatever is playing; `wren say` can never cut anyone off.
     var body: SpeakRequest {
         SpeakRequest(
-            text: text,
+            text: text.joined(separator: " "),
             append: nil,
             raw: raw ? true : nil,
             speed: speed
@@ -113,10 +137,12 @@ struct Yell: ParsableCommand {
 
     func run() throws {
         let client = options.client
-        let payload = body
+        var payload = body
+        payload.text = try SpeakInput.resolve(arguments: text)
+        let request = payload
         do {
             let response: SpeakResponse = try blocking {
-                try await client.post("/speak", body: payload)
+                try await client.post("/speak", body: request)
             }
             print("queued \(response.queued)")
         } catch {

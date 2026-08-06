@@ -71,6 +71,33 @@ final class RequestBuildingTests: XCTestCase {
         XCTAssertEqual(body["append"] as? Bool, true)
     }
 
+    func testSpeakInputJoinsArguments() throws {
+        // Loose words and fish command substitutions (which split output
+        // into one argument per line) both land as several arguments.
+        XCTAssertEqual(
+            try SpeakInput.resolve(arguments: ["googa", "booga", "dogga"]),
+            "googa booga dogga")
+    }
+
+    func testSpeakInputFallsBackToPipedStdin() throws {
+        XCTAssertEqual(
+            try SpeakInput.resolve(
+                arguments: [], stdinIsTTY: false,
+                readStdin: { Data("  from a pipe\n".utf8) }),
+            "from a pipe")
+    }
+
+    func testSpeakInputRejectsEmpty() {
+        // A bare `wren say` on a TTY must error out, not hang reading the
+        // keyboard; an empty pipe has nothing to say either.
+        XCTAssertThrowsError(
+            try SpeakInput.resolve(arguments: [], stdinIsTTY: true,
+                                   readStdin: { Data() }))
+        XCTAssertThrowsError(
+            try SpeakInput.resolve(arguments: [], stdinIsTTY: false,
+                                   readStdin: { Data("\n".utf8) }))
+    }
+
     func testYellPreempts() throws {
         // `wren yell` is the one deliberate preemption path: append stays off
         // the wire so the daemon's default (cut current playback) applies.
