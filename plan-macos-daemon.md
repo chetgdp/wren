@@ -265,6 +265,7 @@ client only, no UI); the menu bar app grows in the same executable at step
    internally, defaults 1.0, UI in step 6.
 6. Menu bar controls wired to /config; voice-change restart handling.
    Plus: voice picker over Application Support/voices, player rate
-   control, pause/stop polish.
+   control, pause/stop polish. Logo stamping: Wren's own icon for the
+   app bundle + menu bar (bundle.sh already has the Otis-style hook).
 7. Install script, doctor.
 8. Decide on Phase B only after living with Phase A.
