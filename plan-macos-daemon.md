@@ -246,24 +246,25 @@ client only, no UI); the menu bar app grows in the same executable at step
 ## Steps
 
 1. ~~Benchmark~~ (done; speed passed, quality comparison pending MLX-8bit).
-2. serve.py: config-file support + /config endpoints (+ tests). Benefits
-   Linux immediately, freezes the full API before any Swift is written.
-3. `wren` scaffold + CLI (first Swift). Scaffold first: SwiftPM package and
-   the Otis-style scripts (bundle.sh with local signing so TCC grants
-   survive rebuilds, install.sh, dev.sh/watch.sh hot reload, gen-icons) -
-   the build/reload story is solved before any interesting code exists.
-   Then the CLI subcommands in that package:
-   say/stop/pause/resume/status/speed against the finished server API.
-4. serve.py channels: per-utterance routing per the Channels section - replaces
-   --playback client. Extension updated to request its channel. Essential
-   before the Swift app is built against the old semantics.
-5. Swift app, player first: the /segment long-poll loop -> AVAudioEngine +
-   AVAudioUnitTimePitch with epoch-aware preemption (port offscreen.js's
-   scheduling logic) is the core of the app, not an add-on - native audio
-   is the reason Swift is here. The app spawns serve.py
-   --local-player client from day one (no sounddevice on macOS), /health
-   icon, quit-kills-child, LaunchAgent. The player's rate multiplies on
-   top of the daemon's config speed.
+2. ~~serve.py config-file support + /config endpoints~~ (done, with tests).
+3. ~~`wren` scaffold + CLI~~ (done; Otis-style scripts, then
+   say/yell/stop/pause/resume/status/speed/config).
+4. ~~serve.py channels~~ (done; per-utterance routing, machine-wide
+   playback queue, extension on its own channel, --playback dropped).
+5. ~~Swift app~~ (done). The /segment long-poll -> AVAudioEngine +
+   AVAudioUnitTimePitch player with epoch-aware preemption and played
+   cursor; the app adopts a daemon already answering /health or spawns
+   its own from the bundle and kills it on quit; /health drives the icon.
+   Self-contained bundle pulled forward from the manifest: serve.py + fx,
+   engine (rpaths rewritten to @loader_path; metallib confirmed embedded),
+   uv, and the default voice ship in Resources; first run provisions the
+   python env and downloads the GGUFs into Application Support with
+   progress in the status line. `wren install --launch-at-login` writes
+   the LaunchAgent. Bare `wren` now launches the app (Spotlight path);
+   the CLI lives in subcommands. Player rate (client multiplier) exists
+   internally, defaults 1.0, UI in step 6.
 6. Menu bar controls wired to /config; voice-change restart handling.
+   Plus: voice picker over Application Support/voices, player rate
+   control, pause/stop polish.
 7. Install script, doctor.
 8. Decide on Phase B only after living with Phase A.
