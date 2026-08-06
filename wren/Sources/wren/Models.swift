@@ -97,6 +97,15 @@ struct HealthResponse: Decodable {
     var paused: Bool
     var block: [Int]?
     var speed: Double?
+    var channels: [String: ChannelHealth]?
+}
+
+struct ChannelHealth: Decodable {
+    var pending: Int
+    var speaking: Bool
+    var paused: Bool
+    var block: [Int]?
+    var active: Bool
 }
 
 struct ErrorBody: Decodable {

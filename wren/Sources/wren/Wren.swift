@@ -2,14 +2,19 @@ import ArgumentParser
 import Foundation
 
 @main
-struct Wren: AsyncParsableCommand {
+struct Wren: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "wren",
-        abstract: "CLI for the wren TTS daemon (tts/serve.py).",
+        abstract: "The wren TTS daemon: menu bar app (default) and CLI for tts/serve.py.",
         subcommands: [
-            Say.self, Yell.self, Stop.self, Pause.self, Resume.self,
-            Speed.self, ConfigCommand.self, Status.self,
-        ]
+            RunApp.self, Say.self, Yell.self, Stop.self, Pause.self,
+            Resume.self, Speed.self, ConfigCommand.self, Status.self,
+            Install.self,
+        ],
+        // Spotlight launches the bundle binary with no arguments; bare
+        // `wren` in a terminal does the same thing on purpose (one
+        // executable, one behavior). The CLI lives in the subcommands.
+        defaultSubcommand: RunApp.self
     )
 }
 
@@ -38,7 +43,7 @@ func fail(_ error: Error) -> ExitCode {
     return ExitCode(1)
 }
 
-struct Say: AsyncParsableCommand {
+struct Say: ParsableCommand {
     static let configuration = CommandConfiguration(
         abstract: "Speak text through the daemon (POST /speak)."
     )
@@ -65,9 +70,13 @@ struct Say: AsyncParsableCommand {
         )
     }
 
-    func run() async throws {
+    func run() throws {
+        let client = options.client
+        let payload = body
         do {
-            let response: SpeakResponse = try await options.client.post("/speak", body: body)
+            let response: SpeakResponse = try blocking {
+                try await client.post("/speak", body: payload)
+            }
             print("queued \(response.queued)")
         } catch {
             throw fail(error)
@@ -75,7 +84,7 @@ struct Say: AsyncParsableCommand {
     }
 }
 
-struct Yell: AsyncParsableCommand {
+struct Yell: ParsableCommand {
     static let configuration = CommandConfiguration(
         abstract: "Speak immediately, cutting off the current queue (POST /speak)."
     )
@@ -102,9 +111,13 @@ struct Yell: AsyncParsableCommand {
         )
     }
 
-    func run() async throws {
+    func run() throws {
+        let client = options.client
+        let payload = body
         do {
-            let response: SpeakResponse = try await options.client.post("/speak", body: body)
+            let response: SpeakResponse = try blocking {
+                try await client.post("/speak", body: payload)
+            }
             print("queued \(response.queued)")
         } catch {
             throw fail(error)
@@ -112,16 +125,17 @@ struct Yell: AsyncParsableCommand {
     }
 }
 
-struct Stop: AsyncParsableCommand {
+struct Stop: ParsableCommand {
     static let configuration = CommandConfiguration(
         abstract: "Stop speech and clear the queue (POST /stop)."
     )
 
     @OptionGroup var options: ClientOptions
 
-    func run() async throws {
+    func run() throws {
+        let client = options.client
         do {
-            let _: StopResponse = try await options.client.post("/stop")
+            let _: StopResponse = try blocking { try await client.post("/stop") }
             print("stopped")
         } catch {
             throw fail(error)
@@ -129,16 +143,19 @@ struct Stop: AsyncParsableCommand {
     }
 }
 
-struct Pause: AsyncParsableCommand {
+struct Pause: ParsableCommand {
     static let configuration = CommandConfiguration(
         abstract: "Pause playback (POST /pause)."
     )
 
     @OptionGroup var options: ClientOptions
 
-    func run() async throws {
+    func run() throws {
+        let client = options.client
         do {
-            let response: PauseResponse = try await options.client.post("/pause")
+            let response: PauseResponse = try blocking {
+                try await client.post("/pause")
+            }
             print(response.paused ? "paused" : "not paused")
         } catch {
             throw fail(error)
@@ -146,16 +163,19 @@ struct Pause: AsyncParsableCommand {
     }
 }
 
-struct Resume: AsyncParsableCommand {
+struct Resume: ParsableCommand {
     static let configuration = CommandConfiguration(
         abstract: "Resume paused playback (POST /resume)."
     )
 
     @OptionGroup var options: ClientOptions
 
-    func run() async throws {
+    func run() throws {
+        let client = options.client
         do {
-            let response: PauseResponse = try await options.client.post("/resume")
+            let response: PauseResponse = try blocking {
+                try await client.post("/resume")
+            }
             print(response.paused ? "still paused" : "resumed")
         } catch {
             throw fail(error)
@@ -163,7 +183,7 @@ struct Resume: AsyncParsableCommand {
     }
 }
 
-struct Speed: AsyncParsableCommand {
+struct Speed: ParsableCommand {
     static let configuration = CommandConfiguration(
         abstract: "Set and persist the playback speed (POST /config)."
     )
@@ -173,10 +193,13 @@ struct Speed: AsyncParsableCommand {
 
     @OptionGroup var options: ClientOptions
 
-    func run() async throws {
+    func run() throws {
+        let client = options.client
+        let update = ConfigUpdate(speed: value)
         do {
-            let payload: ConfigPayload = try await options.client.post(
-                "/config", body: ConfigUpdate(speed: value))
+            let payload: ConfigPayload = try blocking {
+                try await client.post("/config", body: update)
+            }
             print("speed \(payload.speed)")
             reportPersistence(payload)
         } catch {
@@ -185,7 +208,7 @@ struct Speed: AsyncParsableCommand {
     }
 }
 
-struct ConfigCommand: AsyncParsableCommand {
+struct ConfigCommand: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "config",
         abstract: "Show the daemon config, or set one key (GET/POST /config)."
@@ -205,14 +228,17 @@ struct ConfigCommand: AsyncParsableCommand {
         }
     }
 
-    func run() async throws {
+    func run() throws {
+        let client = options.client
         do {
             let payload: ConfigPayload
             if let key, let value {
                 let update = try ConfigUpdate.parsing(key: key, value: value)
-                payload = try await options.client.post("/config", body: update)
+                payload = try blocking {
+                    try await client.post("/config", body: update)
+                }
             } else {
-                payload = try await options.client.get("/config")
+                payload = try blocking { try await client.get("/config") }
             }
             printConfig(payload)
             reportPersistence(payload)
@@ -246,16 +272,19 @@ private func reportPersistence(_ payload: ConfigPayload) {
     }
 }
 
-struct Status: AsyncParsableCommand {
+struct Status: ParsableCommand {
     static let configuration = CommandConfiguration(
         abstract: "Show daemon status (GET /health)."
     )
 
     @OptionGroup var options: ClientOptions
 
-    func run() async throws {
+    func run() throws {
+        let client = options.client
         do {
-            let health: HealthResponse = try await options.client.get("/health")
+            let health: HealthResponse = try blocking {
+                try await client.get("/health")
+            }
             let yesNo = { (flag: Bool) in flag ? "yes" : "no" }
             print("ready:    \(health.ready ? "yes" : "no (model loading)")")
             print("model:    \(health.model)")
