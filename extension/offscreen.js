@@ -305,6 +305,17 @@ async function loop() {
   }
 }
 
+// PDF extraction lives here too: the service worker can't hold the wasm
+// instance across restarts, and this document already exists for audio.
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg.cmd !== "pdf-extract") return;
+  import("./pdf.js")
+    .then((m) => m.extractPdf(msg.url))
+    .then(sendResponse)
+    .catch((e) => sendResponse({ error: e.message }));
+  return true; // async response
+});
+
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.cmd !== "player") return;
   if (msg.action === "start") {

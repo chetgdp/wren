@@ -34,6 +34,17 @@ document.getElementById("addr").addEventListener("submit", async (e) => {
   refresh();
 });
 
+document.getElementById("read").addEventListener("click", () => {
+  chrome.runtime.sendMessage({ cmd: "read-tab" }).catch(() => {});
+  window.close();
+});
+
+// PDF tabs have no content script, so the p/o keybinds don't exist there;
+// this button is the pause control for PDF reads.
+document.getElementById("pause").addEventListener("click", () => {
+  chrome.runtime.sendMessage({ cmd: "player-toggle" }).catch(() => {});
+});
+
 document.getElementById("stop").addEventListener("click", () => {
   chrome.runtime.sendMessage({ path: "/stop" }).catch(() => {});
   chrome.runtime

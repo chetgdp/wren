@@ -43,8 +43,7 @@ async function post(path, body) {
 // service worker can't play audio and in-page playback would hit autoplay
 // blocking on context-menu speaks (no user gesture in the page).
 
-async function ensureClientPlayback(flush) {
-  const { base, token, rate } = await config();
+async function ensureOffscreenDocument() {
   try {
     if (!(await chrome.offscreen.hasDocument()))
       await chrome.offscreen.createDocument({
@@ -55,6 +54,11 @@ async function ensureClientPlayback(flush) {
   } catch (e) {
     if (!e.message?.includes("single offscreen")) throw e; // create race
   }
+}
+
+async function ensureClientPlayback(flush) {
+  const { base, token, rate } = await config();
+  await ensureOffscreenDocument();
   // Chrome reaps AUDIO_PLAYBACK documents after ~30s without audio, and
   // waiting for the machine queue's turn is silent by design; the alarm
   // rebuilds the player so an interrupted page read resumes instead of
@@ -163,13 +167,51 @@ chrome.runtime.onInstalled.addListener(() => {
   });
 });
 
+// PDF path: Chrome's PDF viewer never runs content scripts, so extraction
+// happens in the offscreen document (pdf-inspector wasm) and the blocks go
+// straight to /speak. No overlay and no highlight in the PDF tab; the
+// popup's pause/stop buttons are the controls.
+async function readPdfTab(url) {
+  await ensureOffscreenDocument();
+  const res = await chrome.runtime
+    .sendMessage({ cmd: "pdf-extract", url })
+    .catch((e) => ({ error: e.message }));
+  if (!res?.blocks) {
+    // A classified-but-unreadable PDF (scanned) gets spoken feedback;
+    // anything else (fetch failure, wasm error) just badges.
+    console.warn("voice-ml pdf:", res?.error);
+    if (res?.pdfType) await post("/speak", { text: res.error });
+    else {
+      chrome.action.setBadgeText({ text: "err" });
+      chrome.action.setBadgeBackgroundColor({ color: "#c0392b" });
+      setTimeout(() => chrome.action.setBadgeText({ text: "" }), 3000);
+    }
+    return;
+  }
+  // Drop the speaking-tab link: position messages must not highlight
+  // whatever page was read before this PDF.
+  speakTabId = null;
+  chrome.storage.session.remove("speakTabId");
+  const r = await post("/speak", { blocks: res.blocks });
+  afterSpeak(r, null, false);
+}
+
+async function readTab(tab) {
+  if (tab?.id == null) return;
+  try {
+    // The content script extracts and speaks via the message path below.
+    await chrome.tabs.sendMessage(tab.id, { cmd: "read-page" });
+  } catch {
+    // No content script: Chrome's PDF viewer, or an unrefreshed tab. If
+    // the bytes turn out not to be a PDF the extractor reports that.
+    if (/^https?:/.test(tab.url ?? "")) readPdfTab(tab.url);
+    else console.warn("voice-ml: no content script (refresh tab?)");
+  }
+}
+
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   if (info.menuItemId === "read-page") {
-    if (tab?.id == null) return;
-    // The content script extracts and speaks via the message path below.
-    chrome.tabs
-      .sendMessage(tab.id, { cmd: "read-page" })
-      .catch(() => console.warn("voice-ml: no content script (refresh tab?)"));
+    readTab(tab);
     return;
   }
   if (!info.selectionText) return;
@@ -192,6 +234,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       speakTabId = stored.speakTabId;
       chrome.tabs.sendMessage(speakTabId, msg).catch(() => {});
     });
+    return;
+  }
+  if (msg.cmd === "read-tab") {
+    // Popup trigger: the context menu is unreliable inside Chrome's PDF
+    // viewer, so the popup asks for the active tab to be read.
+    chrome.tabs
+      .query({ active: true, currentWindow: true })
+      .then(([tab]) => readTab(tab));
     return;
   }
   if (msg.cmd === "player-toggle") {
