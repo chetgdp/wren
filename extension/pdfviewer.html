@@ -1,0 +1,110 @@
+<!doctype html>
+<meta charset="utf-8" />
+<style>
+  * { box-sizing: border-box; }
+  html { background: #525659; }
+  body { margin: 0; font: 13px system-ui, sans-serif; }
+  #container {
+    display: flex; flex-direction: column; align-items: center;
+    gap: 8px; padding: 16px 0 80px;
+  }
+  .page {
+    position: relative; background: white;
+    box-shadow: 0 2px 8px rgba(0,0,0,.3);
+  }
+  .page canvas { display: block; }
+
+  /* PDF.js text layer (minimal subset of pdf_viewer.css) */
+  .textLayer {
+    position: absolute; inset: 0; overflow: clip;
+    opacity: 1; line-height: 1;
+    text-align: initial; text-size-adjust: none;
+    forced-color-adjust: none; transform-origin: 0 0;
+    caret-color: CanvasText; z-index: 0;
+  }
+  .textLayer :is(span, br) {
+    color: transparent; position: absolute; white-space: pre;
+    cursor: text; transform-origin: 0% 0%;
+    user-select: text;
+  }
+  .textLayer > :not(.markedContent),
+  .textLayer .markedContent span:not(.markedContent) {
+    z-index: 1;
+    --font-height: 0;
+    font-size: calc(var(--total-scale-factor, 1) * var(--font-height));
+    --scale-x: 1; --rotate: 0deg;
+    transform: rotate(var(--rotate)) scaleX(var(--scale-x));
+  }
+  .textLayer .markedContent { display: contents; }
+  .textLayer ::selection {
+    background: color-mix(in srgb, AccentColor, transparent 50%);
+    color: transparent;
+  }
+  .textLayer .endOfContent {
+    display: block; position: absolute; inset: 100% 0 0;
+    z-index: 0; cursor: default; user-select: none;
+  }
+
+  /* Voice-ml sentence highlight */
+  ::highlight(voice-ml-sentence) {
+    background-color: rgba(255, 180, 40, 0.55);
+  }
+  /* Block-level tint on the paragraph's page area */
+  .page.speaking { box-shadow: 0 2px 12px rgba(255,180,40,.35); }
+
+  /* Status / loading */
+  #status {
+    color: #aaa; padding: 40px; text-align: center;
+    font-size: 15px;
+  }
+  #status.error { color: #e74c3c; }
+
+  /* Controls overlay (matches overlay.js) */
+  #controls {
+    position: fixed; bottom: 16px; right: 16px; z-index: 2147483647;
+    display: none;
+  }
+  .box {
+    display: flex; align-items: center; gap: 10px;
+    padding: 8px 12px; border-radius: 8px;
+    background: rgba(30,30,30,.95); color: #ddd;
+    font: 13px -apple-system, sans-serif;
+    box-shadow: 0 2px 10px rgba(0,0,0,.4);
+  }
+  .box .status { min-width: 70px; color: #6fcf6f; }
+  .box .status.paused { color: #e0b94f; }
+  .box button {
+    display: flex; align-items: center; justify-content: center;
+    width: 28px; height: 28px;
+    border: 0; border-radius: 5px; padding: 0;
+    background: #3a3a3a; cursor: pointer;
+  }
+  .box button:hover { background: #4a4a4a; }
+  .box svg { width: 14px; height: 14px; fill: #ddd; }
+  #pauseBtn .play { display: none; }
+  #pauseBtn.paused .play { display: block; }
+  #pauseBtn.paused .bars { display: none; }
+  .ratectl { font-size: 15px; font-family: inherit; color: #ddd; }
+  #rateVal { min-width: 34px; text-align: center; color: #aaa; }
+</style>
+
+<div id="status">Loading PDF&#8230;</div>
+<div id="container"></div>
+
+<div id="controls">
+  <div class="box">
+    <span class="status" id="ctlStatus">speaking</span>
+    <button class="ratectl" id="rdown" title="Slower (<)">-</button>
+    <span class="ratectl" id="rateVal">1x</span>
+    <button class="ratectl" id="rup" title="Faster (>)">+</button>
+    <button id="pauseBtn" title="Pause (p)">
+      <svg class="bars" viewBox="0 0 16 16"><rect x="3" y="2" width="4" height="12" rx="1"/><rect x="9" y="2" width="4" height="12" rx="1"/></svg>
+      <svg class="play" viewBox="0 0 16 16"><path d="M4 2.5v11a.6.6 0 0 0 .9.5l9-5.5a.6.6 0 0 0 0-1l-9-5.5a.6.6 0 0 0-.9.5z"/></svg>
+    </button>
+    <button id="stopBtn" title="Stop (o)">
+      <svg viewBox="0 0 16 16"><rect x="3" y="3" width="10" height="10" rx="1.5"/></svg>
+    </button>
+  </div>
+</div>
+
+<script type="module" src="pdfviewer.js"></script>

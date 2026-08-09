@@ -167,44 +167,30 @@ chrome.runtime.onInstalled.addListener(() => {
   });
 });
 
-// PDF path: Chrome's PDF viewer never runs content scripts, so extraction
-// happens in the offscreen document (pdf-inspector wasm) and the blocks go
-// straight to /speak. No overlay and no highlight in the PDF tab; the
-// popup's pause/stop buttons are the controls.
+// PDF path: Chrome's PDF viewer never runs content scripts. Instead of
+// extracting in the offscreen document, open a dedicated PDF.js viewer
+// tab that renders the PDF with a text layer for sentence highlighting.
 async function readPdfTab(url) {
-  await ensureOffscreenDocument();
-  const res = await chrome.runtime
-    .sendMessage({ cmd: "pdf-extract", url })
-    .catch((e) => ({ error: e.message }));
-  if (!res?.blocks) {
-    // A classified-but-unreadable PDF (scanned) gets spoken feedback;
-    // anything else (fetch failure, wasm error) just badges.
-    console.warn("voice-ml pdf:", res?.error);
-    if (res?.pdfType) await post("/speak", { text: res.error });
-    else {
-      chrome.action.setBadgeText({ text: "err" });
-      chrome.action.setBadgeBackgroundColor({ color: "#c0392b" });
-      setTimeout(() => chrome.action.setBadgeText({ text: "" }), 3000);
-    }
-    return;
-  }
-  // Drop the speaking-tab link: position messages must not highlight
-  // whatever page was read before this PDF.
-  speakTabId = null;
-  chrome.storage.session.remove("speakTabId");
-  const r = await post("/speak", { blocks: res.blocks });
-  afterSpeak(r, null, false);
+  const viewerUrl =
+    chrome.runtime.getURL("pdfviewer.html") +
+    "?url=" + encodeURIComponent(url);
+  chrome.tabs.create({ url: viewerUrl });
 }
 
 async function readTab(tab) {
   if (tab?.id == null) return;
+  const url = tab.url ?? "";
+  // PDF URLs: go straight to the viewer (content script finds nothing
+  // useful inside Chrome's PDF embed).
+  if (/\.pdf(\?[^#]*)?(#.*)?$/i.test(url) ||
+      /^chrome-extension:.*pdfviewer\.html/i.test(url)) {
+    if (/^https?:/.test(url)) readPdfTab(url);
+    return;
+  }
   try {
-    // The content script extracts and speaks via the message path below.
     await chrome.tabs.sendMessage(tab.id, { cmd: "read-page" });
   } catch {
-    // No content script: Chrome's PDF viewer, or an unrefreshed tab. If
-    // the bytes turn out not to be a PDF the extractor reports that.
-    if (/^https?:/.test(tab.url ?? "")) readPdfTab(tab.url);
+    if (/^https?:/.test(url)) readPdfTab(url);
     else console.warn("voice-ml: no content script (refresh tab?)");
   }
 }
