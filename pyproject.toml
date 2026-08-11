@@ -1,5 +1,5 @@
 [project]
-name = "voice-ml"
+name = "wren"
 version = "0.1.0"
 description = "Voice cloning (tts/) + speech-to-text (transcribe/) on Apple Silicon"
 readme = "README.md"
@@ -28,8 +28,6 @@ torch = [
     "qwen-tts>=0.1.1",
 ]
 
-# Bare `uv run pytest` must only collect the real suite, never vendored
-# checkouts (qwentts.cpp/ etc.).
 [tool.pytest.ini_options]
 testpaths = ["tts"]
 

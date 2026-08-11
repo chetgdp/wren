@@ -1,27 +1,24 @@
 .DS_Store
 
-read_page_cases/
+# Swift
+.build/
+.build-release/
+.swiftpm/
+*.xcodeproj
+*.xcworkspace
 
-# env / caches
+# Python
 .venv/
 __pycache__/
 *.pyc
 .pytest_cache/
+.ruff_cache/
 
-# models are fetched, not committed (./fetch-models.sh, or HF hub for torch)
+# fetched/generated data
 models/
-
-# audio; everything in samples/ stays tracked
 archived_samples/
 outputs/
+read_page_cases/
 
-# scratch, vendored checkouts, tool state
-research/
-parakeet.cpp/
+# tool state
 .giverny/
-
-.DS_Store
-cawker/
-otis/
-
-qwentts.cpp/

@@ -256,6 +256,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     .then((res) => {
       if (msg.path === "/speak")
         afterSpeak(res, sender.tab?.id, !!msg.body?.append);
+      if (msg.path === "/seek" && res?.ok && res.block != null)
+        lastBlock = res.block;
       sendResponse(res);
     })
     .catch((err) => sendResponse({ error: err.message }));
