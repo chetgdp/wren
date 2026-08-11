@@ -14,4 +14,4 @@ cd "$(dirname "$0")/.."
     cat assets/logo.svg
     echo "\"\"\"#"
     echo "}"
-} > Sources/wren/Logo.generated.swift
+} > daemon/Sources/wren/Logo.generated.swift

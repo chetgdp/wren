@@ -12,12 +12,12 @@
 set -e
 cd "$(dirname "$0")/.."
 
-BIN="${1:-.build/release/wren}"
+BIN="${1:-daemon/.build/release/wren}"
 # Reuses otis's local cert: TCC keys grants to identity + bundle id, so
 # two apps sharing one signing identity stay independently permissioned.
 IDENTITY="${WREN_SIGN_IDENTITY:-otis_local_sign_test}"
 APP="$HOME/Applications/Wren.app"
-STAGE=".build/Wren.app"
+STAGE="daemon/.build/Wren.app"
 VERSION=$(git describe --tags --always 2>/dev/null || echo 0.0.0)
 
 if [ ! -f "$BIN" ]; then

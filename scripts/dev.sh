@@ -9,7 +9,7 @@ set -e
 cd "$(dirname "$0")/.."
 
 scripts/stamp-logo.sh
-swift test
-swift build -c release
+swift test --package-path daemon
+swift build --package-path daemon -c release
 
 scripts/bundle.sh
