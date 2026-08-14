@@ -16,18 +16,18 @@ llama-server \
                                             --jinja
 ```
 
-for macos
+for macOS daemon development (the standalone daemon plays locally)
 ```
-uv run tts/serve.py -r samples/c3po_god.wav --fx --local-player client
+uv run tts/serve.py -r samples/c3po_god.wav
 ```
 
 for linux cuda
 ```
-uv run --no-group mlx tts/serve.py -r samples/c3po_god.wav --fx -b qwentts \
+uv run --no-group mlx tts/serve.py -r samples/c3po_god.wav -b qwentts \
                                           --qwentts-bin ~/voice-ml/qwentts.cpp/build/tts-server \
                                           --qwentts-model ~/voice-ml/qwentts.cpp/models/qwen-talker-1.7b-base-Q8_0.gguf \
                                           --qwentts-codec ~/voice-ml/qwentts.cpp/models/qwen-tokenizer-12hz-Q8_0.gguf \
-                                          --host 0.0.0.0 --local-player client
+                                          --host 0.0.0.0 --token "$VOICE_ML_TOKEN" --local-player client
 ```
 
 ## Command line options
@@ -37,22 +37,26 @@ group: `uv run --no-group mlx --group torch <script>`.
 
 ### tts/serve.py - TTS daemon
 
-Loads the model once, then speaks POSTed text (`POST /speak`, `/stop`,
-`/pause`, `/resume`, `/seek`; `GET /health`, `/segment`).
+Loads the model once, then serves the unversioned playback API (`POST /speak`,
+`/stop`, `/pause`, `/resume`, `/seek`; `GET /health`, `/segment`) and the
+management-v2 API (`GET /meta`, `/state`, `/voices`, `/operations/{id}`,
+`/settings`, plus typed voice and settings mutations).
 
 ```
-uv run tts/serve.py -r samples/c3po_god.wav --fx
+uv run tts/serve.py -r samples/c3po_god.wav
 ```
 
 | option | default | description |
 |---|---|---|
-| `-r, --ref-audio` | required | reference voice clip (~3s wav) |
+| `-r, --ref-audio` | none | explicit reference voice clip in the managed voice library |
 | `--ref-text` | sibling `.txt` of ref-audio | transcript of the reference clip |
+| `--config` | platform application config | old config used only as a one-time migration source |
+| `--voices-dir` | beside daemon settings | daemon-owned voice-profile library |
+| `--initial-voice` | none | stable bootstrap ID used only if v2 settings has no `active_voice`; it never overrides durable selection and is not mutable product config |
 | `-m, --model` | `models/Qwen3-TTS-12Hz-1.7B-Base-4bit` | TTS model id (HF repo or local path) |
-| `-b, --backend` | `auto` | `mlx` or `qwen-tts` (torch); auto picks whichever is installed |
+| `-b, --backend` | `auto` | `mlx`, `qwen-tts`, or `qwentts`; auto picks an installed backend |
 | `-l, --language` | `English` | text language (qwen-tts backend only) |
 | `-d, --device` | `auto` | torch device, `cuda` > `mps` > `cpu` (qwen-tts backend only) |
-| `--fx` | off | apply the droid effect chain (fx.py) to all output |
 | `--fx-ring-freq` | `40.0` | ring modulator carrier Hz |
 | `--fx-ring-mix` | `0.12` | ring modulator wet mix 0-1 |
 | `-p, --port` | `8765` | port to listen on |

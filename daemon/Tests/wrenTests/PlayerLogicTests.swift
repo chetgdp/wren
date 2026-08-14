@@ -6,12 +6,15 @@ final class SegmentPollTests: XCTestCase {
         var poll = SegmentPoll()
         _ = poll.handle(status: 200, epoch: 1, seq: 3)
         _ = poll.notePlayed(2)
-        let url = poll.url(base: URL(string: "http://127.0.0.1:8765")!)
+        let base = URL(string: "http://127.0.0.1:8765")!
+        let url = poll.url(base: base)
         let components = try XCTUnwrap(
             URLComponents(url: url, resolvingAgainstBaseURL: false))
         XCTAssertEqual(components.path, "/segment")
-        let query = Dictionary(
-            uniqueKeysWithValues: (components.queryItems ?? []).map { ($0.name, $0.value) })
+        let pairs = (components.queryItems ?? []).map {
+            ($0.name, $0.value)
+        }
+        let query = Dictionary(uniqueKeysWithValues: pairs)
         XCTAssertEqual(query["after"], "3")
         XCTAssertEqual(query["played"], "2")
         XCTAssertEqual(query["timeout"], "20")
@@ -21,9 +24,12 @@ final class SegmentPollTests: XCTestCase {
         // Epoch 0 vs "no epoch seen yet" must be distinguishable, or every
         // fresh player start would begin with a spurious flush.
         var poll = SegmentPoll()
-        XCTAssertEqual(poll.handle(status: 204, epoch: 5, seq: nil), .none)
-        XCTAssertEqual(poll.handle(status: 200, epoch: 5, seq: 1),
-                       .segment(seq: 1, flushFirst: false))
+        XCTAssertEqual(
+            poll.handle(status: 204, epoch: 5, seq: nil),
+            .none)
+        XCTAssertEqual(
+            poll.handle(status: 200, epoch: 5, seq: 1),
+            .segment(seq: 1, flushFirst: false))
     }
 
     func testEpochChangeFlushes() {
@@ -33,8 +39,9 @@ final class SegmentPollTests: XCTestCase {
         XCTAssertEqual(poll.handle(status: 204, epoch: 2, seq: nil), .flush)
         // Preemption arriving with the first segment of the new epoch:
         // flush, then schedule that segment.
-        XCTAssertEqual(poll.handle(status: 200, epoch: 3, seq: 7),
-                       .segment(seq: 7, flushFirst: true))
+        XCTAssertEqual(
+            poll.handle(status: 200, epoch: 3, seq: 7),
+            .segment(seq: 7, flushFirst: true))
         XCTAssertEqual(poll.after, 7)
     }
 
@@ -58,46 +65,40 @@ final class SegmentPollTests: XCTestCase {
 
 final class ServeSpawnTests: XCTestCase {
     private let paths = WrenPaths(
-        resources: URL(fileURLWithPath: "/Applications/Wren.app/Contents/Resources"),
-        appSupport: URL(fileURLWithPath: "/Users/x/Library/Application Support/voice-ml"))
+        resources: URL(
+            fileURLWithPath:
+                "/Applications/Wren.app/Contents/Resources"),
+        appSupport: URL(
+            fileURLWithPath:
+                "/Users/x/Library/Application Support/voice-ml"))
 
     func testSpawnUsesOnlyBundleAndAppSupportPaths() {
-        let arguments = DaemonManager.serveArguments(paths: paths, configHasVoice: true)
-        XCTAssertEqual(arguments[0],
-                       "/Applications/Wren.app/Contents/Resources/server/serve.py")
+        let arguments = DaemonManager.serveArguments(
+            paths: paths,
+            settingsExist: true)
+        XCTAssertEqual(
+            arguments[0],
+            "/Applications/Wren.app/Contents/Resources/server/serve.py")
         XCTAssertTrue(arguments.contains("--local-player"))
         XCTAssertTrue(arguments.contains("client"))
         XCTAssertTrue(arguments.contains(
             "/Applications/Wren.app/Contents/Resources/engine/tts-server"))
         XCTAssertTrue(arguments.contains(
-            "/Users/x/Library/Application Support/voice-ml/models/qwen-talker-1.7b-base-Q8_0.gguf"))
-        // Config names a voice: the daemon resolves it, no -r override.
+            "/Users/x/Library/Application Support/voice-ml/models/"
+                + "qwen-talker-1.7b-base-Q8_0.gguf"))
+        XCTAssertFalse(arguments.contains("--initial-voice"))
         XCTAssertFalse(arguments.contains("-r"))
     }
 
-    func testDefaultVoiceFallsBackToSeededFile() {
-        let arguments = DaemonManager.serveArguments(paths: paths, configHasVoice: false)
-        let flag = try? XCTUnwrap(arguments.firstIndex(of: "-r"))
-        XCTAssertEqual(
-            flag.map { arguments[$0 + 1] },
-            "/Users/x/Library/Application Support/voice-ml/voices/c3po_god.wav")
-    }
+    func testMissingSettingsAddsInitialVoiceID() throws {
+        let arguments = DaemonManager.serveArguments(
+            paths: paths,
+            settingsExist: false)
+        let flag = try XCTUnwrap(
+            arguments.firstIndex(of: "--initial-voice"))
 
-    func testConfigHasVoiceRequiresBothKeys() throws {
-        let dir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("wren-test-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: dir) }
-        let config = dir.appendingPathComponent("config.json")
-
-        XCTAssertFalse(DaemonManager.configHasVoice(at: config)) // no file
-
-        try Data(#"{"voice": null, "voices_dir": null, "port": 8765}"#.utf8)
-            .write(to: config)
-        XCTAssertFalse(DaemonManager.configHasVoice(at: config))
-
-        try Data(#"{"voice": "c3po_god", "voices_dir": "/v"}"#.utf8).write(to: config)
-        XCTAssertTrue(DaemonManager.configHasVoice(at: config))
+        XCTAssertEqual(arguments[flag + 1], "c3po_god")
+        XCTAssertFalse(arguments.contains("-r"))
     }
 }
 
@@ -108,12 +109,15 @@ final class HealthChannelsDecodingTests: XCTestCase {
          "pending": 1, "speaking": true, "paused": false, "block": null,
          "speed": 1.4,
          "channels": {"local": {"pending": 0, "speaking": false,
-                                "paused": false, "block": null, "active": false},
+                                "paused": false, "block": null,
+                                "active": false},
                       "extension": {"pending": 1, "speaking": true,
                                     "paused": false, "block": [2, 3],
                                     "active": true}}}
         """.utf8)
-        let health = try DaemonClient.decoder.decode(HealthResponse.self, from: body)
+        let health = try DaemonClient.decoder.decode(
+            HealthResponse.self,
+            from: body)
         XCTAssertEqual(health.channels?["extension"]?.block, [2, 3])
         XCTAssertEqual(health.channels?["local"]?.active, false)
     }
@@ -125,7 +129,9 @@ final class HealthChannelsDecodingTests: XCTestCase {
         {"ok": true, "ready": false, "model": "m", "playback": "local",
          "pending": 0, "speaking": false, "paused": false}
         """.utf8)
-        let health = try DaemonClient.decoder.decode(HealthResponse.self, from: body)
+        let health = try DaemonClient.decoder.decode(
+            HealthResponse.self,
+            from: body)
         XCTAssertNil(health.channels)
     }
 }

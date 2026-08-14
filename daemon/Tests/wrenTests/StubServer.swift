@@ -13,17 +13,23 @@ final class StubServer {
         var body: Data
     }
 
+    struct Response {
+        var status: Int
+        var headers: [String: String]
+        var body: Data
+    }
+
     /// Connection handling lives here, not on StubServer: NWListener needs
     /// its newConnectionHandler set before start(), and a closure capturing
     /// StubServer's self cannot exist until init finishes (port is a let
     /// assigned after the listener is ready).
     private final class Core: @unchecked Sendable {
-        let respond: (Request) -> (status: Int, body: String)
+        let respond: (Request) -> Response
         let queue = DispatchQueue(label: "wren.stub-server")
         private let lock = NSLock()
         private var recorded: [Request] = []
 
-        init(respond: @escaping (Request) -> (status: Int, body: String)) {
+        init(respond: @escaping (Request) -> Response) {
             self.respond = respond
         }
 
@@ -39,8 +45,10 @@ final class StubServer {
         }
 
         private func receive(_ connection: NWConnection, buffer: Data) {
-            connection.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) {
-                data, _, isComplete, error in
+            connection.receive(
+                minimumIncompleteLength: 1,
+                maximumLength: 64 * 1024
+            ) { data, _, isComplete, error in
                 guard error == nil else {
                     connection.cancel()
                     return
@@ -68,8 +76,21 @@ final class StubServer {
 
     var requests: [Request] { core.requests }
 
-    init(respond: @escaping (Request) -> (status: Int, body: String)) throws {
-        let core = Core(respond: respond)
+    convenience init(
+        respond: @escaping (Request) -> (status: Int, body: String)
+    ) throws {
+        try self.init(respondData: { request in
+            let response = respond(request)
+            return Response(
+                status: response.status,
+                headers: ["Content-Type": "application/json"],
+                body: Data(response.body.utf8)
+            )
+        })
+    }
+
+    init(respondData: @escaping (Request) -> Response) throws {
+        let core = Core(respond: respondData)
         self.core = core
         listener = try NWListener(using: .tcp, on: .any)
 
@@ -86,8 +107,13 @@ final class StubServer {
         listener.start(queue: core.queue)
         ready.wait()
         guard let port = listener.port?.rawValue, port != 0 else {
-            throw NSError(domain: "StubServer", code: 1,
-                          userInfo: [NSLocalizedDescriptionKey: "listener failed to bind"])
+            throw NSError(
+                domain: "StubServer",
+                code: 1,
+                userInfo: [
+                    NSLocalizedDescriptionKey: "listener failed to bind",
+                ]
+            )
         }
         self.port = port
     }
@@ -98,8 +124,10 @@ final class StubServer {
 
     /// nil until the headers and the full Content-Length body have arrived.
     fileprivate static func parse(_ data: Data) -> Request? {
-        guard let headerEnd = data.range(of: Data("\r\n\r\n".utf8)) else { return nil }
-        guard let head = String(data: data[..<headerEnd.lowerBound], encoding: .utf8)
+        let separator = Data("\r\n\r\n".utf8)
+        guard let headerEnd = data.range(of: separator) else { return nil }
+        let headData = data[..<headerEnd.lowerBound]
+        guard let head = String(data: headData, encoding: .utf8)
         else { return nil }
         var lines = head.components(separatedBy: "\r\n")
         let requestLine = lines.removeFirst().split(separator: " ")
@@ -124,14 +152,21 @@ final class StubServer {
         )
     }
 
-    fileprivate static func send(_ response: (status: Int, body: String), over connection: NWConnection) {
-        let body = Data(response.body.utf8)
-        let head = "HTTP/1.1 \(response.status) \(response.status == 200 ? "OK" : "Error")\r\n"
-            + "Content-Type: application/json\r\n"
-            + "Content-Length: \(body.count)\r\n"
-            + "Connection: close\r\n\r\n"
+    fileprivate static func send(
+        _ response: Response,
+        over connection: NWConnection
+    ) {
+        let reason = response.status == 200 ? "OK" : "Response"
+        var head = "HTTP/1.1 \(response.status) \(reason)\r\n"
+        for (name, value) in response.headers.sorted(by: {
+            $0.key.lowercased() < $1.key.lowercased()
+        }) {
+            head += "\(name): \(value)\r\n"
+        }
+        head += "Content-Length: \(response.body.count)\r\n"
+        head += "Connection: close\r\n\r\n"
         connection.send(
-            content: Data(head.utf8) + body,
+            content: Data(head.utf8) + response.body,
             completion: .contentProcessed { _ in connection.cancel() }
         )
     }

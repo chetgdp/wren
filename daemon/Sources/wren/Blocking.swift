@@ -5,7 +5,9 @@ import Foundation
 /// runs every subcommand on the concurrency pool instead of the real main
 /// thread, and NSApplication.run() (the `run` subcommand) traps anywhere
 /// but on it.
-func blocking<T: Sendable>(_ body: @escaping @Sendable () async throws -> T) throws -> T {
+func blocking<T: Sendable>(
+    _ body: @escaping @Sendable () async throws -> T
+) throws -> T {
     let box = ResultBox<T>()
     let semaphore = DispatchSemaphore(value: 0)
     Task.detached {

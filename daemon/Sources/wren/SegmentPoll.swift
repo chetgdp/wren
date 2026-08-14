@@ -39,7 +39,11 @@ struct SegmentPoll {
 
     /// Digest one poll response. status 204 carries only an epoch; 200
     /// carries a segment. Any other status is the caller's problem.
-    mutating func handle(status: Int, epoch newEpoch: Int?, seq: Int?) -> Outcome {
+    mutating func handle(
+        status: Int,
+        epoch newEpoch: Int?,
+        seq: Int?
+    ) -> Outcome {
         let preempted = epoch != nil && newEpoch != nil && newEpoch != epoch
         if let newEpoch { epoch = newEpoch }
         guard status == 200, let seq else {

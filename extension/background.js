@@ -4,13 +4,40 @@
 // channel "extension" and its audio always streams back via GET /segment,
 // regardless of how the daemon plays the local channel.
 
+const IS_OFFSCREEN = typeof chrome.offscreen !== "undefined";
+
+let audioModule = null;
+const audioModuleReady = IS_OFFSCREEN
+  ? Promise.resolve(null)
+  : import("./audio.js").then((module) => {
+    audioModule = module;
+    return module;
+  });
 const DEFAULTS = { base: "http://127.0.0.1:8765", token: "", rate: 1 };
 const CHANNEL = "extension";
 // Calls that act on a channel; keeping them on the extension's own channel
 // means its pause/stop buttons never silence other channels' speech.
 const CHANNEL_PATHS = ["/speak", "/stop", "/pause", "/resume", "/seek"];
 
-const config = () => chrome.storage.sync.get(DEFAULTS);
+let cachedConfig = { ...DEFAULTS };
+let configReady = false;
+let configInitPromise = chrome.storage.sync.get(DEFAULTS).then((stored) => {
+  if (!configReady) cachedConfig = { ...DEFAULTS, ...stored };
+  configReady = true;
+}).catch((err) => {
+  console.warn("voice-ml config:", err.message);
+  configReady = true;
+});
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== "sync") return;
+  for (const key of Object.keys(DEFAULTS)) {
+    if (changes[key]) cachedConfig[key] =
+      changes[key].newValue ?? DEFAULTS[key];
+  }
+  configReady = true;
+});
+
+const config = () => configInitPromise.then(() => cachedConfig);
 
 async function call(path, body) {
   const { base, token } = await config();
@@ -44,6 +71,7 @@ async function post(path, body) {
 // blocking on context-menu speaks (no user gesture in the page).
 
 async function ensureOffscreenDocument() {
+  if (!IS_OFFSCREEN) return;
   try {
     if (!(await chrome.offscreen.hasDocument()))
       await chrome.offscreen.createDocument({
@@ -52,76 +80,96 @@ async function ensureOffscreenDocument() {
         justification: "Play TTS audio fetched from the voice-ml daemon",
       });
   } catch (e) {
-    if (!e.message?.includes("single offscreen")) throw e; // create race
+    if (!/single offscreen|already exists/i.test(e?.message || "")) throw e;
   }
 }
 
 async function ensureClientPlayback(flush) {
   const { base, token, rate } = await config();
   await ensureOffscreenDocument();
-  // Chrome reaps AUDIO_PLAYBACK documents after ~30s without audio, and
-  // waiting for the machine queue's turn is silent by design; the alarm
-  // rebuilds the player so an interrupted page read resumes instead of
-  // dying (see onAlarm below).
-  chrome.alarms.create("player-keepalive", { periodInMinutes: 0.5 });
-  // The stream cursor survives document teardown here (offscreen docs get
-  // no chrome.storage); a rebuilt player resumes after what it already
-  // played instead of replaying the server's buffer. A preempting speak
-  // invalidated the buffer server-side, so a flush start needs no cursor
-  // (and skipping it lets a fresh document track a restarted daemon).
-  const { playerCursor } = await chrome.storage.session.get("playerCursor");
-  chrome.runtime
-    .sendMessage({ cmd: "player", action: "start", base, token, rate, flush,
-                   cursor: flush ? null : playerCursor })
-    .catch(() => {});
+  if (IS_OFFSCREEN) {
+    chrome.alarms.create("player-keepalive", {
+      periodInMinutes: 0.5,
+    });
+    const { playerCursor } =
+      await chrome.storage.session.get("playerCursor");
+    chrome.runtime
+      .sendMessage({
+        cmd: "player", action: "start",
+        base, token, rate, flush,
+        cursor: flush ? null : playerCursor,
+      })
+      .catch(() => {});
+  } else {
+    const module = await audioModuleReady;
+    const { playerCursor } =
+      await chrome.storage.session.get("playerCursor");
+    module.start({
+      base, token, rate, flush,
+      cursor: flush ? null : playerCursor,
+      onPosition: (pos) => sendPosition(pos),
+      onCursor: (cur) => {
+        chrome.storage.session.set({
+          playerCursor: {
+            seq: cur.seq, played: cur.played,
+          },
+        });
+      },
+    });
+  }
 }
 
 chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name !== "player-keepalive") return;
+  if (!IS_OFFSCREEN) return;
   if (await chrome.offscreen.hasDocument()) return;
   let health;
   try {
     health = await call("/health");
   } catch {
-    return; // transient daemon hiccup: stay armed, retry next period
+    return;
   }
   const ch = health.channels?.[CHANNEL];
-  if (ch?.paused) return; // togglePlayer rebuilds on resume, not before
-  // "active" covers what pending/speaking miss: a channel parked waiting
-  // for its machine-queue turn holds a mid-utterance batch with pending 0,
-  // and clearing here would strand the rest of the read.
+  if (ch?.paused) return;
   if (ch?.active) await ensureClientPlayback(false);
-  else chrome.alarms.clear("player-keepalive"); // session over; let it rest
+  else chrome.alarms.clear("player-keepalive");
 });
 
-// Pause/resume of client playback routes through here rather than straight
-// to the offscreen player: a suspended AudioContext produces no audio, so
-// Chrome closes the AUDIO_PLAYBACK document ~30s into a pause. Resume must
-// then rebuild - /seek the daemon back to the paused block (seek preempts
-// and resumes server-side) and recreate the player document.
-let lastBlock = null; // most recent audible block, from position messages
+let lastBlock = null;
 
 async function togglePlayer() {
-  if (await chrome.offscreen.hasDocument()) {
-    const r = await chrome.runtime
-      .sendMessage({ cmd: "player", action: "toggle" })
-      .catch(() => null);
-    if (r) {
-      if (r.paused)
-        chrome.storage.session.set({ pausedBlock: r.block ?? lastBlock });
-      else chrome.storage.session.remove("pausedBlock");
-      await post(r.paused ? "/pause" : "/resume");
-      return r;
+  if (IS_OFFSCREEN) {
+    if (await chrome.offscreen.hasDocument()) {
+      const r = await chrome.runtime
+        .sendMessage({ cmd: "player", action: "toggle" })
+        .catch(() => null);
+      if (r) {
+        if (r.paused)
+          chrome.storage.session.set({
+            pausedBlock: r.block ?? lastBlock,
+          });
+        else chrome.storage.session.remove("pausedBlock");
+        await post(r.paused ? "/pause" : "/resume");
+        return r;
+      }
     }
+  } else {
+    const module = await audioModuleReady;
+    const r = await module.toggle();
+    if (r.paused)
+      chrome.storage.session.set({
+        pausedBlock: r.block ?? lastBlock,
+      });
+    else chrome.storage.session.remove("pausedBlock");
+    await post(r.paused ? "/pause" : "/resume");
+    return r;
   }
-  // No player document: Chrome closed it during a long pause, taking the
-  // scheduled audio with it. Requeue server-side from the paused block;
-  // plain-text speaks aren't seekable, so /resume is the fallback (the
-  // daemon un-gates and synthesis continues from its queue).
-  const { pausedBlock } = await chrome.storage.session.get("pausedBlock");
+  const { pausedBlock } =
+    await chrome.storage.session.get("pausedBlock");
   chrome.storage.session.remove("pausedBlock");
   let res = null;
-  if (pausedBlock != null) res = await post("/seek", { block: pausedBlock });
+  if (pausedBlock != null)
+    res = await post("/seek", { block: pausedBlock });
   if (!res?.ok) await post("/resume");
   await ensureClientPlayback(false);
   return { paused: false };
@@ -131,9 +179,30 @@ async function togglePlayer() {
 // storage.session read on each hop adds latency to the highlight. Session
 // storage stays the durable copy for service-worker restarts.
 let speakTabId = null;
+let speakTabReady = false;
+const speakTabInitPromise = chrome.storage.session.get("speakTabId")
+  .then((stored) => {
+    if (speakTabId == null && stored.speakTabId != null)
+      speakTabId = stored.speakTabId;
+    speakTabReady = true;
+  })
+  .catch(() => {
+    speakTabReady = true;
+  });
+
+function sendPosition(pos) {
+  if (pos.block) lastBlock = pos.block[0];
+  const send = () => {
+    if (speakTabId != null)
+      chrome.tabs.sendMessage(speakTabId, {
+        cmd: "position", ...pos,
+      }).catch(() => {});
+  };
+  if (speakTabReady) send();
+  else speakTabInitPromise.then(send);
+}
 
 function afterSpeak(res, tabId, append) {
-  if (!res || !(res.queued > 0)) return;
   if (!append) {
     // A preempting speak invalidates any position saved by an earlier pause.
     lastBlock = null;
@@ -171,6 +240,7 @@ chrome.runtime.onInstalled.addListener(() => {
 // extracting in the offscreen document, open a dedicated PDF.js viewer
 // tab that renders the PDF with a text layer for sentence highlighting.
 async function readPdfTab(url) {
+  if (!IS_OFFSCREEN) return;
   const viewerUrl =
     chrome.runtime.getURL("pdfviewer.html") +
     "?url=" + encodeURIComponent(url);
@@ -183,7 +253,7 @@ async function readTab(tab) {
   // PDF URLs: go straight to the viewer (content script finds nothing
   // useful inside Chrome's PDF embed).
   if (/\.pdf(\?[^#]*)?(#.*)?$/i.test(url) ||
-      /^chrome-extension:.*pdfviewer\.html/i.test(url)) {
+      /^(chrome|moz)-extension:.*pdfviewer\.html/i.test(url)) {
     if (/^https?:/.test(url)) readPdfTab(url);
     return;
   }
@@ -210,16 +280,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // Playhead updates from the offscreen player -> content script of the
   // tab that last spoke (runtime.sendMessage can't reach content scripts).
   if (msg.cmd === "position") {
-    if (msg.block) lastBlock = msg.block[0];
-    if (speakTabId != null) {
-      chrome.tabs.sendMessage(speakTabId, msg).catch(() => {});
-      return;
-    }
-    chrome.storage.session.get("speakTabId").then((stored) => {
-      if (stored.speakTabId == null) return;
-      speakTabId = stored.speakTabId;
-      chrome.tabs.sendMessage(speakTabId, msg).catch(() => {});
-    });
+    sendPosition(msg);
     return;
   }
   if (msg.cmd === "read-tab") {
@@ -247,7 +308,23 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     });
     return;
   }
-  if (msg.cmd === "player") return; // overlay/self -> offscreen; not for us
+  if (msg.cmd === "player") {
+    if (!IS_OFFSCREEN) {
+      audioModuleReady.then((module) => {
+        if (msg.action === "flush") module.flush();
+        else if (msg.action === "stop") module.stop();
+        else if (msg.action === "rate") {
+          sendResponse(
+            module.setRate({
+              value: msg.value, delta: msg.delta,
+            })
+          );
+        }
+      }).catch(() => {});
+      if (msg.action === "rate") return true;
+    }
+    return;
+  }
   if (!msg.path) return;
   if (msg.path === "/stop") chrome.alarms.clear("player-keepalive");
   // Content scripts proxy daemon calls through here (they hit CORS directly).

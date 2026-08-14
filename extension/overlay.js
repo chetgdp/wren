@@ -166,5 +166,5 @@
   timer = setInterval(poll, 500);
   // Keybinds live in content.js and drive the overlay through this handle.
   window.__voiceMlOverlay =
-    { reset: () => (idlePolls = 0), togglePause, stop, rateDelta };
+    { reset: () => (idlePolls = 0), poll, togglePause, stop, rateDelta };
 })();

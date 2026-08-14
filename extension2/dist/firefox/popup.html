@@ -1,0 +1,94 @@
+<!doctype html>
+<meta charset="utf-8">
+<style>
+  body {
+    font: 13px system-ui; margin: 0;
+    min-width: 240px;
+  }
+  #status { padding: 10px 12px; }
+  form {
+    display: flex; gap: 6px;
+    padding: 0 12px 10px;
+  }
+  input {
+    font: inherit; padding: 4px 6px;
+    border: 1px solid #bbb; border-radius: 3px;
+    min-width: 0;
+  }
+  #host { flex: 3; }
+  #port { flex: 1; width: 5ch; }
+  form button {
+    padding: 4px 10px; border: 1px solid #bbb;
+    border-radius: 3px; background: #f5f5f5;
+    font: inherit; cursor: pointer;
+  }
+  .action {
+    display: block; width: 100%;
+    padding: 8px 12px; border: 0;
+    border-top: 1px solid #ddd;
+    background: none; font: inherit;
+    text-align: left; cursor: pointer;
+  }
+  .action:hover { background: #eee; }
+</style>
+<div id="status">checking daemon...</div>
+<form id="addr">
+  <input id="host" placeholder="host">
+  <input id="port" placeholder="port" inputmode="numeric">
+  <button type="submit">Save</button>
+</form>
+<button class="action" id="read">Read this page</button>
+<button class="action" id="pause">Pause / resume</button>
+<button class="action" id="stop">Stop speaking</button>
+<script>
+const D = {base: "http://127.0.0.1:8765", token: ""};
+const $ = (id) => document.getElementById(id);
+async function refresh() {
+  const {base, token} = await chrome.storage.sync.get(D);
+  const u = new URL(base);
+  const port = u.port ||
+    (u.protocol === "https:" ? "443" : "80");
+  $("host").value = u.hostname;
+  $("port").value = port;
+  $("status").textContent = "checking daemon...";
+  try {
+    const r = await fetch(base + "/health", {
+      headers: token
+        ? {Authorization: "Bearer " + token} : {},
+    });
+    if (!r.ok) throw 0;
+    $("status").textContent =
+      "connected to " + u.hostname + ":" + port;
+  } catch {
+    $("status").textContent =
+      "daemon not reachable at " + u.hostname + ":" + port;
+  }
+}
+$("addr").onsubmit = async (e) => {
+  e.preventDefault();
+  const h = $("host").value.trim();
+  const p = $("port").value.trim();
+  if (!h || !/^\d+$/.test(p)) return;
+  const {base} = await chrome.storage.sync.get(D);
+  const proto = new URL(base).protocol;
+  await chrome.storage.sync.set(
+    {base: proto + "//" + h + ":" + p}
+  );
+  refresh();
+};
+$("read").onclick = () => {
+  chrome.runtime.sendMessage({cmd: "read-tab"});
+  window.close();
+};
+$("pause").onclick = () => {
+  chrome.runtime.sendMessage({cmd: "player-toggle"});
+};
+$("stop").onclick = () => {
+  chrome.runtime.sendMessage({path: "/stop"});
+  chrome.runtime.sendMessage(
+    {cmd: "player", action: "stop"}
+  );
+  window.close();
+};
+refresh();
+</script>

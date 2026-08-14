@@ -1,0 +1,15 @@
+{
+  "manifest_version": 3,
+  "name": "voice-ml speak",
+  "version": "0.3",
+  "description": "Send selected text to the voice-ml TTS daemon",
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"
+  },
+  "permissions": ["contextMenus", "scripting", "activeTab", "storage", "offscreen", "alarms"],
+  "host_permissions": ["http://*/*", "https://*/*"],
+  "background": { "service_worker": "background.js" },
+  "content_scripts": [{ "matches": ["<all_urls>"], "js": ["content.js"] }],
+  "action": { "default_title": "voice-ml", "default_popup": "popup.html" },
+  "options_ui": { "page": "options.html" }
+}

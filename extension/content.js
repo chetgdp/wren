@@ -71,6 +71,62 @@ let readSentences = []; // sentence text per block index
 let rangeCache = new Map(); // block index -> Range | null
 let currentBlock = 0; // start of the last painted range (paragraph jumps)
 let lit = [];
+let selectedSentenceRangeKey = null;
+let seekSequence = 0;
+let latestPositionEpoch = null;
+let domInvalidationPending = false;
+let domInvalidationObserver = null;
+
+function clearReadCache() {
+  readElements = [];
+  readSentences = [];
+  rangeCache = new Map();
+  if (sentenceHl) sentenceHl.clear();
+  selectedSentenceRangeKey = null;
+  for (const el of lit) el.style.background = el.__vmBg ?? "";
+  lit = [];
+}
+
+function scheduleReadCacheInvalidation() {
+  if (domInvalidationPending) return;
+  domInvalidationPending = true;
+  queueMicrotask(() => {
+    domInvalidationPending = false;
+    clearReadCache();
+  });
+}
+
+function observeReadableDom() {
+  if (domInvalidationObserver || !document.body) return;
+  domInvalidationObserver = new MutationObserver((mutations) => {
+    for (const mutation of mutations) {
+      // Highlighting uses inline style and CSS Custom Highlight ranges; do
+      // not treat those extension-owned updates as page content changes.
+      if (mutation.type === "attributes" && mutation.attributeName === "style")
+        continue;
+      if (mutation.type === "childList" || mutation.type === "characterData") {
+        scheduleReadCacheInvalidation();
+        return;
+      }
+      if (mutation.type === "attributes") {
+        const target = mutation.target;
+        if (target instanceof Element && target.closest("#voice-ml-overlay"))
+          continue;
+        scheduleReadCacheInvalidation();
+        return;
+      }
+    }
+  });
+  domInvalidationObserver.observe(document.body, {
+    subtree: true,
+    childList: true,
+    characterData: true,
+    attributes: true,
+    attributeFilter: ["class", "id", "role", "hidden", "aria-hidden"],
+  });
+}
+
+observeReadableDom();
 
 const sentenceHl = typeof Highlight === "undefined" ? null : new Highlight();
 let hlStyleReady = false;
@@ -123,7 +179,7 @@ function sentenceRange(i) {
   return result;
 }
 
-function highlight(range) {
+function highlight(range, instant = false) {
   let want = [];
   if (range) currentBlock = range[0];
   if (range && readElements.length) {
@@ -132,7 +188,8 @@ function highlight(range) {
       if (i >= 0) want.push(readElements[i]);
     want = [...new Set(want)]; // sentences share elements; style once
   }
-  if (sentenceHl) {
+  const rangeKey = range ? `${range[0]}:${range[1]}` : null;
+  if (sentenceHl && rangeKey !== selectedSentenceRangeKey) {
     ensureSentenceStyle();
     sentenceHl.clear();
     if (range) {
@@ -142,6 +199,7 @@ function highlight(range) {
         if (r) sentenceHl.add(r);
       }
     }
+    selectedSentenceRangeKey = rangeKey;
   }
   if (want.length === lit.length && want.every((el, i) => el === lit[i]))
     return;
@@ -153,7 +211,9 @@ function highlight(range) {
     el.style.background = "rgba(255, 214, 90, 0.18)";
   }
   lit = want;
-  lit[0]?.scrollIntoView({ block: "center", behavior: "smooth" });
+  lit[0]?.scrollIntoView({
+    block: "center", behavior: instant ? "instant" : "smooth",
+  });
 }
 
 // The overlay drives this from its /health poll.
@@ -193,19 +253,16 @@ function readPage(fromSelection) {
 }
 
 async function seek(body) {
-  const r = await chrome.runtime.sendMessage({ path: "/seek", body });
-  if (r && r.ok) {
-    // Client playback: the server already dropped its buffer, but audio
-    // scheduled in the offscreen player would keep playing until the first
-    // post-seek segment arrives; cut it now.
-    chrome.runtime
-      .sendMessage({ cmd: "player", action: "flush" })
-      .catch(() => {});
-    highlight([r.block, r.block]);
-    // A /health response captured before the seek can land after this
-    // paint; hold off poll-driven highlights so it can't rubber-band back.
-    window.__voiceMlSeekHold = performance.now() + 1200;
-  }
+  const sequence = ++seekSequence;
+  const r = await chrome.runtime.sendMessage({
+    path: "/seek", body,
+  });
+  if (sequence !== seekSequence || !r || !r.ok) return;
+  chrome.runtime
+    .sendMessage({ cmd: "player", action: "flush" })
+    .catch(() => {});
+  highlight([r.block, r.block], true);
+  window.__voiceMlOverlay?.poll();
 }
 
 // Paragraph jumps: first sentence of the next/previous element relative to
@@ -241,13 +298,19 @@ window.__voiceMlClientState = { playing: false, paused: false };
 chrome.runtime.onMessage.addListener((msg) => {
   if (msg.cmd === "read-page") readPage();
   else if (msg.cmd === "position") {
+    const msgEpoch = msg.epoch;
+    if (Number.isFinite(msgEpoch)) {
+      if (latestPositionEpoch !== null && msgEpoch < latestPositionEpoch)
+        return;
+      latestPositionEpoch = msgEpoch;
+    }
     window.__voiceMlClientState = {
       playing: msg.playing,
       paused: msg.paused,
       rate: msg.rate,
+      epoch: msgEpoch,
     };
-    if (msg.block && !(window.__voiceMlSeekHold > performance.now()))
-      highlight(msg.block);
+    if (msg.block) highlight(msg.block);
   }
 });
 document.addEventListener(

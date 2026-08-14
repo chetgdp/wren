@@ -9,9 +9,8 @@ after the first chunk instead of after the whole message. A new /speak or
 Endpoints (every playback POST takes an optional "channel"; see Channels):
     POST /speak  {"text": "...", "raw": false, "append": false,
                   "speed": 1.5, "channel": "name"} -> {"queued": n}
-                 speed (0.5-3.0) time-stretches output pitch-preserved and
-                 sticks until the next request that sets it (or the --speed
-                 default)
+                 speed (0.5-3.0) time-stretches only this request's output,
+                 pitch-preserved (otherwise the product setting applies)
                  {"blocks": ["...", ...], ...}: indexed blocks; /health then
                  reports which block range is currently audible (read mode)
     POST /stop   {"channel": "name"} stops that channel only; without a
@@ -47,23 +46,6 @@ Endpoints (every playback POST takes an optional "channel"; see Channels):
                  channel's stream, which only exists under
                  --local-player client (404 otherwise, exactly as before
                  channels).
-    GET  /config -> live settings (voice, voices_dir, speed, fx, port,
-                 backend) plus "restart_required": true when a persisted
-                 change needs a daemon restart (model reload / rebind) to
-                 take effect - the manager's cue to restart the child
-    POST /config partial update, e.g. {"speed": 1.4}: validates, persists to
-                 the config file atomically, hot-applies speed and fx, marks
-                 voice/voices_dir/port/backend restart_required; responds
-                 with the same shape as GET /config plus "persisted": a
-                 failed file write leaves the change live in memory and
-                 reports "persisted": false with "persist_error". Unknown
-                 keys are 400 and nothing is written.
-
-Settings live in a JSON config file (--config; default
-~/Library/Application Support/voice-ml/config.json on macOS,
-$XDG_CONFIG_HOME/voice-ml/config.json elsewhere). It is read once at launch
-and rewritten on every accepted POST /config; command-line flags override it
-for one run without being written back.
 
 With --token (or $VOICE_ML_TOKEN), every request must carry
 "Authorization: Bearer <token>"; use it whenever --host exposes the daemon
@@ -91,22 +73,43 @@ Example:
     curl -X POST localhost:8765/speak -d '{"text": "hello there"}'
 """
 
+from abc import ABC, abstractmethod
 import argparse
+import copy
 import hmac
+import io
+import ipaddress
 import json
+import math
 import os
 import queue
 import re
 import subprocess
+import socket
+import stat
 import sys
 import tempfile
 import threading
 import time
 import traceback
-from dataclasses import asdict, dataclass, fields, replace
+import uuid
+from datetime import datetime, timezone
+from dataclasses import asdict, dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
+try:
+    from storage import (
+        MAX_REFERENCE_WAV_BYTES, ManagementFailure, ProductSettings,
+        SettingsStore, VoiceIssue, VoiceLibrary, VoiceLibraryEntry,
+        VoiceLibrarySnapshot,
+    )
+except ModuleNotFoundError:  # package/module execution convenience
+    from .storage import (
+        MAX_REFERENCE_WAV_BYTES, ManagementFailure, ProductSettings,
+        SettingsStore, VoiceIssue, VoiceLibrary, VoiceLibraryEntry,
+        VoiceLibrarySnapshot,
+    )
 
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
@@ -139,9 +142,6 @@ ALLOWED_ORIGIN_SCHEMES = (
 # more likely a client bug than intent.
 SPEED_MIN, SPEED_MAX = 0.5, 3.0
 BACKEND_CHOICES = ("auto", "mlx", "qwen-tts", "qwentts")
-# Keys POST /config persists but cannot hot-apply (model reload or rebind);
-# a persisted drift from the launch snapshot is reported as restart_required.
-RESTART_KEYS = ("voice", "voices_dir", "port", "backend")
 # GET /segment's default long-poll length. The played-report grace window
 # derives from it: a healthy client may sit a full poll cycle before its
 # next played report, so a deadline shorter than the poll timeout would
@@ -159,95 +159,120 @@ MAX_POLL_TIMEOUT = PLAYED_GRACE - 5.0
 CHANNEL_GC_SECONDS = 600.0
 CHANNEL_NAME_RE = re.compile(r"[a-z0-9_-]{1,32}\Z")
 LOCAL_CHANNEL = "local"
+@dataclass(frozen=True)
+class VoiceProfile:
+    """Validated daemon-owned voice metadata and stable source files."""
+
+    id: str
+    display_name: str
+    root_path: str
+    audio_path: str
+    transcript_path: str
+    transcript: str
+    audio: bytes | None = None
+    def __post_init__(self):
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", self.id):
+            raise ValueError(
+                "voice id must be 1-128 URL-safe filename characters")
+        if not isinstance(self.display_name, str) or not self.display_name.strip():
+            raise ValueError("voice display name must not be empty")
+        if not isinstance(self.transcript, str) or not self.transcript.strip():
+            raise ValueError("voice transcript must not be empty")
+        if self.audio is not None and not isinstance(self.audio, bytes):
+            raise ValueError("voice audio payload must be bytes")
+        if self.audio is None:
+            root = Path(self.root_path).expanduser().resolve()
+            audio = Path(self.audio_path).expanduser().resolve()
+            transcript = Path(self.transcript_path).expanduser().resolve()
+            if not root.is_dir():
+                raise ValueError(f"voice root does not exist: {root}")
+            for kind, path in (("audio", audio),
+                               ("transcript", transcript)):
+                try:
+                    path.relative_to(root)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"voice {kind} path is outside its root: "
+                        f"{path}") from exc
+                if not path.is_file():
+                    raise ValueError(
+                        f"voice {kind} file does not exist: {path}")
+        else:
+            root = Path(os.path.abspath(
+                os.path.expanduser(self.root_path)))
+            audio = Path(os.path.abspath(
+                os.path.expanduser(self.audio_path)))
+            transcript = Path(os.path.abspath(
+                os.path.expanduser(self.transcript_path)))
+        object.__setattr__(self, "root_path", str(root))
+        object.__setattr__(self, "audio_path", str(audio))
+        object.__setattr__(self, "transcript_path", str(transcript))
 
 
-@dataclass
-class Config:
-    """The config surface: exactly these fields, in this order. The file
-    doubles as a hand-edited UI, so daemon rewrites keep it pretty-printed
-    and stably ordered (field order) instead of mangling whatever the user
-    laid out.
 
-    Construction validates types and ranges (ValueError), so a Config in
-    hand is always well-formed. File-existence checks (the voice's wav+txt)
-    are separate via with_changes(check_files=True): POST /config must
-    reject an unresolvable voice, but at load the ref-audio resolution
-    already reports a missing file with the transcribe hint.
-    """
+@dataclass(frozen=True)
+class VoiceContext:
+    """Immutable prepared voice state; data is opaque to the daemon."""
 
-    voice: str | None = None
-    voices_dir: str | None = None
-    speed: float = 1.0
-    fx: bool = False
-    port: int = DEFAULT_PORT
-    backend: str = "auto"
+    profile: VoiceProfile
+    data: object
+    identity: object
+
+
+@dataclass(frozen=True)
+class SynthesisSnapshot:
+    """One semantic synthesis state captured atomically at acceptance."""
+
+    context: VoiceContext
+    effects: bool
+    rate: float
+    identity: object = field(init=False)
 
     def __post_init__(self):
-        speed = self.speed
-        if (not isinstance(speed, (int, float)) or isinstance(speed, bool)
-                or not SPEED_MIN <= speed <= SPEED_MAX):
-            raise ValueError(
-                f"speed must be a number in [{SPEED_MIN}, {SPEED_MAX}]")
-        if not isinstance(self.fx, bool):
-            raise ValueError("fx must be a boolean")
-        port = self.port
-        if (not isinstance(port, int) or isinstance(port, bool)
-                or not 1 <= port <= 65535):
-            raise ValueError("port must be an integer in [1, 65535]")
-        if self.backend not in BACKEND_CHOICES:
-            raise ValueError(
-                f"backend must be one of: {', '.join(BACKEND_CHOICES)}")
-        for key in ("voice", "voices_dir"):
-            value = getattr(self, key)
-            if value is not None and not isinstance(value, str):
-                raise ValueError(f"{key} must be a string")
-        if self.voice is not None:
-            # A voice is a bare name resolved inside voices_dir, nothing
-            # else: separators or ".." would let a request read files
-            # outside it.
-            if ("/" in self.voice or "\\" in self.voice
-                    or self.voice in ("", ".", "..")):
-                raise ValueError(
-                    "voice must be a bare name (no path separators or ..)")
-            if self.voices_dir is None:
-                raise ValueError("voice requires voices_dir")
-
-    def with_changes(self, changes, check_files=False):
-        """Error-string API for callers that report instead of raise (POST
-        /config bodies, the config file at load): a partial dict applied on
-        top of self, so voice and voices_dir are checked as the merged
-        pair. Returns (new Config, None) or (None, error message)."""
-        for key in changes:
-            if key not in _CONFIG_FIELDS:
-                return None, f"unknown key: {key}"
-        try:
-            merged = replace(self, **changes)
-        except ValueError as exc:
-            return None, str(exc)
-        if check_files:
-            error = merged.check_voice_files()
-            if error:
-                return None, error
-        return merged, None
-
-    @classmethod
-    def from_dict(cls, raw, check_files=False):
-        """Raw dict merged over the defaults; same return as with_changes."""
-        return cls().with_changes(raw, check_files=check_files)
-
-    def check_voice_files(self):
-        """Error message when the voice's wav or transcript is missing."""
-        if self.voice is None:
-            return None
-        wav = resolve_voice(self.voice, self.voices_dir)
-        if not wav.exists():
-            return f"voice wav not found: {wav}"
-        if not wav.with_suffix(".txt").exists():
-            return f"voice transcript not found: {wav.with_suffix('.txt')}"
-        return None
+        object.__setattr__(
+            self, "identity",
+            (self.context.profile.id, self.context.identity,
+             self.effects, self.rate))
 
 
-_CONFIG_FIELDS = tuple(f.name for f in fields(Config))
+@dataclass(frozen=True)
+class EngineHealth:
+    """Whether synthesis is usable and, when not, its structured error."""
+
+    usable: bool
+    error: object | None = None
+
+
+class SynthesisEngine(ABC):
+    """Backend contract. Every method executes on its SynthWorker."""
+
+    @abstractmethod
+    def prepare(self, profile):
+        """Return a preparation-pinned immutable VoiceContext."""
+
+    @abstractmethod
+    def synthesize(self, context, text, make_path, effects=False):
+        """Yield audio paths using only the supplied immutable context."""
+
+    @abstractmethod
+    def retain(self, context):
+        """Acquire one context pin."""
+
+    @abstractmethod
+    def release(self, context):
+        """Release one context pin."""
+
+    @abstractmethod
+    def health(self):
+        """Return EngineHealth without raising for a known engine failure."""
+
+    @abstractmethod
+    def close(self):
+        """Release backend resources owned by the engine."""
+
+
+
+
 
 
 def stretch_wav(path, speed):
@@ -579,53 +604,229 @@ class SegmentStore:
         return found
 
 
+class _FunctionEngine(SynthesisEngine):
+    """Internal adapter preserving direct Speaker construction in tests."""
+
+    def __init__(self, synth):
+        self._synth = synth
+
+    def prepare(self, profile):
+        return VoiceContext(
+            profile, self._synth, ("function", id(self._synth), profile.id))
+
+    def synthesize(self, context, text, make_path, effects=False):
+        synth = context.data
+        if getattr(synth, "_snapshot_effects", False):
+            return synth(text, make_path, effects)
+        return synth(text, make_path)
+
+    def retain(self, context):
+        pass
+
+    def release(self, context):
+        pass
+
+    def health(self):
+        return EngineHealth(True)
+
+    def close(self):
+        pass
+
+
+def _legacy_profile():
+    # Direct Speaker construction is an internal test convenience and has
+    # no daemon-owned files to validate.
+    profile = object.__new__(VoiceProfile)
+    for name, value in (
+            ("id", "legacy"), ("display_name", "Legacy"),
+            ("root_path", ""), ("audio_path", ""),
+            ("transcript_path", ""), ("transcript", ""),
+            ("audio", None)):
+        object.__setattr__(profile, name, value)
+    return profile
+
+
+class _ControlCall:
+    __slots__ = ("fn", "args", "kwargs", "done", "result", "error")
+
+    def __init__(self, fn, args, kwargs, wait):
+        self.fn = fn
+        self.args = args
+        self.kwargs = kwargs
+        self.done = threading.Event() if wait else None
+        self.result = None
+        self.error = None
+
+    def run(self):
+        try:
+            self.result = self.fn(*self.args, **self.kwargs)
+        except BaseException as exc:
+            self.error = exc
+            if self.done is None:
+                traceback.print_exc()
+        finally:
+            if self.done is not None:
+                self.done.set()
+
+
+class _SnapshotLease:
+    """One acceptance pin shared by all chunks of that accepted request."""
+
+    __slots__ = ("snapshot", "_worker", "_remaining", "_lock",
+                 "_release_context")
+
+    def __init__(self, snapshot, worker, count, release_context=True):
+        self.snapshot = snapshot
+        self._worker = worker
+        self._remaining = count
+        self._lock = threading.Lock()
+        self._release_context = release_context
+
+    def release_one(self):
+        release = False
+        with self._lock:
+            if self._remaining <= 0:
+                return
+            self._remaining -= 1
+            release = self._remaining == 0
+        if release and self._release_context:
+            self._worker.release(self.snapshot.context, wait=False)
+
+
+class _QueueItem:
+    __slots__ = ("epoch", "index", "text", "snapshot", "_lease",
+                 "_released")
+
+    def __init__(self, epoch, index, text, lease):
+        self.epoch = epoch
+        self.index = index
+        self.text = text
+        self.snapshot = lease.snapshot
+        self._lease = lease
+        self._released = False
+
+    def release(self):
+        if not self._released:
+            self._released = True
+            self._lease.release_one()
+
+
 class _Batch:
-    """One in-flight synthesis call: the streaming generator plus the
-    bookkeeping the worker needs to resume it after parking (owner paused
-    past its budget, or lookahead spent)."""
+    """One resumable synthesis call and the snapshot-bound queue items."""
 
-    __slots__ = ("epoch", "gen", "text", "layout", "block", "speed",
-                 "t0", "audio_s")
+    __slots__ = ("epoch", "gen", "text", "layout", "block", "snapshot",
+                 "items", "t0", "audio_s", "_released")
 
-    def __init__(self, epoch, gen, text, layout, block, speed):
+    def __init__(self, epoch, gen, text, layout, block, snapshot, items):
         self.epoch = epoch
         self.gen = gen
         self.text = text
         self.layout = layout
         self.block = block
-        self.speed = speed
+        self.snapshot = snapshot
+        self.items = items
         self.t0 = time.monotonic()
         self.audio_s = 0.0
+        self._released = False
+
+    def release(self):
+        if self._released:
+            return
+        self._released = True
+        for item in self.items:
+            item.release()
 
 
 class SynthWorker:
-    """The one thread that owns the TTS model and renders every Speaker's
-    queued text.
+    """The engine-owning executor shared by every Speaker."""
 
-    MLX streams are thread-local, so the model must load and generate on
-    the same thread; synth_factory runs here for that reason. Speakers
-    register themselves and the worker round-robins over whichever of them
-    is schedulable: has work and lookahead budget left. A paused or
-    fully-rendered Speaker simply stops being scheduled - the worker never
-    blocks on one Speaker's state, so several Speakers (per-utterance
-    channels, later) can share it without a stalled one jamming the rest.
-    """
-
-    # Render at most this many segments past the playhead: enough to hide
-    # per-segment synth latency (the next segment is ready before this one
-    # ends) without free-running a whole page of audio into memory.
     LOOKAHEAD = 2
 
-    def __init__(self, synth_fn=None, synth_factory=None):
-        self._synth = synth_fn
-        self._factory = synth_factory
+    def __init__(self, synth_fn=None, synth_factory=None, engine=None,
+                 engine_factory=None, voice_profile=None):
+        sources = (synth_fn, synth_factory, engine, engine_factory)
+        if sum(source is not None for source in sources) != 1:
+            raise ValueError("pass exactly one synthesis source")
+        self._source = next(source for source in sources
+                            if source is not None)
+        self._source_kind = next(
+            name for name, source in zip(
+                ("synth", "synth_factory", "engine", "engine_factory"),
+                sources) if source is not None)
+        self.initialized = threading.Event()
+        self.initialization_error = None
+        self._profile = voice_profile or _legacy_profile()
+        self._engine = None
+        self._context = None
+        self._profile_pins = {}
+        self._owner = None
         self.ready = threading.Event()
-        if synth_fn is not None:
-            self.ready.set()
         self._cond = threading.Condition()
+        self._controls = []
+        self._prefer_synth = False
         self._speakers = []
-        self._rr = 0  # round-robin cursor so no Speaker starves
+        self._rr = 0
         threading.Thread(target=self._run, daemon=True).start()
+
+    @property
+    def context(self):
+        return self._context
+
+    def control(self, fn, *args, wait=True, **kwargs):
+        """Run backend work on the engine owner, alternating with synthesis."""
+        if threading.get_ident() == self._owner:
+            return fn(*args, **kwargs)
+        call = _ControlCall(fn, args, kwargs, wait)
+        with self._cond:
+            self._controls.append(call)
+            self._cond.notify_all()
+        if not wait:
+            return None
+        call.done.wait()
+        if call.error is not None:
+            raise call.error
+        return call.result
+
+    def prepare(self, profile):
+        return self.control(self._prepare_owned, profile)
+
+    def retain(self, context, wait=True):
+        return self.control(self._retain_owned, context, wait=wait)
+
+    def release(self, context, wait=True):
+        return self.control(self._release_owned, context, wait=wait)
+
+    def is_profile_pinned(self, profile_id):
+        return self.control(
+            lambda: self._profile_pins.get(profile_id, 0) > 0)
+
+    def _prepare_owned(self, profile):
+        context = self._engine.prepare(profile)
+        profile_id = context.profile.id
+        self._profile_pins[profile_id] = (
+            self._profile_pins.get(profile_id, 0) + 1)
+        return context
+
+    def _retain_owned(self, context):
+        self._engine.retain(context)
+        profile_id = context.profile.id
+        self._profile_pins[profile_id] = (
+            self._profile_pins.get(profile_id, 0) + 1)
+
+    def _release_owned(self, context):
+        self._engine.release(context)
+        profile_id = context.profile.id
+        remaining = self._profile_pins.get(profile_id, 0) - 1
+        if remaining > 0:
+            self._profile_pins[profile_id] = remaining
+        else:
+            self._profile_pins.pop(profile_id, None)
+
+    def health(self):
+        return self.control(self._engine.health)
+
+    def close(self):
+        return self.control(self._engine.close)
 
     def register(self, speaker):
         with self._cond:
@@ -633,8 +834,20 @@ class SynthWorker:
             self._cond.notify_all()
 
     def unregister(self, speaker):
-        """Channel GC: a deleted channel's Speaker must stop being
-        scheduled or the worker would keep probing dead state forever."""
+        self.control(self._unregister_owned, speaker)
+
+    def _unregister_owned(self, speaker):
+        batch, speaker._batch = speaker._batch, None
+        if batch is not None:
+            try:
+                batch.gen.close()
+            except Exception as exc:
+                print(f"synth failed: {exc}", file=sys.stderr)
+            finally:
+                batch.release()
+        carry, speaker._carry = speaker._carry, None
+        if carry is not None:
+            carry.release()
         with self._cond:
             if speaker in self._speakers:
                 self._speakers.remove(speaker)
@@ -642,52 +855,54 @@ class SynthWorker:
             self._cond.notify_all()
 
     def wake(self):
-        """Scheduling inputs changed (new work, resume, freed budget):
-        re-evaluate who runs."""
         with self._cond:
             self._cond.notify_all()
 
     def segment_taken(self, speaker, epoch):
-        """Playback pulled a segment off the queue: the playhead advanced,
-        so a unit of lookahead budget is free again. epoch is the popped
-        segment's; a stale segment pulled after reset_budget re-based the
-        accounting must not free budget the new epoch never charged, or the
-        worker transiently renders past LOOKAHEAD."""
         with self._cond:
             if epoch == speaker._inflight_epoch and speaker._inflight > 0:
                 speaker._inflight -= 1
             self._cond.notify_all()
 
     def reset_budget(self, speaker):
-        """A preemption drained the play queue; nothing is in flight. The
-        accounting re-bases onto the current epoch so charges and frees for
-        older segments become no-ops from here on."""
         with self._cond:
             speaker._inflight = 0
             speaker._inflight_epoch = speaker._epoch
             self._cond.notify_all()
 
+    def _initialize(self):
+        source = self._source
+        if self._source_kind.endswith("factory"):
+            source = source()
+        if not isinstance(source, SynthesisEngine):
+            source = _FunctionEngine(source)
+        self._engine = source
+        prepared = self._prepare_owned(self._profile)
+        self._retain_owned(prepared)
+        self._release_owned(prepared)
+        self._context = prepared
+
     def _run(self):
-        if self._factory is not None:
-            try:
-                self._synth = self._factory()
-            except Exception:
-                traceback.print_exc()
-                print("model load failed; exiting", file=sys.stderr)
-                # os._exit skips atexit; no-op unless qwentts
-                _cleanup_qwentts()
-                os._exit(1)
-            self.ready.set()
+        self._owner = threading.get_ident()
+        try:
+            self._initialize()
+        except BaseException as exc:
+            self.initialization_error = exc
+            traceback.print_exc()
+            print("model load failed; daemon remains available",
+                  file=sys.stderr)
+            _cleanup_qwentts()
+            self.initialized.set()
+            return
+        self.ready.set()
+        self.initialized.set()
         while True:
-            speaker = self._next()
-            # The busy flag covers the instant where text has left the
-            # synth queue but the batch is not visible yet; without it the
-            # machine queue can read "no text, no audio" mid-handoff and
-            # retire a channel that is in fact mid-utterance.
+            kind, value = self._next_action()
+            if kind == "control":
+                value.run()
+                continue
+            speaker = value
             speaker._synth_busy = True
-            # One bad batch must never kill the only synthesis thread: log
-            # it, drop that batch (its generator unwinds here, on the
-            # model's thread), re-base the speaker's budget, and move on.
             try:
                 self._advance(speaker)
             except Exception:
@@ -699,20 +914,30 @@ class SynthWorker:
                         batch.gen.close()
                     except Exception:
                         pass
+                    batch.release()
                 self.reset_budget(speaker)
             finally:
                 speaker._synth_busy = False
 
-    def _next(self):
-        """Block until some Speaker is runnable and pick it fairly."""
+    def _next_action(self):
+        """Alternate ready controls and synthesis so neither can starve."""
         with self._cond:
             while True:
+                runnable = None
                 count = len(self._speakers)
                 for i in range(count):
-                    speaker = self._speakers[(self._rr + i) % count]
-                    if speaker._synth_runnable():
+                    candidate = self._speakers[(self._rr + i) % count]
+                    if candidate._synth_runnable():
                         self._rr = (self._rr + i + 1) % count
-                        return speaker
+                        runnable = candidate
+                        break
+                if self._controls and (
+                        runnable is None or not self._prefer_synth):
+                    self._prefer_synth = True
+                    return "control", self._controls.pop(0)
+                if runnable is not None:
+                    self._prefer_synth = False
+                    return "synth", runnable
                 self._cond.wait()
 
     def _advance(self, speaker):
@@ -729,127 +954,116 @@ class SynthWorker:
 
     def _start_batch(self, speaker):
         if speaker._carry is not None:
-            epoch, idx, text = speaker._carry
+            item = speaker._carry
             speaker._carry = None
         else:
             try:
-                epoch, idx, text = speaker._synth_q.get_nowait()
+                item = speaker._synth_q.get_nowait()
             except queue.Empty:
                 return None
-        if epoch != speaker._epoch:
+        if item.epoch != speaker._epoch:
+            item.release()
             return None
-        parts = [text]
-        idxs = [] if idx is None else [idx]
-        # Coalesce backlog that queued up behind a previous synthesis:
-        # every generate call pays a prefill proportional to the
-        # reference length, so batching backlog into one call pays it
-        # once instead of per sentence. The first chunk of an epoch is
-        # never coalesced; it is sized small for fast first audio.
-        # Coalescing only ever reads this Speaker's own queue, so
-        # utterances never merge across Speakers.
+        epoch = item.epoch
+        snapshot = item.snapshot
+        items = [item]
+        parts = [item.text]
+        idxs = [] if item.index is None else [item.index]
         if epoch == speaker._last_synth_epoch:
-            total = len(text)
+            total = len(item.text)
             while total < speaker._max_chars:
                 try:
-                    item = speaker._synth_q.get_nowait()
+                    next_item = speaker._synth_q.get_nowait()
                 except queue.Empty:
                     break
-                next_epoch, next_idx, next_text = item
-                if next_epoch < epoch:
-                    continue  # stale, drop
-                if next_epoch > epoch:
-                    # A preemption queued this mid-coalesce; it belongs
-                    # to the new epoch, not this dying batch.
-                    speaker._carry = item
+                if next_item.epoch < epoch:
+                    next_item.release()
+                    continue
+                if (next_item.epoch > epoch
+                        or next_item.snapshot.identity != snapshot.identity):
+                    speaker._carry = next_item
                     break
-                parts.append(next_text)
-                if next_idx is not None:
-                    idxs.append(next_idx)
-                total += len(next_text) + 1
-            text = " ".join(parts)
-        if epoch != speaker._epoch:  # preempted during coalesce
+                items.append(next_item)
+                parts.append(next_item.text)
+                if next_item.index is not None:
+                    idxs.append(next_item.index)
+                total += len(next_item.text) + 1
+        if epoch != speaker._epoch:
+            for queued in items:
+                queued.release()
             return None
+        text = " ".join(parts)
         speaker._last_synth_epoch = epoch
-        # A coalesced batch spans several blocks. Each streamed segment
-        # is tagged with the sentence range it is estimated to cover, so
-        # the reported position tracks the audible sentence, not the
-        # whole batch. Falls back to the full range when the parts/index
-        # pairing is broken (mixed indexed and plain-text chunks).
         block = (idxs[0], idxs[-1]) if idxs else None
-        layout = (list(zip(idxs, (len(p) for p in parts)))
+        layout = (list(zip(idxs, (len(part) for part in parts)))
                   if idxs and len(idxs) == len(parts) else None)
         print(f'synthesizing ({len(text)} chars, '
-              f'{speaker.pending()} queued): "{text}"',
-              flush=True)
-        # Speed is read once per batch: mid-stream changes would jump rate.
-        return _Batch(epoch, self._synth(text, speaker._make_path),
-                      text, layout, block, speaker.speed)
+              f'{speaker.pending()} queued): "{text}"', flush=True)
+        try:
+            gen = self._engine.synthesize(
+                snapshot.context, text, speaker._make_path, snapshot.effects)
+        except Exception:
+            for queued in items:
+                queued.release()
+            raise
+        return _Batch(epoch, gen, text, layout, block, snapshot, items)
 
     def _pump(self, speaker, batch):
-        """Pull segments from the batch until it finishes, its Speaker
-        stops being schedulable (parked, resumable later), or a preemption
-        makes it stale."""
         while True:
             if batch.epoch != speaker._epoch:
                 self._discard(speaker, batch)
                 return
             if not speaker._synth_schedulable():
-                return  # parked; playback progress or resume re-schedules
+                return
             try:
                 path = next(batch.gen)
             except StopIteration:
                 self._finish(speaker, batch)
                 return
-            if batch.epoch != speaker._epoch:  # preempted: abandon it
+            if batch.epoch != speaker._epoch:
                 self._discard(speaker, batch)
                 return
-            if batch.speed != 1.0:
+            if batch.snapshot.rate != 1.0:
                 try:
-                    # Before _wav_seconds so the block-position math
-                    # and rate calibration see playback durations.
-                    stretch_wav(path, batch.speed)
+                    stretch_wav(path, batch.snapshot.rate)
                 except Exception as exc:
                     print(f"time-stretch failed ({exc}); playing at "
                           "1.0x", file=sys.stderr)
             seg_start = batch.audio_s
             batch.audio_s += _wav_seconds(path)
-            # Unknown/zero segment duration: report the whole batch.
-            seg_block = (block_span(batch.layout, seg_start, batch.audio_s,
-                                    speaker._chars_per_sec)
-                         if batch.layout and batch.audio_s > seg_start
-                         else batch.block)
+            seg_block = (block_span(
+                batch.layout, seg_start, batch.audio_s,
+                speaker._chars_per_sec)
+                if batch.layout and batch.audio_s > seg_start
+                else batch.block)
             with self._cond:
-                # A preemption may have re-based the accounting since the
-                # epoch check above; a segment of the old epoch stays
-                # uncharged (it will be popped as stale, also uncharged).
                 if batch.epoch == speaker._inflight_epoch:
                     speaker._inflight += 1
             speaker._play_q.put((batch.epoch, path, seg_block))
+            # Re-enter the fair scheduler between streamed segments so
+            # queued controls and other Speakers cannot starve.
+            return
 
     def _discard(self, speaker, batch):
         speaker._batch = None
-        # close() runs the generator's unwind here, on the model's thread.
         try:
             batch.gen.close()
         except Exception as exc:
             print(f"synth failed: {exc}", file=sys.stderr)
+        finally:
+            batch.release()
 
     def _finish(self, speaker, batch):
         speaker._batch = None
+        batch.release()
         wall = time.monotonic() - batch.t0
         print(f"  {batch.audio_s:.1f}s audio in {wall:.1f}s"
-              f" (RTF {batch.audio_s / wall:.2f})",
-              flush=True)
-        # Recalibrate the highlight's speech-rate estimate from this
-        # batch. Only un-preempted batches measure the full text; the
-        # EMA smooths pause/punctuation noise between batches and the
-        # clamp rejects degenerate wavs (silence, decode failures).
+              f" (RTF {batch.audio_s / wall:.2f})", flush=True)
         if batch.epoch == speaker._epoch and batch.audio_s > 0:
             measured = len(batch.text) / batch.audio_s
             if 5.0 <= measured <= 30.0:
-                speaker._chars_per_sec = (0.5 * speaker._chars_per_sec
-                                          + 0.5 * measured)
-
+                speaker._chars_per_sec = (
+                    0.5 * speaker._chars_per_sec + 0.5 * measured)
 
 class Speaker:
     """Per-utterance queue and playback state; synthesis itself runs on a
@@ -870,20 +1084,22 @@ class Speaker:
 
     def __init__(self, synth_fn=None, play_fn=None, max_chars=MAX_CHUNK_CHARS,
                  first_chars=FIRST_CHUNK_CHARS, synth_factory=None, speed=1.0,
-                 worker=None):
+                 worker=None, engine=None, engine_factory=None,
+                 voice_profile=None):
         if worker is None:
-            if (synth_fn is None) == (synth_factory is None):
-                raise ValueError(
-                    "pass exactly one of synth_fn or synth_factory")
-            worker = SynthWorker(synth_fn=synth_fn,
-                                 synth_factory=synth_factory)
+            sources = (synth_fn, synth_factory, engine, engine_factory)
+            if sum(source is not None for source in sources) != 1:
+                raise ValueError("pass exactly one synthesis source")
+            worker = SynthWorker(
+                synth_fn=synth_fn, synth_factory=synth_factory,
+                engine=engine, engine_factory=engine_factory,
+                voice_profile=voice_profile)
         self._worker = worker
         self.ready = worker.ready
         self._play = play_fn or default_player()
         self._max_chars = max_chars
         self._first_chars = first_chars
-        # Playback rate; read once per synth batch. Mutated by speak(speed=)
-        # so a request's speed persists for everything after it.
+        # Daemon default rate. Request overrides live only in their snapshot.
         self.speed = speed
         self._lock = threading.Lock()
         self._epoch = 0
@@ -893,6 +1109,7 @@ class Speaker:
         self._current = None
         self._current_block = None
         self._blocks = None  # last blocks-speak, kept for /seek
+        self._blocks_snapshot = None
         self._last_played = None  # block index most recently started
         self._counter = 0
         self._last_synth_epoch = -1
@@ -931,25 +1148,61 @@ class Speaker:
         threading.Thread(target=self._play_loop, daemon=True).start()
         self._worker.register(self)
 
-    def speak(self, text=None, append=False, blocks=None, speed=None):
-        """blocks: list of (index, text) pairs; the index of whatever is
-        currently audible is exposed via current_block() so clients can
-        highlight it. Plain text is a single index-less block."""
-        if speed is not None:
-            self.speed = speed
+    def speak(self, text=None, append=False, blocks=None, speed=None,
+              snapshot=None):
+        """Queue text with one immutable, already-retained snapshot.
+
+        Direct Speaker callers may omit snapshot; that internal convenience
+        captures and retains the worker's current context here. HTTP callers
+        always pass the App-captured snapshot.
+        """
         if blocks is None:
             blocks = [(None, text)]
-        items = self._chunks_for(blocks)
+        chunks = self._chunks_for(blocks)
+        release_context = snapshot is not None
+        if snapshot is None:
+            self.ready.wait()
+            snapshot = SynthesisSnapshot(
+                self._worker.context, False,
+                self.speed if speed is None else speed)
+            # The legacy callable adapter has no backend registration to pin.
+            # Keeping this direct-test convenience synchronous preserves the
+            # pre-existing acceptance/preemption and backlog timing.
+            release_context = not isinstance(
+                self._worker._engine, _FunctionEngine)
+            if release_context:
+                self._worker.retain(snapshot.context)
+        if not chunks:
+            if release_context:
+                self._worker.release(snapshot.context, wait=False)
+            return 0
+        lease = _SnapshotLease(
+            snapshot, self._worker, len(chunks),
+            release_context=release_context)
         with self._lock:
             if not append:
                 self._preempt_locked()
-                indexed = [(i, t) for i, t in blocks if i is not None]
-                self._blocks = indexed or None
+                self._replace_blocks_locked(blocks, snapshot)
             epoch = self._epoch
-            for idx, chunk in items:
-                self._synth_q.put((epoch, idx, chunk))
+            for idx, chunk in chunks:
+                self._synth_q.put(_QueueItem(
+                    epoch, idx, chunk, lease))
         self._worker.wake()
-        return len(items)
+        return len(chunks)
+
+    def _replace_blocks_locked(self, blocks, snapshot):
+        old = self._blocks_snapshot
+        indexed = [(index, text) for index, text in blocks
+                   if index is not None]
+        if indexed:
+            self._worker.retain(snapshot.context)
+            self._blocks = indexed
+            self._blocks_snapshot = snapshot
+        else:
+            self._blocks = None
+            self._blocks_snapshot = None
+        if old is not None:
+            self._worker.release(old.context, wait=False)
 
     def _chunks_for(self, blocks):
         items = []
@@ -976,10 +1229,13 @@ class Speaker:
         self._current_block = None
 
     def clear_blocks(self):
-        """Cross-channel preemption: a later /seek must not resurrect text
-        that a preempt-all already nuked."""
+        """Prevent a later seek from resurrecting preempted channel text."""
         with self._lock:
+            old = self._blocks_snapshot
             self._blocks = None
+            self._blocks_snapshot = None
+        if old is not None:
+            self._worker.release(old.context, wait=False)
 
     def seek(self, delta=None, target=None):
         """Jump within the last blocks-speak by preempting and requeueing
@@ -1006,11 +1262,16 @@ class Speaker:
                     cur = lo
                 target = cur + delta
             target = min(max(lo, target), hi)
+            snapshot = self._blocks_snapshot
+            chunks = self._chunks_for(
+                [(i, t) for i, t in blocks if i >= target])
+            self._worker.retain(snapshot.context)
+            lease = _SnapshotLease(snapshot, self._worker, len(chunks))
             self._preempt_locked()
             epoch = self._epoch
-            for idx, chunk in self._chunks_for(
-                    [(i, t) for i, t in blocks if i >= target]):
-                self._synth_q.put((epoch, idx, chunk))
+            for idx, chunk in chunks:
+                self._synth_q.put(_QueueItem(
+                    epoch, idx, chunk, lease))
             # Until the new audio starts, this target is the position a
             # follow-up relative seek must be based on; leaving it None
             # would send the next j/k back to the start of the document.
@@ -1022,11 +1283,16 @@ class Speaker:
         with self._lock:
             self._epoch += 1
             self._drain()
+            old = self._blocks_snapshot
+            self._blocks = None
+            self._blocks_snapshot = None
             self._worker.reset_budget(self)
             self._terminate_current()
             if hasattr(self._play, "invalidate"):
                 self._play.invalidate()
             self._resume_locked()
+        if old is not None:
+            self._worker.release(old.context, wait=False)
         self._worker.wake()
 
     def pause(self):
@@ -1075,10 +1341,10 @@ class Speaker:
         return self._synth_q.qsize() + self._play_q.qsize()
 
     def _synth_runnable(self):
-        """Worker-side: anything to do for this Speaker right now? A stale
-        parked batch counts as work - the worker must discard it (the
-        generator's unwind has to run on the model's thread)."""
+        """Run stale parked state even when the channel gate is closed."""
         if self._batch is not None and self._batch.epoch != self._epoch:
+            return True
+        if self._carry is not None and self._carry.epoch != self._epoch:
             return True
         has_work = (self._batch is not None or self._carry is not None
                     or not self._synth_q.empty())
@@ -1128,12 +1394,17 @@ class Speaker:
         return used
 
     def _drain(self):
-        for q in (self._synth_q, self._play_q):
-            while True:
-                try:
-                    q.get_nowait()
-                except queue.Empty:
-                    break
+        while True:
+            try:
+                item = self._synth_q.get_nowait()
+            except queue.Empty:
+                break
+            item.release()
+        while True:
+            try:
+                self._play_q.get_nowait()
+            except queue.Empty:
+                break
 
     def _terminate_current(self):
         current = self._current
@@ -1148,9 +1419,9 @@ class Speaker:
         return os.path.join(self._tmpdir, f"{self._counter}.wav")
 
     def close(self):
-        """Channel GC: stop, detach from the shared worker, and end the
-        play loop. The Speaker must not be used afterwards."""
+        """Stop, release seek state, detach, and end the play loop."""
         self.stop()
+        self.clear_blocks()
         self._worker.unregister(self)
         self._play_q.put(None)
 
@@ -1511,7 +1782,6 @@ class ChannelManager:
         self._gc_seconds = gc_seconds
         self._tick = tick
         self._worker = local_speaker._worker
-        # /speak's speed is sticky daemon-wide: one knob, every channel.
         self.speed = local_speaker.speed
         self.queue = MachineQueue(clock=clock, grace=grace)
         self.queue.on_change = self._worker.wake
@@ -1607,15 +1877,15 @@ class ChannelManager:
         st = self._state(ch)
         return st["rendered"] > 0 or st["released"] > 0 or st["has_text"]
 
-    def speak(self, name, text=None, blocks=None, append=False, speed=None):
-        if speed is not None:
-            self.set_speed(speed)
+    def speak(self, name, text=None, blocks=None, append=False, speed=None,
+              snapshot=None):
         ch = self._acquire(name)
         try:
             if not append:
                 self.preempt_all(keep=name)
-            queued = ch.speaker.speak(text=text, blocks=blocks,
-                                      append=append)
+            queued = ch.speaker.speak(
+                text=text, blocks=blocks, append=append, speed=speed,
+                snapshot=snapshot)
             self.queue.enqueue(name)
             return queued
         finally:
@@ -1820,32 +2090,200 @@ class ChannelManager:
             ch.speaker.close()
 
 
+@dataclass(frozen=True)
+class _SynthesisState:
+    context: VoiceContext
+    effects: bool
+    rate: float
+
+
+@dataclass
+class _ManagementOperation:
+    id: str
+    kind: str
+    phase: str
+    fingerprint: str = field(repr=False)
+    target: str | None = None
+    progress: object | None = None
+    error: dict | None = None
+    response: dict | None = None
+    status: int = field(default=202, repr=False)
+    done: threading.Event = field(
+        default_factory=threading.Event, repr=False)
+
+    def snapshot(self):
+        result = {"id": self.id, "kind": self.kind, "phase": self.phase}
+        if self.target is not None:
+            result["target"] = self.target
+        if self.progress is not None:
+            result["progress"] = copy.deepcopy(self.progress)
+        if self.error is not None:
+            result["error"] = copy.deepcopy(self.error)
+        if self.response is not None:
+            result["response"] = copy.deepcopy(self.response)
+        return result
+
+
+class ManagementOperations:
+    """Instance-local idempotency and single-mutation coordinator."""
+
+    def __init__(self, changed=None):
+        self._changed = changed or (lambda: None)
+        self._lock = threading.RLock()
+        self._records = {}
+        self._active_id = None
+
+    @staticmethod
+    def fingerprint(method, path, body):
+        canonical = json.dumps(
+            body, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+            allow_nan=False)
+        return f"{method.upper()}\n{path}\n{canonical}"
+
+    def _conflict(self, code, message, detail):
+        raise ManagementFailure(
+            code, message, detail=detail, recoverable=True, status=409)
+
+    def _reserve(self, request_id, kind, method, path, body, target):
+        fingerprint = self.fingerprint(method, path, body)
+        with self._lock:
+            existing = self._records.get(request_id)
+            if existing is not None:
+                if existing.fingerprint != fingerprint:
+                    self._conflict(
+                        "request_id_conflict",
+                        "That request ID was already used for another action.",
+                        {"request_id": request_id})
+                return existing, True
+            if self._active_id is not None:
+                active = self._records[self._active_id]
+                self._conflict(
+                    "operation_busy",
+                    "Another voice or settings action is still in progress.",
+                    {"active_operation": active.snapshot()})
+            operation = _ManagementOperation(
+                request_id, kind, "pending", fingerprint, target=target)
+            self._records[request_id] = operation
+            self._active_id = request_id
+        self._changed()
+        return operation, False
+
+    def _set_phase(self, operation, phase, *, progress=None):
+        with self._lock:
+            operation.phase = phase
+            operation.progress = progress
+        self._changed()
+
+    @staticmethod
+    def _safe_error(exc):
+        if isinstance(exc, ManagementFailure):
+            return exc.as_dict(), exc.status
+        traceback.print_exc()
+        return {
+            "code": "management_internal_error",
+            "message": "The daemon could not complete the action.",
+            "detail": None,
+            "recoverable": True,
+        }, 500
+
+    def _finish(self, operation, runner):
+        try:
+            self._set_phase(operation, "preparing")
+
+            def transition(phase, progress=None):
+                self._set_phase(operation, phase, progress=progress)
+
+            response = copy.deepcopy(runner(operation.id, transition))
+            with self._lock:
+                operation.response = response
+                operation.status = 200
+                operation.phase = "succeeded"
+                if self._active_id == operation.id:
+                    self._active_id = None
+                operation.done.set()
+        except BaseException as exc:
+            error, status = self._safe_error(exc)
+            with self._lock:
+                operation.error = copy.deepcopy(error)
+                operation.status = status
+                operation.phase = "failed"
+                if self._active_id == operation.id:
+                    self._active_id = None
+                operation.done.set()
+        self._changed()
+
+    def submit(self, request_id, kind, method, path, body, target, runner):
+        operation, replay = self._reserve(
+            request_id, kind, method, path, body, target)
+        if not replay:
+            threading.Thread(
+                target=self._finish, args=(operation, runner),
+                name=f"management-{kind}", daemon=True).start()
+        return operation.snapshot(), replay
+
+    def execute(self, request_id, kind, method, path, body, target, runner):
+        operation, replay = self._reserve(
+            request_id, kind, method, path, body, target)
+        if not replay:
+            self._finish(operation, runner)
+        else:
+            operation.done.wait()
+        with self._lock:
+            return operation.snapshot(), operation.status, replay
+
+
+    def active(self):
+        with self._lock:
+            operation = (self._records.get(self._active_id)
+                         if self._active_id is not None else None)
+            return operation.snapshot() if operation is not None else None
+
+    def result(self, request_id):
+        with self._lock:
+            operation = self._records.get(request_id)
+            return operation.snapshot() if operation is not None else None
+
+
 class App:
     """Shared server state. speaker is attached once the model finishes
     loading, so the server can come up (and report status) immediately."""
 
-    def __init__(self, model_id="", token=None, segments=None,
-                 config_path=None, config=None):
+    def __init__(self, model_id="", token=None, segments=None, *,
+                 backend="auto", host=HOST, port=DEFAULT_PORT,
+                 voices_dir=None, library=None, settings_store=None,
+                 settings=None):
+        self.instance_id = str(uuid.uuid4()).upper()
+        self.started_at = (
+            datetime.now(timezone.utc).isoformat(timespec="seconds")
+            .replace("+00:00", "Z"))
+        self.capabilities = [
+            "state-v2", "voice-list", "voice-activate", "settings-v2",
+            "staged-import", "segment-player",
+        ]
         self.model_id = model_id
+        self.backend = backend
+        self.host = host
+        self.port = port
+        self.voices_dir = str(
+            Path(voices_dir).expanduser().resolve()
+            if voices_dir is not None else "")
         self.token = token
-        self.segments = segments  # SegmentStore when --local-player client
+        self.segments = segments
         self.speaker = None
-        self.config_path = config_path  # None: don't persist (tests)
-        self.config = config if config is not None else Config()
-        # Launch snapshot of the restart-only keys; /config reports
-        # restart_required once the persisted value drifts from it. Flag
-        # overrides stay out of this on purpose: they are one-off and the
-        # file is the truth a restart would come back to.
-        self.applied = {k: getattr(self.config, k) for k in RESTART_KEYS}
-        self.fx_enabled = self.config.fx  # live; read by wrap_fx
-        # POST /config does read-validate-update-save; serialize it so
-        # concurrent posts can't interleave a stale config into a save.
-        self.config_lock = threading.Lock()
-        # Channel routing is built on first use (or eagerly by main), so a
-        # server that never sees a channel field behaves exactly as it did
-        # before channels existed.
+        self._startup_settings = settings or ProductSettings()
+        self.library = library
+        self.settings_store = settings_store
+        self._state_lock = threading.RLock()
+        self._revision = 1
+        self._lifecycle = {"phase": "starting", "message": None}
+        self._last_error = None
+        self.operations = ManagementOperations(self._operation_changed)
+        # Acceptance, settings commits, and active-context swaps linearize
+        # on this one lock.
+        self._synthesis_lock = threading.RLock()
+        self._synthesis_state = None
         self.channels = None
-        self.channel_opts = {}  # test hook: short clocks and windows
+        self.channel_opts = {}
         self._channels_lock = threading.Lock()
 
     def ensure_channels(self):
@@ -1855,6 +2293,297 @@ class App:
                                                **self.channel_opts)
         return self.channels
 
+    def _state_locked(self):
+        state = self._synthesis_state
+        if state is None:
+            if self.speaker is None or not self.speaker.ready.is_set():
+                raise RuntimeError("synthesis engine is not ready")
+            settings = self._settings_snapshot()
+            state = _SynthesisState(
+                self.speaker._worker.context, settings["effects"],
+                settings["default_synthesis_rate"])
+            # The worker's startup-active pin is adopted by this state.
+            self._synthesis_state = state
+        return state
+
+    def capture_synthesis_snapshot(self, rate=None):
+        """Linearization point for one accepted /speak request."""
+        with self._synthesis_lock:
+            state = self._state_locked()
+            snapshot = SynthesisSnapshot(
+                state.context, state.effects,
+                state.rate if rate is None else rate)
+            self.speaker._worker.retain(snapshot.context)
+            return snapshot
+
+    def commit_synthesis_settings(self, rate=None, effects=None):
+        """Atomically publish daemon defaults for future acceptances."""
+        with self._synthesis_lock:
+            state = self._state_locked()
+            state = _SynthesisState(
+                state.context,
+                state.effects if effects is None else effects,
+                state.rate if rate is None else rate)
+            self._synthesis_state = state
+            self.speaker.speed = state.rate
+            if self.channels is not None:
+                self.channels.set_speed(state.rate)
+
+    def commit_synthesis_context(self, context):
+        """Non-failing active pointer swap; caller owns pin transitions."""
+        with self._synthesis_lock:
+            old = self._state_locked()
+            self._synthesis_state = _SynthesisState(
+                context, old.effects, old.rate)
+            self.speaker._worker._context = context
+            return old.context
+
+    def synthesis_settings(self):
+        with self._synthesis_lock:
+            state = self._state_locked()
+            return state.rate, state.effects
+
+    def is_profile_captured(self, profile_id):
+        """Guard deletion while any preparation/state/work pin exists."""
+        speaker = self.speaker
+        if speaker is None or not speaker.ready.is_set():
+            return False
+        return speaker._worker.is_profile_pinned(profile_id)
+
+    def _bump_revision(self):
+        with self._state_lock:
+            self._revision += 1
+
+    def _operation_changed(self):
+        self._bump_revision()
+
+    def configure_storage(self, library, settings_store):
+        with self._state_lock:
+            self.library = library
+            self.settings_store = settings_store
+            self._revision += 1
+
+    def set_lifecycle(self, phase, message=None, error=None):
+        if phase not in {
+                "starting", "loading", "ready", "degraded", "failed"}:
+            raise ValueError(f"invalid lifecycle phase: {phase}")
+        lifecycle = {"phase": phase, "message": message}
+        with self._state_lock:
+            if (lifecycle == self._lifecycle
+                    and error == self._last_error):
+                return
+            self._lifecycle = lifecycle
+            self._last_error = error
+            self._revision += 1
+
+    def meta_snapshot(self):
+        return {
+            "service": "wren",
+            "protocol_version": 2,
+            "instance_id": self.instance_id,
+            "started_at": self.started_at,
+            "capabilities": list(self.capabilities),
+        }
+
+    @staticmethod
+    def _snapshot_value(value):
+        if isinstance(value, dict):
+            return dict(value)
+        if hasattr(value, "to_dict"):
+            return value.to_dict()
+        try:
+            return asdict(value)
+        except TypeError:
+            return value
+
+    def voices_snapshot(self):
+        library = self.library
+        if library is None:
+            return {"revision": 0, "voices": []}
+        snapshot = library.snapshot()
+        if isinstance(snapshot, dict):
+            return snapshot
+        voices = [
+            self._snapshot_value(voice)
+            for voice in snapshot.voices
+        ]
+        return {"revision": snapshot.revision, "voices": voices}
+
+    def _settings_snapshot(self):
+        store = self.settings_store
+        if store is None:
+            settings = self._startup_settings.as_dict()
+            if self._synthesis_state is not None:
+                settings.update(
+                    active_voice=(
+                        self._synthesis_state.context.profile.id),
+                    effects=self._synthesis_state.effects,
+                    default_synthesis_rate=self._synthesis_state.rate,
+                )
+            return settings
+        settings = store.snapshot()
+        return self._snapshot_value(settings)
+
+    def _engine_failure(self):
+        speaker = self.speaker
+        if speaker is None or not speaker.ready.is_set():
+            return None
+        health = speaker._worker.health()
+        if health.usable:
+            return None
+        raw = health.error if isinstance(health.error, dict) else {}
+        detail = raw or {"engine_error": repr(health.error)}
+        return {
+            "code": raw.get("code", "engine_unavailable"),
+            "message": "The synthesis engine is unavailable.",
+            "detail": detail,
+            "recoverable": True,
+        }
+
+    def _playback_snapshot(self, ready):
+        speaker = self.speaker
+        if not ready or speaker is None:
+            return {"pending": 0, "speaking": False, "paused": False}
+        manager = self.channels
+        if manager is None:
+            return {
+                "pending": speaker.pending(),
+                "speaking": speaker.speaking(),
+                "paused": speaker.paused(),
+            }
+        channels = manager.snapshot()
+        local = channels.get(LOCAL_CHANNEL, {})
+        return {
+            "pending": sum(channel["pending"]
+                           for channel in channels.values()),
+            "speaking": any(channel["speaking"]
+                            for channel in channels.values()),
+            "paused": bool(local.get("paused", False)),
+        }
+
+    def state_snapshot(self, *, include_operation=True):
+        engine_error = self._engine_failure()
+        if engine_error is not None:
+            self.set_lifecycle(
+                "degraded", "The synthesis engine is unavailable.",
+                engine_error)
+        with self._synthesis_lock:
+            speaker_ready = (
+                self.speaker is not None and self.speaker.ready.is_set()
+                and engine_error is None)
+            if speaker_ready and self._synthesis_state is None:
+                self._state_locked()
+            settings = self._settings_snapshot()
+            active_voice = None
+            if speaker_ready and self._synthesis_state is not None:
+                active_voice = self._synthesis_state.context.profile.id
+                effects = self._synthesis_state.effects
+                rate = self._synthesis_state.rate
+            else:
+                effects = settings["effects"]
+                rate = settings["default_synthesis_rate"]
+            synthesis = {
+                "ready": speaker_ready,
+                "active_voice": active_voice,
+                "effects": effects,
+                "default_synthesis_rate": rate,
+                "backend": self.backend,
+                "model": self.model_id,
+                "host": self.host,
+                "port": self.port,
+                "voices_dir": self.voices_dir,
+            }
+        voices_revision = self.voices_snapshot()["revision"]
+        with self._state_lock:
+            return {
+                "revision": self._revision,
+                "voices_revision": voices_revision,
+                "lifecycle": dict(self._lifecycle),
+                "synthesis": synthesis,
+                "operation": (
+                    self.operations.active() if include_operation else None),
+                "playback": self._playback_snapshot(speaker_ready),
+                "last_error": (
+                    dict(self._last_error)
+                    if self._last_error is not None else None),
+            }
+
+    def activate_voice_runner(self, voice_id):
+        def run(operation_id, transition):
+            del operation_id
+            profile = self.library.resolve_ready(voice_id)
+            speaker = self.speaker
+            if speaker is None or not speaker.ready.is_set():
+                raise ManagementFailure(
+                    "engine_not_ready",
+                    "The synthesis engine is not ready.",
+                    recoverable=True, status=503)
+            worker = speaker._worker
+            try:
+                prepared = worker.prepare(profile)
+            except ManagementFailure:
+                raise
+            except BaseException as exc:
+                raise ManagementFailure(
+                    "voice_prepare_failed",
+                    f"{profile.display_name} could not be prepared.",
+                    detail=repr(exc), recoverable=True, status=500) from exc
+            with self._synthesis_lock:
+                transition("committing")
+                activate_voice(
+                    profile, lambda ignored: prepared,
+                    lambda ignored: self.settings_store.set_active_voice(
+                        voice_id),
+                    self.commit_synthesis_context,
+                    worker.retain, worker.release)
+                self._bump_revision()
+            return self.state_snapshot()
+        return run
+
+    def import_voice_runner(self, staging_id, voice_id, display_name):
+        def run(operation_id, transition):
+            transition("committing")
+            self.library.import_staged(
+                staging_id, voice_id, display_name, operation_id)
+            self._bump_revision()
+            return self.voices_snapshot()
+        return run
+
+    def update_voice_runner(self, voice_id, display_name):
+        def run(operation_id, transition):
+            del operation_id
+            transition("committing")
+            self.library.update_metadata(voice_id, display_name)
+            self._bump_revision()
+            return self.voices_snapshot()
+        return run
+
+    def delete_voice_runner(self, voice_id):
+        def run(operation_id, transition):
+            active = self._settings_snapshot().get("active_voice")
+            transition("committing")
+            self.library.delete(
+                voice_id, operation_id, active_voice=active,
+                is_captured=self.is_profile_captured)
+            self._bump_revision()
+            return self.voices_snapshot()
+        return run
+
+    def settings_runner(self, changes):
+        def run(operation_id, transition):
+            del operation_id
+            transition("committing")
+            with self._synthesis_lock:
+                settings = self.settings_store.update(**changes)
+                rate = settings.default_synthesis_rate
+                effects = settings.effects
+                if self.speaker is not None and self.speaker.ready.is_set():
+                    self.commit_synthesis_settings(
+                        rate=rate, effects=effects)
+                self._bump_revision()
+            return self.state_snapshot(include_operation=False)
+        return run
+
 
 class _Handler(BaseHTTPRequestHandler):
     app = None  # injected via make_server
@@ -1862,19 +2591,165 @@ class _Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
-    def _json(self, code, obj):
+    def _json(self, code, obj, *, headers=None):
         body = json.dumps(obj).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
-        self.wfile.write(body)
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def _is_v2_path(self):
+        path = urlsplit(self.path).path
+        return (
+            path in {"/meta", "/state", "/voices", "/settings"}
+            or path.startswith("/voices/")
+            or path.startswith("/operations/"))
+
+    def _v2_error(self, failure):
+        self._json(failure.status, {"error": failure.as_dict()})
+
+    def _route_failure(self, code, message, *, status=400, detail=None):
+        self._v2_error(ManagementFailure(
+            code, message, detail=detail, recoverable=True, status=status))
+
+    @staticmethod
+    def _reject_json_constant(value):
+        raise ValueError(f"non-finite JSON number: {value}")
+
+    @classmethod
+    def _reject_nonfinite(cls, value):
+        if isinstance(value, float):
+            if not math.isfinite(value):
+                raise ValueError("non-finite JSON number")
+            return
+        if isinstance(value, dict):
+            for child in value.values():
+                cls._reject_nonfinite(child)
+        elif isinstance(value, list):
+            for child in value:
+                cls._reject_nonfinite(child)
+
+    def _management_body(self):
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            self._route_failure(
+                "request_content_length_invalid",
+                "The request Content-Length is invalid.")
+            return None
+        if length < 0 or length > MAX_BODY_BYTES:
+            remaining = min(max(length, 0), 8 * MAX_BODY_BYTES)
+            while remaining:
+                chunk = self.rfile.read(min(remaining, 65536))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+            self._route_failure(
+                "request_body_too_large",
+                "The request body is too large.", status=413)
+            return None
+        try:
+            body = json.loads(
+                self.rfile.read(length) or b"{}",
+                parse_constant=self._reject_json_constant)
+            self._reject_nonfinite(body)
+        except (ValueError, json.JSONDecodeError):
+            self._route_failure(
+                "request_json_invalid",
+                "The request body is not valid JSON.")
+            return None
+        if not isinstance(body, dict):
+            self._route_failure(
+                "request_body_invalid",
+                "The request body must be a JSON object.")
+            return None
+        return body
+
+    def _request_id(self):
+        request_id = self.headers.get("Idempotency-Key", "")
+        if request_id.strip():
+            return request_id
+        self._route_failure(
+            "idempotency_key_required",
+            "A nonempty Idempotency-Key header is required.")
+        return None
+
+    @staticmethod
+    def _validate_body(body, allowed, required=()):
+        unknown = sorted(set(body) - set(allowed))
+        missing = sorted(set(required) - set(body))
+        if unknown:
+            raise ManagementFailure(
+                "request_field_unknown",
+                "The request contains an unknown field.",
+                detail={"fields": unknown}, recoverable=True, status=400)
+        if missing:
+            raise ManagementFailure(
+                "request_field_required",
+                "The request is missing a required field.",
+                detail={"fields": missing}, recoverable=True, status=400)
+
+    @staticmethod
+    def _voice_id(value, field_name="voice"):
+        if (not isinstance(value, str)
+                or CHANNEL_NAME_RE.fullmatch(value) is None):
+            raise ManagementFailure(
+                "voice_id_invalid",
+                "The voice ID must use lowercase letters, digits, _ or -.",
+                detail={"field": field_name}, recoverable=True, status=400)
+        return value
+
+    @staticmethod
+    def _display_name(value):
+        if not isinstance(value, str) or not value.strip():
+            raise ManagementFailure(
+                "voice_display_name_invalid",
+                "The voice display name must not be empty.",
+                detail={"field": "display_name"},
+                recoverable=True, status=400)
+        return value.strip()
+
+    def _management_get(self, path):
+        if path == "/meta":
+            self._json(200, self.app.meta_snapshot())
+            return
+        if path == "/state":
+            self._json(200, self.app.state_snapshot())
+            return
+        if path == "/voices":
+            self._json(200, self.app.voices_snapshot())
+            return
+        if path.startswith("/operations/"):
+            request_id = unquote(path[len("/operations/"):])
+            operation = self.app.operations.result(request_id)
+            if operation is None:
+                raise ManagementFailure(
+                    "operation_result_unknown",
+                    "No operation with that ID exists in this daemon "
+                    "instance.",
+                    detail={"request_id": request_id},
+                    recoverable=True, status=404)
+            self._json(200, operation)
+            return
+        raise ManagementFailure(
+            "route_not_found",
+            "The management route does not exist.",
+            recoverable=True, status=404)
 
     def _origin_allowed(self):
         origin = self.headers.get("Origin", "")
         if not origin or origin.startswith(ALLOWED_ORIGIN_SCHEMES):
             return True
-        self._json(403, {"error": "origin not allowed"})
+        if self._is_v2_path():
+            self._route_failure(
+                "origin_not_allowed",
+                "This browser Origin is not allowed.", status=403)
+        else:
+            self._json(403, {"error": "origin not allowed"})
         return False
 
     def _authorized(self):
@@ -1884,22 +2759,91 @@ class _Handler(BaseHTTPRequestHandler):
         supplied = self.headers.get("Authorization", "")
         if hmac.compare_digest(supplied, f"Bearer {token}"):
             return True
-        self._json(401, {"error": "unauthorized"})
+        if self._is_v2_path():
+            self._route_failure(
+                "authorization_required",
+                "A valid bearer token is required.", status=401)
+        else:
+            self._json(401, {"error": "unauthorized"})
         return False
 
-    def _config_payload(self):
-        """GET and POST /config both return this: the live settings plus an
-        unambiguous restart_required so a manager (the future Swift app)
-        knows whether the daemon must be restarted to apply what the file
-        now says."""
-        app = self.app
-        live = asdict(app.config)
-        if app.speaker is not None:  # speed is live (also moved by /speak)
-            live["speed"] = app.speaker.speed
-        live["fx"] = app.fx_enabled
-        live["restart_required"] = any(
-            getattr(app.config, k) != app.applied[k] for k in RESTART_KEYS)
-        return live
+    @staticmethod
+    def _management_methods(path):
+        if path in {"/meta", "/state", "/voices"}:
+            return ("GET",)
+        if path == "/settings":
+            return ("PATCH",)
+        if path.startswith("/operations/"):
+            return ("GET",)
+        if path in {"/voices/activate", "/voices/import"}:
+            return ("POST",)
+        if path.startswith("/voices/"):
+            return ("PATCH", "DELETE")
+        return ()
+
+    def _management_exception(self, exc):
+        if isinstance(exc, ManagementFailure):
+            self._v2_error(exc)
+            return
+        traceback.print_exception(type(exc), exc, exc.__traceback__)
+        self._route_failure(
+            "internal_error",
+            "The daemon could not process the management request.",
+            status=500)
+
+    def _method_not_allowed(self, allowed):
+        self._json(
+            405,
+            {"error": {
+                "code": "method_not_allowed",
+                "message": "The HTTP method is not allowed for this route.",
+                "detail": None,
+                "recoverable": True,
+            }},
+            headers={"Allow": ", ".join(allowed)})
+
+    def _dispatch_management(self, method, path):
+        if not self._is_v2_path():
+            return False
+        try:
+            if not self._origin_allowed() or not self._authorized():
+                return True
+            allowed = self._management_methods(path)
+            if method not in allowed:
+                self._method_not_allowed(allowed)
+            elif method == "GET":
+                self._management_get(path)
+            else:
+                self._management_mutation(method, path)
+        except Exception as exc:
+            self._management_exception(exc)
+        return True
+
+    def _unsupported_method(self):
+        path = urlsplit(self.path).path
+        if self._dispatch_management(self.command, path):
+            return
+        if not self._origin_allowed() or not self._authorized():
+            return
+        self._method_not_allowed(("GET", "POST"))
+
+    def send_error(self, code, message=None, explain=None):
+        if int(code) == 501:
+            self._unsupported_method()
+            return
+        super().send_error(code, message, explain)
+
+    def _accept_speak(self, mgr, speaker, channel, speed, **kwargs):
+        """Capture exactly once, then transfer that pin to the queue."""
+        snapshot = self.app.capture_synthesis_snapshot(rate=speed)
+        try:
+            if mgr is not None:
+                return mgr.speak(
+                    channel or LOCAL_CHANNEL, snapshot=snapshot, **kwargs)
+            return speaker.speak(snapshot=snapshot, **kwargs)
+        except BaseException:
+            speaker._worker.release(snapshot.context, wait=False)
+            raise
 
     def _segment(self, query):
         channel = query.get("channel", [None])[0]
@@ -1958,13 +2902,97 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _management_mutation(self, method, path):
+        body = self._management_body()
+        if body is None:
+            return
+        request_id = self._request_id()
+        if request_id is None:
+            return
+        try:
+            if self.app.library is None or self.app.settings_store is None:
+                raise ManagementFailure(
+                    "storage_not_ready",
+                    "Voice storage is not ready.",
+                    recoverable=True, status=503)
+            if method == "POST" and path == "/voices/activate":
+                self._validate_body(body, {"voice"}, {"voice"})
+                voice_id = self._voice_id(body["voice"])
+                operation, _ = self.app.operations.submit(
+                    request_id, "activate_voice", method, path, body,
+                    voice_id, self.app.activate_voice_runner(voice_id))
+                self._json(202, operation)
+                return
+            if method == "POST" and path == "/voices/import":
+                self._validate_body(
+                    body, {"staging_id", "id", "display_name"},
+                    {"staging_id", "id", "display_name"})
+                staging_id = self._voice_id(
+                    body["staging_id"], "staging_id")
+                voice_id = self._voice_id(body["id"], "id")
+                display_name = self._display_name(body["display_name"])
+                operation, _ = self.app.operations.submit(
+                    request_id, "import_voice", method, path, body,
+                    voice_id, self.app.import_voice_runner(
+                        staging_id, voice_id, display_name))
+                self._json(202, operation)
+                return
+            if method == "PATCH" and path.startswith("/voices/"):
+                voice_id = self._voice_id(
+                    unquote(path[len("/voices/"):]), "id")
+                self._validate_body(
+                    body, {"display_name"}, {"display_name"})
+                display_name = self._display_name(body["display_name"])
+                operation, _ = self.app.operations.submit(
+                    request_id, "update_voice", method, path, body,
+                    voice_id, self.app.update_voice_runner(
+                        voice_id, display_name))
+                self._json(202, operation)
+                return
+            if method == "DELETE" and path.startswith("/voices/"):
+                voice_id = self._voice_id(
+                    unquote(path[len("/voices/"):]), "id")
+                self._validate_body(body, set())
+                operation, _ = self.app.operations.submit(
+                    request_id, "delete_voice", method, path, body,
+                    voice_id, self.app.delete_voice_runner(voice_id))
+                self._json(202, operation)
+                return
+            if method == "PATCH" and path == "/settings":
+                allowed = {"effects", "default_synthesis_rate"}
+                self._validate_body(body, allowed)
+                if not body:
+                    raise ManagementFailure(
+                        "request_field_required",
+                        "At least one settings field is required.",
+                        detail={"fields": sorted(allowed)},
+                        recoverable=True, status=400)
+                operation, status, _ = self.app.operations.execute(
+                    request_id, "update_settings", method, path, body,
+                    None, self.app.settings_runner(body))
+                if operation["phase"] == "failed":
+                    self._json(status, {"error": operation["error"]})
+                else:
+                    self._json(status, operation["response"])
+                return
+            raise ManagementFailure(
+                "route_not_found",
+                "The management route does not exist.",
+                recoverable=True, status=404)
+        except ManagementFailure as failure:
+            self._v2_error(failure)
+
     def do_GET(self):
+        url = urlsplit(self.path)
+        if self._dispatch_management("GET", url.path):
+            return
         if not self._origin_allowed() or not self._authorized():
             return
-        url = urlsplit(self.path)
         if url.path == "/health":
             speaker = self.app.speaker
-            ready = speaker is not None and speaker.ready.is_set()
+            loaded = speaker is not None and speaker.ready.is_set()
+            engine_health = (speaker._worker.health() if loaded else None)
+            ready = loaded and engine_health.usable
             payload = {
                 "ok": True,
                 "ready": ready,
@@ -1977,13 +3005,12 @@ class _Handler(BaseHTTPRequestHandler):
                          if ready and speaker.current_block() else None,
                 "speed": speaker.speed if ready else None,
             }
+            if engine_health is not None and not engine_health.usable:
+                payload["engine_error"] = engine_health.error
             mgr = self.app.channels
             if ready and mgr is not None:
                 channels = mgr.snapshot()
                 local = channels[LOCAL_CHANNEL]
-                # Top-level fields keep their pre-channel meaning for
-                # existing clients: machine-wide activity plus the local
-                # channel's pause/position.
                 payload.update(
                     pending=sum(c["pending"] for c in channels.values()),
                     speaking=any(c["speaking"] for c in channels.values()),
@@ -2001,20 +3028,26 @@ class _Handler(BaseHTTPRequestHandler):
                                or payload["speaking"]),
                 }}
             self._json(200, payload)
-        elif url.path == "/config":
-            self._json(200, self._config_payload())
         elif url.path == "/segment":
             self._segment(parse_qs(url.query))
         else:
             self._json(404, {"error": "not found"})
 
     def do_POST(self):
+        path = urlsplit(self.path).path
+        if self._dispatch_management("POST", path):
+            return
         if not self._origin_allowed() or not self._authorized():
             return
         speaker = self.app.speaker
         if speaker is None or not speaker.ready.is_set():
             self._json(503, {"error": "model still loading"})
             return
+        if self.path == "/speak":
+            engine_health = speaker._worker.health()
+            if not engine_health.usable:
+                self._json(503, {"error": engine_health.error})
+                return
         try:
             length = int(self.headers.get("Content-Length", 0))
         except ValueError:
@@ -2083,39 +3116,6 @@ class _Handler(BaseHTTPRequestHandler):
             else:
                 self._json(200, {"ok": True, "block": target})
             return
-        if self.path == "/config":
-            app = self.app
-            with app.config_lock:
-                updated, error = app.config.with_changes(body,
-                                                         check_files=True)
-                if error:
-                    self._json(400, {"error": error})
-                    return
-                app.config = updated
-                # Hot-apply what playback picks up mid-flight; the rest sits
-                # in the file and is reported via restart_required.
-                if "speed" in body:
-                    if mgr is not None:  # one knob, every channel
-                        mgr.set_speed(float(body["speed"]))
-                    else:
-                        speaker.speed = float(body["speed"])
-                if "fx" in body:
-                    app.fx_enabled = body["fx"]
-                # Persist last: the change is already live in memory, so a
-                # failed write (disk full, permissions) must not undo it or
-                # crash the daemon - it is reported instead.
-                persist_error = None
-                if app.config_path is not None:
-                    try:
-                        save_config(app.config_path, app.config)
-                    except OSError as exc:
-                        persist_error = str(exc)
-                payload = self._config_payload()
-                payload["persisted"] = persist_error is None
-                if persist_error is not None:
-                    payload["persist_error"] = persist_error
-                self._json(200, payload)
-            return
         if self.path == "/pause":
             if mgr is not None:
                 paused = mgr.pause(channel or LOCAL_CHANNEL)
@@ -2158,12 +3158,9 @@ class _Handler(BaseHTTPRequestHandler):
             if not indexed:
                 self._json(200, {"queued": 0})
                 return
-            if mgr is not None:
-                queued = mgr.speak(channel or LOCAL_CHANNEL, blocks=indexed,
-                                   append=append, speed=speed)
-            else:
-                queued = speaker.speak(blocks=indexed, append=append,
-                                       speed=speed)
+            queued = self._accept_speak(
+                mgr, speaker, channel, speed, blocks=indexed,
+                append=append)
             self._json(200, {"queued": queued})
             return
         text = body.get("text")
@@ -2175,15 +3172,29 @@ class _Handler(BaseHTTPRequestHandler):
         if not text:
             self._json(200, {"queued": 0})
             return
-        if mgr is not None:
-            queued = mgr.speak(channel or LOCAL_CHANNEL, text=text,
-                               append=append, speed=speed)
-        else:
-            queued = speaker.speak(text, append=append, speed=speed)
+        queued = self._accept_speak(
+            mgr, speaker, channel, speed, text=text, append=append)
         self._json(200, {"queued": queued})
+
+    def do_PATCH(self):
+        path = urlsplit(self.path).path
+        if self._dispatch_management("PATCH", path):
+            return
+        if not self._origin_allowed() or not self._authorized():
+            return
+        self._json(404, {"error": "not found"})
+
+    def do_DELETE(self):
+        path = urlsplit(self.path).path
+        if self._dispatch_management("DELETE", path):
+            return
+        if not self._origin_allowed() or not self._authorized():
+            return
+        self._json(404, {"error": "not found"})
 
 
 def make_server(app, port=DEFAULT_PORT, host=HOST):
+    _require_management_token(host, app.token)
     handler = type("Handler", (_Handler,), {"app": app})
     return ThreadingHTTPServer((host, port), handler)
 
@@ -2199,110 +3210,304 @@ def resolve_device(device="auto"):
     return "cpu"
 
 
-def load_qwen_tts_synth(model_id, ref_audio, ref_text, language, device="auto"):
-    """PyTorch backend (Qwen/Qwen3-TTS-*): cuda > mps > cpu."""
-    import torch
+def _effect_paths(paths, enabled, ring_freq, ring_mix):
+    if not enabled:
+        yield from paths
+        return
     import soundfile as sf
-    from qwen_tts import Qwen3TTSModel
+    from fx import DroidFX
 
-    from progress_bar import attach_progress_bar
-
-    device = resolve_device(device)
-    print(f"device: {device}")
-    if device == "cpu":
-        dtype = torch.float32
-    elif device == "cuda" and torch.cuda.get_device_capability()[0] < 8:
-        dtype = torch.float16  # pre-Ampere: no native bf16
-    else:
-        dtype = torch.bfloat16
-    model = Qwen3TTSModel.from_pretrained(
-        model_id,
-        device_map=device,
-        dtype=dtype,
-        attn_implementation="sdpa",
-    )
-    attach_progress_bar(model)
-
-    def synth(text, make_path):
-        wavs, sr = model.generate_voice_clone(
-            text=text,
-            language=language,
-            ref_audio=str(ref_audio),
-            ref_text=ref_text,
-        )
-        path = make_path()
-        sf.write(path, wavs[0], sr)
+    fx = DroidFX(ring_freq=ring_freq, ring_mix=ring_mix)
+    for path in paths:
+        audio, sr = sf.read(path, dtype="float32")
+        if audio.ndim == 2:
+            audio = audio.T
+        processed = fx.process(audio, sr)
+        sf.write(
+            path, processed.T if processed.ndim == 2 else processed, sr)
         yield path
 
-    return synth
+
+class _ResidentEngine(SynthesisEngine):
+    """Shared lifecycle for in-process resident models."""
+
+    def __init__(self, backend, ring_freq=40.0, ring_mix=0.12):
+        self.backend = backend
+        self._owner = threading.get_ident()
+        self._pins = {}
+        self._closed = False
+        self._ring_freq = ring_freq
+        self._ring_mix = ring_mix
+
+    def _check_owner(self):
+        if threading.get_ident() != self._owner:
+            raise RuntimeError(
+                f"{self.backend} engine accessed outside its SynthWorker")
+        if self._closed:
+            raise RuntimeError(f"{self.backend} engine is closed")
+
+    def _context(self, profile, data, digest):
+        context = VoiceContext(
+            profile=profile, data=data,
+            identity=(self.backend, digest))
+        self._pins[id(context)] = 1
+        return context
+
+    def retain(self, context):
+        self._check_owner()
+        key = id(context)
+        pins = self._pins.get(key)
+        if pins is None:
+            raise RuntimeError("cannot retain a released voice context")
+        self._pins[key] = pins + 1
+
+    def release(self, context):
+        self._check_owner()
+        key = id(context)
+        pins = self._pins.get(key)
+        if pins is None or pins <= 0:
+            raise RuntimeError("voice context pin underflow")
+        if pins == 1:
+            del self._pins[key]
+            self._released(context)
+        else:
+            self._pins[key] = pins - 1
+
+    def _released(self, context):
+        pass
+
+    def _effects(self, paths, enabled):
+        yield from _effect_paths(
+            paths, enabled, self._ring_freq, self._ring_mix)
+
+    def health(self):
+        self._check_owner()
+        return EngineHealth(usable=True)
+
+    def close(self):
+        self._check_owner()
+        self._pins.clear()
+        self._closed = True
 
 
-def load_mlx_synth(model_id, ref_audio, ref_text, language):
-    """MLX backend (mlx-community/Qwen3-TTS-* and other mlx-audio
-    conversions)."""
-    import numpy as np
-    import soundfile as sf
-    from mlx_audio.tts.utils import load_model
-    from mlx_audio.utils import load_audio
+def _profile_digest(profile, audio):
+    """Stable identity for conditioning content, independent of its path."""
+    import hashlib
 
-    # NOTE: MLX streams are thread-local; this must be called from the same
-    # thread that will run synth (Speaker's synth_factory handles that).
-    model = load_model(model_id)
+    transcript = profile.transcript.encode("utf-8")
+    digest = hashlib.sha256()
+    digest.update(b"wren-voice-context-v1\0")
+    digest.update(len(audio).to_bytes(8, "big"))
+    digest.update(audio)
+    digest.update(len(transcript).to_bytes(8, "big"))
+    digest.update(transcript)
+    return digest.hexdigest()
 
-    # Pay per-ref costs once instead of per request. mlx-audio caches the
-    # ref's codec codes and tokens internally, but reloads + resamples the
-    # audio file and recomputes the x-vector speaker embedding over the full
-    # clip on every generate call; with long refs both are significant.
-    ref_audio_arr = load_audio(str(ref_audio), sample_rate=model.sample_rate)
-    if hasattr(model, "extract_speaker_embedding"):
-        original_spk = model.extract_speaker_embedding
-        spk_memo = {}
 
-        def memoized_spk(audio):  # safe: the daemon serves one ref for life
-            if "spk" not in spk_memo:
-                spk_memo["spk"] = original_spk(audio)
-            return spk_memo["spk"]
+def _read_profile_audio(profile):
+    if not profile.transcript.strip():
+        raise ValueError("voice transcript must not be empty")
+    if profile.audio is not None:
+        return profile.audio
+    path = Path(profile.audio_path)
+    fd = None
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise OSError("voice audio is not a regular file")
+        if info.st_size > MAX_REFERENCE_WAV_BYTES:
+            raise ManagementFailure(
+                "voice_audio_too_large",
+                f"{profile.display_name} reference audio is too large.",
+                detail={
+                    "size": info.st_size,
+                    "limit": MAX_REFERENCE_WAV_BYTES,
+                },
+                status=422)
+        payload = bytearray()
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            if len(payload) + len(chunk) > MAX_REFERENCE_WAV_BYTES:
+                raise ManagementFailure(
+                    "voice_audio_too_large",
+                    f"{profile.display_name} reference audio is too large.",
+                    detail={"limit": MAX_REFERENCE_WAV_BYTES},
+                    status=422)
+            payload.extend(chunk)
+        audio = bytes(payload)
+    except ManagementFailure:
+        raise
+    except OSError as exc:
+        raise ValueError(f"cannot read voice audio {path}: {exc}") from exc
+    finally:
+        if fd is not None:
+            os.close(fd)
+    if (len(audio) < 12 or audio[:4] != b"RIFF"
+            or audio[8:12] != b"WAVE"):
+        raise ValueError(f"voice audio is not a WAV file: {path}")
+    return audio
 
-        model.extract_speaker_embedding = memoized_spk
 
-    def synth(text, make_path):
-        # Cap tokens at 2x the expected length: a model that misses the
-        # end-of-speech token (more likely when quantized) otherwise babbles
-        # until mlx-audio's 4096-token default (~5.5 min of audio).
-        # Floor of 32 frames (~2.5s) only matters for very short texts; a
-        # generous floor lets the model babble to it (observed: 20-char texts
-        # consistently padding out to the old 64-frame floor).
-        max_tokens = max(32, estimate_frames(text) * 2)
-        cap_samples = None
-        emitted = 0
-        # stream=True yields audio segments every ~streaming_interval seconds
-        # of audio, so playback starts long before generation finishes.
-        for result in model.generate(
-            text=text,
-            ref_audio=ref_audio_arr,
-            ref_text=ref_text,
-            max_tokens=max_tokens,
-            stream=True,
-            streaming_interval=1.0,
-        ):
-            audio = np.asarray(result.audio)
-            if audio.size == 0:
-                continue
-            sr = getattr(result, "sample_rate", 24000)
-            # codec is 12.5 frames/sec
-            cap_samples = (max_tokens - 1) * sr / 12.5
-            emitted += audio.size
+class QwenTTSEngine(_ResidentEngine):
+    """Resident PyTorch Qwen engine with immutable captured references."""
+
+    def __init__(self, model_id, language, device="auto",
+                 ring_freq=40.0, ring_mix=0.12):
+        super().__init__("qwen-tts", ring_freq, ring_mix)
+        import torch
+        from qwen_tts import Qwen3TTSModel
+        from progress_bar import attach_progress_bar
+
+        self._sf = __import__("soundfile")
+        self._language = language
+        device = resolve_device(device)
+        print(f"device: {device}")
+        if device == "cpu":
+            dtype = torch.float32
+        elif device == "cuda" and torch.cuda.get_device_capability()[0] < 8:
+            dtype = torch.float16
+        else:
+            dtype = torch.bfloat16
+        self._model = Qwen3TTSModel.from_pretrained(
+            model_id,
+            device_map=device,
+            dtype=dtype,
+            attn_implementation="sdpa",
+        )
+        attach_progress_bar(self._model)
+
+    def prepare(self, profile):
+        self._check_owner()
+        encoded = _read_profile_audio(profile)
+        try:
+            audio, sample_rate = self._sf.read(
+                io.BytesIO(encoded), dtype="float32")
+        except Exception as exc:
+            raise ValueError(
+                f"cannot decode captured voice audio: {exc}") from exc
+        if getattr(audio, "size", 0) == 0:
+            raise ValueError("voice audio contains no samples")
+        data = ((audio, sample_rate), profile.transcript)
+        return self._context(
+            profile, data, _profile_digest(profile, encoded))
+
+    def synthesize(self, context, text, make_path, effects=False):
+        self._check_owner()
+        ref_audio, ref_text = context.data
+
+        def generate():
+            wavs, sr = self._model.generate_voice_clone(
+                text=text,
+                language=self._language,
+                ref_audio=ref_audio,
+                ref_text=ref_text,
+            )
             path = make_path()
-            sf.write(path, audio, sr)
+            self._sf.write(path, wavs[0], sr)
             yield path
-        if cap_samples is not None and emitted >= cap_samples:
-            print(f"warning: hit token cap ({max_tokens}); output may be "
-                  f"truncated babble for: {text[:60]!r}", file=sys.stderr)
 
-    return synth
+        yield from self._effects(generate(), effects)
 
 
-# Global reference to the qwentts child process, set once by load_qwentts_synth.
+class MLXEngine(_ResidentEngine):
+    """Resident MLX model; loading and conditioning stay on its owner thread."""
+
+    def __init__(self, model_id, language,
+                 ring_freq=40.0, ring_mix=0.12):
+        super().__init__("mlx", ring_freq, ring_mix)
+        import numpy as np
+        import soundfile as sf
+        from mlx_audio.tts.utils import load_model
+        from mlx_audio.utils import load_audio
+
+        self._np = np
+        self._sf = sf
+        self._load_audio = load_audio
+        self._language = language
+        self._model = load_model(model_id)
+        self._embedding_cache = {}
+        self._extract_embedding = getattr(
+            self._model, "extract_speaker_embedding", None)
+        if self._extract_embedding is not None:
+            original = self._extract_embedding
+
+            def cached_embedding(audio):
+                cached = self._embedding_cache.get(id(audio))
+                if cached is not None:
+                    return cached
+                return original(audio)
+
+            self._model.extract_speaker_embedding = cached_embedding
+
+    def prepare(self, profile):
+        self._check_owner()
+        encoded = _read_profile_audio(profile)
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".wav") as captured:
+                captured.write(encoded)
+                captured.flush()
+                audio = self._load_audio(
+                    captured.name, sample_rate=self._model.sample_rate)
+        except Exception as exc:
+            raise ValueError(
+                f"cannot decode captured voice audio: {exc}") from exc
+        if getattr(audio, "size", 0) == 0:
+            raise ValueError("voice audio contains no samples")
+        if self._extract_embedding is not None:
+            self._embedding_cache[id(audio)] = self._extract_embedding(audio)
+        data = (audio, profile.transcript)
+        return self._context(
+            profile, data, _profile_digest(profile, encoded))
+
+    def _released(self, context):
+        audio, _ = context.data
+        self._embedding_cache.pop(id(audio), None)
+
+    def synthesize(self, context, text, make_path, effects=False):
+        self._check_owner()
+        ref_audio, ref_text = context.data
+        max_tokens = max(32, estimate_frames(text) * 2)
+
+        def generate():
+            cap_samples = None
+            emitted = 0
+            for result in self._model.generate(
+                text=text,
+                ref_audio=ref_audio,
+                ref_text=ref_text,
+                max_tokens=max_tokens,
+                stream=True,
+                streaming_interval=1.0,
+            ):
+                audio = self._np.asarray(result.audio)
+                if audio.size == 0:
+                    continue
+                sr = getattr(result, "sample_rate", 24000)
+                cap_samples = (max_tokens - 1) * sr / 12.5
+                emitted += audio.size
+                path = make_path()
+                self._sf.write(path, audio, sr)
+                yield path
+            if cap_samples is not None and emitted >= cap_samples:
+                print(
+                    f"warning: hit token cap ({max_tokens}); output may be "
+                    f"truncated babble for: {text[:60]!r}",
+                    file=sys.stderr)
+
+        yield from self._effects(generate(), effects)
+
+
+@dataclass
+class _QwenttsRegistration:
+    pins: int
+    last_used: int
+
+
+# qwentts is a single resident child. Kept for signal/atexit cleanup and for
+# startup error paths that cannot yet hold the engine instance.
 _qwentts_process: subprocess.Popen | None = None
 
 
@@ -2315,167 +3520,361 @@ def _pick_free_port():
 
 
 def _cleanup_qwentts():
-    """Terminate the tts-server child if it's still running."""
+    """Terminate the resident tts-server child if it is still running."""
     global _qwentts_process
-    if _qwentts_process and _qwentts_process.poll() is None:
-        _qwentts_process.terminate()
-        try:
-            _qwentts_process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            _qwentts_process.kill()
-            _qwentts_process.wait()
-        _qwentts_process = None
+    process, _qwentts_process = _qwentts_process, None
+    if process is None or process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
 
 
-def load_qwentts_synth(model_id, ref_audio, ref_text, language, device="auto",
-                       qwentts_bin=None, qwentts_model=None,
-                       qwentts_codec=None, qwentts_port=None):
-    """qwentts.cpp backend: spawns tts-server as a child process and proxies
-    synthesis via its OpenAI-compatible HTTP API.
-    """
-    global _qwentts_process
+class QwenttsEngine(SynthesisEngine):
+    """Resident qwentts child with content-addressed, explicitly pinned voices."""
 
-    import atexit
-    import base64
-    import urllib.request
+    CACHE_LIMIT = 16
+    SAMPLE_RATE = 24000
+    SEGMENT_BYTES = SAMPLE_RATE * 2
 
-    # RuntimeError, not SystemExit: this runs in the Speaker synth thread,
-    # whose error paths catch Exception only (SystemExit would silently kill
-    # the thread and leave the daemon serving 503 forever).
-    if not all([qwentts_bin, qwentts_model, qwentts_codec, qwentts_port]):
-        raise RuntimeError(
-            "qwentts backend requires --qwentts-bin, --qwentts-model, "
-            "--qwentts-codec, and --qwentts-port"
-        )
+    def __init__(self, qwentts_bin, qwentts_model, qwentts_codec,
+                 qwentts_port, language, ring_freq=40.0, ring_mix=0.12,
+                 startup_timeout=60):
+        global _qwentts_process
+        import atexit
+        import urllib.error
+        import urllib.request
 
-    # Read the reference WAV and encode it for voice registration.
-    ref_wav_bytes = ref_audio.read_bytes()
-    ref_wav_b64 = base64.b64encode(ref_wav_bytes).decode("ascii")
+        if not all([
+                qwentts_bin, qwentts_model, qwentts_codec, qwentts_port]):
+            raise RuntimeError(
+                "qwentts backend requires --qwentts-bin, --qwentts-model, "
+                "--qwentts-codec, and --qwentts-port")
+        self._owner = threading.get_ident()
+        self._urllib_error = urllib.error
+        self._urllib_request = urllib.request
+        self._base_url = f"http://127.0.0.1:{qwentts_port}"
+        self._ring_freq = ring_freq
+        self._ring_mix = ring_mix
+        self._registrations = {}
+        self._clock = 0
+        self._closed = False
+        self._failure = None
+        self._state_lock = threading.Lock()
+        self._monitor_stop = threading.Event()
 
-    # Build the tts-server command line.
-    cmd = [
-        qwentts_bin,
-        "--model", qwentts_model,
-        "--codec", qwentts_codec,
-        "--host", "127.0.0.1",
-        "--port", str(qwentts_port),
-        "--lang", language,
-    ]
+        cmd = [
+            str(qwentts_bin),
+            "--model", str(qwentts_model),
+            "--codec", str(qwentts_codec),
+            "--host", "127.0.0.1",
+            "--port", str(qwentts_port),
+            "--lang", language,
+        ]
+        print(f"starting tts-server on 127.0.0.1:{qwentts_port}")
+        self._process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL)
+        _qwentts_process = self._process
+        atexit.register(_cleanup_qwentts)
+        if not self._wait_ready(startup_timeout):
+            exited = self._process.poll() is not None
+            self.close()
+            raise RuntimeError(
+                "tts-server exited during startup (see its stderr above)"
+                if exited else
+                f"tts-server did not become ready on port {qwentts_port} "
+                f"within {startup_timeout}s")
+        print(f"tts-server ready on port {qwentts_port}")
+        threading.Thread(
+            target=self._monitor_child, name="qwentts-monitor",
+            daemon=True).start()
 
-    print(f"starting tts-server on 127.0.0.1:{qwentts_port}")
-    # stderr is inherited so model-load failures are visible in the daemon log.
-    _qwentts_process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL)
-    atexit.register(_cleanup_qwentts)
-
-    # Poll until the server answers /health, the child dies, or we time out.
-    startup_timeout = 60
-    def _is_ready(port, timeout):
+    def _wait_ready(self, timeout):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            if _qwentts_process.poll() is not None:
+            if self._process.poll() is not None:
                 return False
             try:
-                urllib.request.urlopen(
-                    f"http://127.0.0.1:{port}/health", timeout=1
-                ).read()
+                response = self._urllib_request.urlopen(
+                    f"{self._base_url}/health", timeout=1)
+                response.read()
+                response.close()
                 return True
             except OSError:
                 time.sleep(0.2)
         return False
 
-    if not _is_ready(qwentts_port, startup_timeout):
-        exited = _qwentts_process.poll() is not None
-        _cleanup_qwentts()
-        raise RuntimeError(
-            "tts-server exited during startup (see its stderr above)" if exited
-            else f"tts-server did not become ready on port {qwentts_port} "
-                 f"within {startup_timeout}s"
-        )
-    print(f"tts-server ready on port {qwentts_port}")
+    def _monitor_child(self):
+        while not self._monitor_stop.wait(0.1):
+            returncode = self._process.poll()
+            if returncode is not None:
+                self._mark_child_exit(returncode)
+                return
 
-    # Register the clone voice once via POST /v1/audio/voices.
-    voice_url = f"http://127.0.0.1:{qwentts_port}/v1/audio/voices"
-    voice_body = json.dumps({
-        "name": "serve_clone",
-        "ref_text": ref_text,
-        "wav_b64": ref_wav_b64,
-    }).encode("utf-8")
-    voice_req = urllib.request.Request(
-        voice_url, data=voice_body,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        resp = urllib.request.urlopen(voice_req, timeout=30)
-        resp.read()
-        print("voice 'serve_clone' registered with tts-server")
-    except OSError as exc:
-        _cleanup_qwentts()
-        raise RuntimeError(f"failed to register voice: {exc}") from exc
+    def _mark_child_exit(self, returncode=None):
+        if returncode is None:
+            returncode = self._process.poll()
+        if returncode is None:
+            return False
+        with self._state_lock:
+            if self._failure is None and not self._closed:
+                self._failure = {
+                    "code": "engine_child_exited",
+                    "message": "qwentts tts-server exited unexpectedly",
+                    "exit_code": returncode,
+                }
+        return True
 
-    import wave
+    def _check_owner(self):
+        if threading.get_ident() != self._owner:
+            raise RuntimeError(
+                "qwentts engine accessed outside its SynthWorker")
+        if self._closed:
+            raise RuntimeError("qwentts engine is closed")
 
-    QWENTTS_SR = 24000  # tts-server pcm is s16le 24 kHz mono
-    SEG_BYTES = QWENTTS_SR * 2  # ~1s per yielded segment, like the mlx path
+    def _ensure_healthy(self):
+        self._check_owner()
+        self._mark_child_exit()
+        with self._state_lock:
+            failure = self._failure
+        if failure is not None:
+            raise RuntimeError(failure["message"])
 
-    def _write_seg(make_path, pcm):
+    def _touch(self, registration):
+        self._clock += 1
+        registration.last_used = self._clock
+
+    def _voice_key(self, profile, audio):
+        return f"wren-{_profile_digest(profile, audio)}"
+
+    def _request(self, path, body=None, method="GET", timeout=30):
+        self._ensure_healthy()
+        request = self._urllib_request.Request(
+            f"{self._base_url}{path}", data=body,
+            headers={"Content-Type": "application/json"},
+            method=method)
+        try:
+            response = self._urllib_request.urlopen(request, timeout=timeout)
+            payload = response.read()
+            response.close()
+            self._mark_child_exit()
+            return payload
+        except OSError as exc:
+            if self._mark_child_exit():
+                raise RuntimeError(
+                    "qwentts tts-server exited unexpectedly") from exc
+            raise RuntimeError(f"qwentts request failed: {exc}") from exc
+
+    def prepare(self, profile):
+        self._ensure_healthy()
+        import base64
+
+        audio = _read_profile_audio(profile)
+        key = self._voice_key(profile, audio)
+        registration = self._registrations.get(key)
+        if registration is None:
+            body = json.dumps({
+                "name": key,
+                "ref_text": profile.transcript,
+                "wav_b64": base64.b64encode(audio).decode("ascii"),
+            }).encode("utf-8")
+            try:
+                self._request(
+                    "/v1/audio/voices", body=body, method="POST", timeout=30)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"failed to register qwentts voice {profile.id}: {exc}"
+                ) from exc
+            registration = _QwenttsRegistration(pins=1, last_used=0)
+            self._registrations[key] = registration
+        else:
+            registration.pins += 1
+        self._touch(registration)
+        self._trim()
+        return VoiceContext(
+            profile=profile, data=key, identity=("qwentts", key))
+
+    def retain(self, context):
+        self._check_owner()
+        registration = self._registrations.get(context.data)
+        if registration is None:
+            raise RuntimeError("cannot retain an evicted qwentts context")
+        registration.pins += 1
+        self._touch(registration)
+
+    def release(self, context):
+        self._check_owner()
+        registration = self._registrations.get(context.data)
+        if registration is None or registration.pins <= 0:
+            raise RuntimeError("qwentts context pin underflow")
+        registration.pins -= 1
+        self._touch(registration)
+        self._trim()
+
+    def _trim(self):
+        while len(self._registrations) > self.CACHE_LIMIT:
+            candidates = [
+                (registration.last_used, key)
+                for key, registration in self._registrations.items()
+                if registration.pins == 0
+            ]
+            if not candidates:
+                return
+            _, key = min(candidates)
+            from urllib.parse import quote
+            escaped_key = quote(key, safe="")
+            try:
+                self._request(
+                    f"/v1/audio/voices/{escaped_key}",
+                    method="DELETE", timeout=10)
+            except RuntimeError as exc:
+                with self._state_lock:
+                    if self._failure is None:
+                        self._failure = {
+                            "code": "voice_eviction_failed",
+                            "message": str(exc),
+                            "voice_key": key,
+                        }
+                return
+            del self._registrations[key]
+
+    def _write_segment(self, make_path, pcm):
+        import wave
+
         path = make_path()
-        with wave.open(path, "wb") as w:
-            w.setnchannels(1)
-            w.setsampwidth(2)
-            w.setframerate(QWENTTS_SR)
-            w.writeframes(pcm)
+        with wave.open(path, "wb") as output:
+            output.setnchannels(1)
+            output.setsampwidth(2)
+            output.setframerate(self.SAMPLE_RATE)
+            output.writeframes(pcm)
         return path
 
-    def synth(text, make_path):
-        """Stream synthesis via tts-server's POST /v1/audio/speech.
-
-        response_format "pcm" streams s16le as it is generated, so segments
-        yield while generation continues (first audio ~engine TTFA instead
-        of after the whole chunk, which "wav" one-shot forced)."""
-        speech_url = f"http://127.0.0.1:{qwentts_port}/v1/audio/speech"
+    def synthesize(self, context, text, make_path, effects=False):
+        self._ensure_healthy()
+        registration = self._registrations.get(context.data)
+        if registration is None or registration.pins <= 0:
+            raise RuntimeError("qwentts context is not pinned for synthesis")
+        self._touch(registration)
         body = json.dumps({
             "input": text,
-            "voice": "serve_clone",
+            "voice": context.data,
             "response_format": "pcm",
         }).encode("utf-8")
-        req = urllib.request.Request(
-            speech_url, data=body,
+        request = self._urllib_request.Request(
+            f"{self._base_url}/v1/audio/speech", data=body,
             headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        try:
-            resp = urllib.request.urlopen(req, timeout=120)
-            buf = b""
-            while True:
-                chunk = resp.read(65536)
-                if not chunk:
-                    break
-                buf += chunk
-                while len(buf) >= SEG_BYTES:
-                    yield _write_seg(make_path, buf[:SEG_BYTES])
-                    buf = buf[SEG_BYTES:]
-            buf = buf[:len(buf) & ~1]  # drop a trailing half-sample
-            if buf:
-                yield _write_seg(make_path, buf)
-        except OSError as exc:
-            if _qwentts_process and _qwentts_process.poll() is not None:
-                raise RuntimeError("tts-server exited unexpectedly") from exc
-            raise RuntimeError(f"synthesis request failed: {exc}") from exc
+            method="POST")
 
-    return synth
+        def generate():
+            try:
+                response = self._urllib_request.urlopen(request, timeout=120)
+                buffer = b""
+                while True:
+                    chunk = response.read(65536)
+                    if not chunk:
+                        break
+                    buffer += chunk
+                    while len(buffer) >= self.SEGMENT_BYTES:
+                        yield self._write_segment(
+                            make_path, buffer[:self.SEGMENT_BYTES])
+                        buffer = buffer[self.SEGMENT_BYTES:]
+                response.close()
+                buffer = buffer[:len(buffer) & ~1]
+                if buffer:
+                    yield self._write_segment(make_path, buffer)
+                if self._mark_child_exit():
+                    raise RuntimeError(
+                        "qwentts tts-server exited unexpectedly")
+            except OSError as exc:
+                if self._mark_child_exit():
+                    raise RuntimeError(
+                        "qwentts tts-server exited unexpectedly") from exc
+                raise RuntimeError(
+                    f"qwentts synthesis request failed: {exc}") from exc
+
+        yield from _effect_paths(
+            generate(), effects, self._ring_freq, self._ring_mix)
+
+    def health(self):
+        self._check_owner()
+        self._mark_child_exit()
+        with self._state_lock:
+            failure = self._failure
+        return EngineHealth(usable=failure is None, error=failure)
+
+    def close(self):
+        global _qwentts_process
+        if self._closed:
+            return
+        if threading.get_ident() != self._owner:
+            raise RuntimeError(
+                "qwentts engine accessed outside its SynthWorker")
+        self._closed = True
+        self._monitor_stop.set()
+        process = self._process
+        if _qwentts_process is process:
+            _qwentts_process = None
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        self._registrations.clear()
 
 
-def wrap_fx(synth, ring_freq, ring_mix, enabled=None):
+def load_qwen_tts_engine(model_id, language, device="auto",
+                         ring_freq=40.0, ring_mix=0.12):
+    return QwenTTSEngine(
+        model_id, language, device, ring_freq, ring_mix)
+
+
+def load_mlx_engine(model_id, language,
+                    ring_freq=40.0, ring_mix=0.12):
+    return MLXEngine(model_id, language, ring_freq, ring_mix)
+
+
+def load_qwentts_engine(model_id, language, device="auto",
+                         qwentts_bin=None, qwentts_model=None,
+                         qwentts_codec=None, qwentts_port=None,
+                         ring_freq=40.0, ring_mix=0.12):
+    del model_id, device
+    return QwenttsEngine(
+        qwentts_bin, qwentts_model, qwentts_codec, qwentts_port, language,
+        ring_freq, ring_mix)
+
+
+def activate_voice(profile, prepare, persist, swap, retain, release):
+    """Transactionally prepare, durably commit, then swap an active context.
+
+    The callbacks are injected so preparation/control stay on the engine
+    executor and persistence can be replaced by Phase 2 without coupling the
+    engine layer to a settings schema.
+    """
+    prepared = prepare(profile)
+    try:
+        persist(profile)
+    except BaseException:
+        release(prepared)
+        raise
+    retain(prepared)
+    previous = swap(prepared)
+    release(prepared)
+    if previous is not None:
+        release(previous)
+    return prepared
+
+
+def wrap_fx(synth, ring_freq, ring_mix):
     """Post-process every synthesized segment through the droid chain.
 
     One stateful DroidFX per synth call: segments of a stream are played
     gaplessly, so the ring-mod carrier and chorus LFO must continue across
     segment boundaries or the joins click. reset() per call keeps unrelated
     utterances from sharing filter tails.
-
-    enabled is a callable checked per synth call so POST /config can toggle
-    fx live without a model reload; None means always on.
     """
     import soundfile as sf
     from fx import DroidFX
@@ -2483,9 +3882,6 @@ def wrap_fx(synth, ring_freq, ring_mix, enabled=None):
     fx = DroidFX(ring_freq=ring_freq, ring_mix=ring_mix)
 
     def wrapped(text, make_path):
-        if enabled is not None and not enabled():
-            yield from synth(text, make_path)
-            return
         fx.reset()
         for path in synth(text, make_path):
             audio, sr = sf.read(path, dtype="float32")
@@ -2517,20 +3913,56 @@ def pick_backend(backend):
     )
 
 
-def load_synth(backend, model_id, ref_audio, ref_text, language, device="auto",
-               qwentts_bin=None, qwentts_model=None,
-               qwentts_codec=None, qwentts_port=None):
+def load_engine(backend, model_id, language, device="auto",
+                qwentts_bin=None, qwentts_model=None,
+                qwentts_codec=None, qwentts_port=None,
+                ring_freq=40.0, ring_mix=0.12):
     backend = pick_backend(backend)
     print(f"model: {model_id} (backend: {backend})")
     if backend == "mlx":
-        return load_mlx_synth(model_id, ref_audio, ref_text, language)
+        return load_mlx_engine(
+            model_id, language, ring_freq, ring_mix)
     if backend == "qwentts":
-        return load_qwentts_synth(
-            model_id, ref_audio, ref_text, language, device,
+        return load_qwentts_engine(
+            model_id, language, device,
             qwentts_bin=qwentts_bin, qwentts_model=qwentts_model,
             qwentts_codec=qwentts_codec, qwentts_port=qwentts_port,
-        )
-    return load_qwen_tts_synth(model_id, ref_audio, ref_text, language, device)
+            ring_freq=ring_freq, ring_mix=ring_mix)
+    return load_qwen_tts_engine(
+        model_id, language, device, ring_freq, ring_mix)
+def load_synth(backend, model_id, ref_audio, ref_text, language, device="auto",
+               qwentts_bin=None, qwentts_model=None,
+               qwentts_codec=None, qwentts_port=None):
+    """Standalone benchmark convenience; the daemon uses load_engine."""
+    ref_audio = Path(ref_audio).expanduser().resolve()
+    transcript_path = ref_audio.with_suffix(".txt")
+    profile_id = ref_audio.stem
+    if not re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", profile_id):
+        import hashlib
+        profile_id = (
+            f"voice-{hashlib.sha256(str(ref_audio).encode()).hexdigest()[:16]}")
+    profile = VoiceProfile(
+        id=profile_id,
+        display_name=ref_audio.stem,
+        root_path=str(ref_audio.parent),
+        audio_path=str(ref_audio),
+        transcript_path=str(transcript_path),
+        transcript=ref_text)
+    engine = load_engine(
+        backend, model_id, language, device,
+        qwentts_bin=qwentts_bin, qwentts_model=qwentts_model,
+        qwentts_codec=qwentts_codec, qwentts_port=qwentts_port)
+    context = engine.prepare(profile)
+    engine.retain(context)
+    engine.release(context)
+
+    def synth(text, make_path):
+        yield from engine.synthesize(context, text, make_path)
+
+    return synth
+
+
 
 
 def resolve_ref_text(ref_audio, ref_text_path):
@@ -2544,75 +3976,72 @@ def resolve_ref_text(ref_audio, ref_text_path):
     return path.read_text().strip()
 
 
-def default_config_path():
+def default_legacy_config_path():
+    """Return the one-time migration source used when --config is omitted."""
     if sys.platform == "darwin":
         return Path.home() / "Library/Application Support/voice-ml/config.json"
     base = os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config"
     return Path(base) / "voice-ml/config.json"
 
 
-def resolve_voice(voice, voices_dir):
-    """A voice name resolves to voices_dir/<name>.wav with its transcript in
-    the sibling .txt - the same layout -r + resolve_ref_text expect."""
-    return Path(voices_dir).expanduser() / f"{voice}.wav"
-
-
-def load_config(path):
-    """File contents merged over the Config defaults. A missing file just
-    means defaults; a hand-broken file (bad JSON, unknown key, bad value) is
-    a startup error naming the file, because the file is hand-edited and a
-    traceback would bury the actual problem."""
-    path = Path(path)
-    if not path.exists():
-        return Config()
+def _is_loopback_host(host):
+    candidate = host.strip().strip("[]")
     try:
-        data = json.loads(path.read_text())
-    except ValueError as exc:
-        raise SystemExit(f"config file {path} is not valid JSON: {exc}")
-    if not isinstance(data, dict):
-        raise SystemExit(f"config file {path} must contain a JSON object")
-    config, error = Config.from_dict(data)
-    if error:
-        raise SystemExit(f"config file {path}: {error}")
-    return config
-
-
-def save_config(path, config):
-    """Atomic write: full JSON to a temp file in the same directory, fsync,
-    then rename over config.json, so a crash mid-save (daemons die by
-    SIGKILL) never leaves a truncated file. Pretty-printed in Config field
-    order with a trailing newline so rewrites don't mangle a hand-kept file."""
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".config-",
-                               suffix=".json.tmp")
-    try:
-        with os.fdopen(fd, "w") as f:
-            json.dump(asdict(config), f, indent=2)
-            f.write("\n")
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, path)
-    except BaseException:
+        return ipaddress.ip_address(
+            candidate.split("%", 1)[0]).is_loopback
+    except ValueError:
         try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+            addresses = {
+                item[4][0].split("%", 1)[0]
+                for item in socket.getaddrinfo(
+                    candidate, None, type=socket.SOCK_STREAM)
+            }
+        except socket.gaierror:
+            return False
+        return bool(addresses) and all(
+            ipaddress.ip_address(address).is_loopback
+            for address in addresses)
 
 
-def effective_settings(config, args):
-    """Flag-over-file merge for the keys flags can override. The flags
-    default to None so an absent flag is distinguishable from an explicit
-    value; flags are one-off dev overrides and are never written back.
-    A flag value that fails Config validation is a startup error."""
-    overrides = {key: getattr(args, key)
-                 for key in ("speed", "fx", "port", "backend")
-                 if getattr(args, key) is not None}
-    try:
-        return replace(config, **overrides)
-    except ValueError as exc:
-        raise SystemExit(str(exc))
+def _require_management_token(host, token):
+    if token or _is_loopback_host(host):
+        return
+    raise SystemExit(
+        "refusing non-loopback --host without authentication: "
+        "set --token or VOICE_ML_TOKEN")
+
+
+def _resolve_startup_voice(
+        library, settings_store, settings, initial_voice=None):
+    """Resolve durable selection, using a stable-ID bootstrap hint if empty."""
+    if settings.active_voice is not None:
+        return settings, library.resolve_ready(settings.active_voice)
+    if initial_voice is None:
+        raise ManagementFailure(
+            "settings_active_voice_required",
+            "Choose a ready voice before synthesis can start.",
+            recoverable=True, status=409)
+    profile = library.resolve_ready(initial_voice)
+    settings = settings_store.set_active_voice(initial_voice)
+    return settings, profile
+
+def _resolve_explicit_startup_voice(
+        library, settings_store, explicit_id):
+    """Reject a flat source that collided with another managed profile."""
+    failure = next((
+        item for item in library.migration_failures
+        if item["id"] == explicit_id
+    ), None)
+    if failure is not None:
+        issue = failure["issue"]
+        raise ManagementFailure(
+            issue["code"], issue["message"], detail=failure,
+            recoverable=True, status=409)
+    profile = library.resolve_ready(explicit_id)
+    settings = settings_store.set_active_voice(explicit_id)
+    return settings, profile
+
+
 
 
 def parse_args():
@@ -2622,45 +4051,39 @@ def parse_args():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("-r", "--ref-audio", type=Path,
-                   help="reference voice clip (~3s wav); overrides the "
-                        "config file's voice/voices_dir")
+                   help="explicit reference voice clip (~3s wav)")
     p.add_argument("--ref-text", type=Path,
                    help="transcript of --ref-audio (default: its sibling .txt)")
-    p.add_argument("--config", type=Path,
-                   help="settings file (default: ~/Library/Application "
-                        "Support/voice-ml/config.json on macOS, "
-                        "$XDG_CONFIG_HOME/voice-ml/config.json elsewhere); "
-                        "flags below override it for this run only")
+    p.add_argument(
+        "--config", type=Path,
+        help="legacy config path used only as a one-time migration source")
+    p.add_argument(
+        "--initial-voice",
+        help="stable voice ID used only when settings have no active voice")
     p.add_argument("-m", "--model", default=DEFAULT_MODEL,
                    help="TTS model id (HF repo)")
     p.add_argument("-b", "--backend", choices=list(BACKEND_CHOICES),
-                   default=None,
-                   help="auto picks whichever backend library is installed "
-                        "(default: config file, or auto)")
+                   default="auto",
+                   help="synthesis backend; auto picks an installed backend")
+    p.add_argument(
+        "--voices-dir", type=Path,
+        help="daemon-owned voice library directory (defaults beside settings)")
     p.add_argument("-l", "--language", default="English",
                    help="language of the text (qwen-tts backend only)")
     p.add_argument("-d", "--device", choices=["auto", "cuda", "mps", "cpu"],
                    default="auto",
                    help="torch device (qwen-tts backend only); auto picks "
                         "cuda > mps > cpu")
-    p.add_argument("--fx", action="store_true", default=None,
-                   help="apply the droid effect chain (fx.py) to all output "
-                        "(default: config file, or off)")
     p.add_argument("--fx-ring-freq", type=float, default=40.0,
                    help="droid ring modulator carrier Hz")
     p.add_argument("--fx-ring-mix", type=float, default=0.12,
                    help="droid ring modulator wet mix 0-1")
-    p.add_argument("-p", "--port", type=int, default=None,
-                   help=f"port to listen on (default: config file, or "
-                        f"{DEFAULT_PORT})")
+    p.add_argument(
+        "-p", "--port", type=int, default=DEFAULT_PORT,
+        help="port to listen on")
     p.add_argument("--host", default=HOST,
                    help="address to bind (0.0.0.0 to serve the LAN; "
                         "set --token when doing so)")
-    p.add_argument("--speed", type=float, default=None,
-                   help=f"default playback speed, pitch-preserving "
-                        f"({SPEED_MIN}-{SPEED_MAX}); a /speak with a speed "
-                        f"field overrides it from then on (default: config "
-                        f"file, or 1.0)")
     p.add_argument("--local-player", choices=["daemon", "client"],
                    default=None,
                    help="who plays the local channel: daemon plays audio on "
@@ -2682,97 +4105,191 @@ def parse_args():
     return p.parse_args()
 
 
+def _reach_ready_and_cleanup_migrations(
+        app, library, legacy_path, cleanup_backups=True):
+    """Publish first Ready, then retire managed-install migration backups."""
+    app.set_lifecycle("ready")
+    if not cleanup_backups:
+        return True
+    try:
+        library.cleanup_migration_backups(legacy_path)
+    except ManagementFailure as exc:
+        app.set_lifecycle("degraded", exc.message, exc.as_dict())
+        print(f"migration backup cleanup failed: {exc.detail}",
+              file=sys.stderr)
+        return False
+    except Exception as exc:
+        traceback.print_exception(type(exc), exc, exc.__traceback__)
+        failure = ManagementFailure(
+            "migration_backup_cleanup_failed",
+            "Migration backup cleanup could not finish.",
+            detail=repr(exc), recoverable=True, status=500)
+        app.set_lifecycle(
+            "degraded", failure.message, failure.as_dict())
+        return False
+    return True
+
+
+def _settings_storage_for_launch(ref_audio, legacy_path):
+    """Keep explicit-reference dev settings out of product storage."""
+    if ref_audio is None:
+        path = Path(legacy_path).expanduser().resolve().with_name(
+            "settings.json")
+        return path, legacy_path, None
+    scope = tempfile.TemporaryDirectory(prefix="wren-explicit-settings-")
+    return Path(scope.name) / "settings.json", None, scope
+
+
 def main():
     args = parse_args()
-    config_path = args.config or default_config_path()
-    config = load_config(config_path)
-    live = effective_settings(config, args)
-    # Downstream code reads args.*; fold the merged values back in.
-    args.speed = live.speed
-    args.port = live.port
-    args.backend = live.backend
-    if args.ref_audio is None:
-        if live.voice is None:
-            raise SystemExit(
-                f"no voice: pass -r, or set voice/voices_dir in {config_path}")
-        args.ref_audio = resolve_voice(live.voice, live.voices_dir)
-    if not args.ref_audio.exists():
-        raise SystemExit(f"ref-audio not found: {args.ref_audio}")
-    ref_text = resolve_ref_text(args.ref_audio, args.ref_text)
-
-    if args.host not in ("127.0.0.1", "localhost", "::1") and not args.token:
-        print("warning: binding beyond loopback with no --token; anyone on "
-              "the network can drive synthesis", file=sys.stderr)
-    local_player = args.local_player or "daemon"
-    store = SegmentStore() if local_player == "client" else None
-
-    # qwentts: validate required flags and pick a free port if needed.
-    if args.backend == "qwentts":
-        missing = [a for a in ("qwentts_bin", "qwentts_model", "qwentts_codec")
-                   if not getattr(args, a)]
-        if missing:
-            raise SystemExit(
-                f"--qwentts-{missing[0].split('_', 1)[1]}"
-                " is required with -b qwentts"
-            )
-        if args.qwentts_port == 0:
-            args.qwentts_port = _pick_free_port()
-        # -m goes unused with this backend; /health should name the model
-        # actually synthesizing, not the mlx default.
-        args.model = str(args.qwentts_model)
-        # atexit alone doesn't run on SIGTERM; route it through sys.exit so
-        # the tts-server child is terminated when the daemon is killed.
-        import signal
-        signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(0))
+    _require_management_token(args.host, args.token)
+    legacy_path = args.config or default_legacy_config_path()
+    if args.voices_dir is not None:
+        voices_dir = args.voices_dir
+    elif args.ref_audio is not None:
+        voices_dir = args.ref_audio.expanduser().resolve().parent
     else:
-        args.qwentts_bin = None
-        args.qwentts_model = None
-        args.qwentts_codec = None
-        args.qwentts_port = None
+        voices_dir = Path(legacy_path).expanduser().resolve().parent / "voices"
+    voices_dir = voices_dir.expanduser().resolve()
 
-    # Serve immediately so clients can see "loading" via /health; /speak
-    # returns 503 until the model is loaded. The model loads inside the
-    # Speaker's synth thread because MLX streams are thread-local.
-    app = App(model_id=args.model, token=args.token, segments=store,
-              config_path=config_path, config=config)
-    app.fx_enabled = live.fx  # --fx overrides the file for this run
+    local_player = args.local_player or "daemon"
+    segment_store = SegmentStore() if local_player == "client" else None
+    reported_backend = (
+        args.backend if args.backend != "auto" else "unresolved")
+    reported_model = (
+        str(args.qwentts_model)
+        if reported_backend == "qwentts" and args.qwentts_model is not None
+        else args.model)
+    app = App(
+        model_id=reported_model, token=args.token, segments=segment_store,
+        backend=reported_backend, host=args.host, port=args.port,
+        voices_dir=voices_dir, settings=ProductSettings())
     server = make_server(app, args.port, args.host)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    print(f"listening on http://{args.host}:{args.port}  "
-          f"(POST /speak, /stop; GET /health; local player: {local_player})")
+    app.port = server.server_address[1]
+    threading.Thread(
+        target=server.serve_forever, name="wren-http", daemon=True).start()
+    print(
+        f"listening on http://{args.host}:{app.port} "
+        f"(management v2; local player: {local_player})")
 
-    def factory():
-        synth = load_synth(
-            args.backend, args.model, args.ref_audio, ref_text,
-            args.language, args.device,
-            qwentts_bin=args.qwentts_bin,
-            qwentts_model=args.qwentts_model,
-            qwentts_codec=args.qwentts_codec,
-            qwentts_port=args.qwentts_port,
-        )
-        # Always wrapped so POST /config can toggle fx live; the gate makes
-        # it a passthrough while disabled.
-        synth = wrap_fx(synth, args.fx_ring_freq, args.fx_ring_mix,
-                        enabled=lambda: app.fx_enabled)
-        # Warm up before reporting ready: the first generation pays JIT and
-        # cache costs (observed 4-20s extra) better spent at startup than on
-        # the first real request.
-        warm_dir = tempfile.mkdtemp(prefix="voice-warmup-")
-        t0 = time.monotonic()
-        for path in synth("Voice daemon warm up.",
-                          lambda: os.path.join(
-                              warm_dir, f"{time.monotonic_ns()}.wav")):
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
-        print(f"warmup synth: {time.monotonic() - t0:.1f}s")
-        return synth
+    def fail_startup(exc, code="startup_failed",
+                     message="The daemon could not finish starting."):
+        if isinstance(exc, ManagementFailure):
+            error = exc.as_dict()
+        else:
+            traceback.print_exception(type(exc), exc, exc.__traceback__)
+            error = {
+                "code": code,
+                "message": message,
+                "detail": repr(exc),
+                "recoverable": True,
+            }
+        app.set_lifecycle("failed", error["message"], error)
 
-    app.speaker = Speaker(synth_factory=factory, play_fn=store,
-                          speed=args.speed)
-    app.ensure_channels()
-    app.speaker.ready.wait()
+    app.set_lifecycle("loading", "Voice storage is loading.")
+
+    library = VoiceLibrary(voices_dir)
+    settings_path, settings_legacy_path, settings_scope = (
+        _settings_storage_for_launch(args.ref_audio, legacy_path))
+    # Keep an explicit-reference TemporaryDirectory alive for this process.
+    _ = settings_scope
+    settings_store = SettingsStore(
+        settings_path, settings_legacy_path, library)
+    try:
+        library.initialize()
+        settings = settings_store.initialize()
+        app.configure_storage(library, settings_store)
+
+        if args.ref_audio is not None:
+            reference = args.ref_audio.expanduser().resolve()
+            transcript = (
+                args.ref_text.expanduser().resolve()
+                if args.ref_text is not None
+                else reference.with_suffix(".txt"))
+            explicit_id = reference.stem
+            if (reference.parent != voices_dir
+                    or transcript != reference.with_suffix(".txt")
+                    or CHANNEL_NAME_RE.fullmatch(explicit_id) is None):
+                raise ManagementFailure(
+                    "startup_voice_unmanaged",
+                    "The startup voice must be a stable ID in the configured "
+                    "voice library.",
+                    detail={
+                        "reference": str(reference),
+                        "voices_dir": str(voices_dir),
+                    },
+                    recoverable=True, status=409)
+            settings, voice_profile = _resolve_explicit_startup_voice(
+                library, settings_store, explicit_id)
+        else:
+            settings, voice_profile = _resolve_startup_voice(
+                library, settings_store, settings, args.initial_voice)
+    except BaseException as exc:
+        if app.library is None:
+            app.configure_storage(library, settings_store)
+        fail_startup(exc)
+        threading.Event().wait()
+        return
+
+    try:
+        actual_backend = pick_backend(args.backend)
+        if actual_backend == "qwentts":
+            missing = [
+                name for name in (
+                    "qwentts_bin", "qwentts_model", "qwentts_codec")
+                if not getattr(args, name)
+            ]
+            if missing:
+                flag = missing[0].replace("_", "-")
+                raise ManagementFailure(
+                    "deployment_setting_missing",
+                    "The qwentts deployment is incomplete.",
+                    detail=f"--{flag} is required",
+                    recoverable=True, status=409)
+            if args.qwentts_port == 0:
+                args.qwentts_port = _pick_free_port()
+            args.model = str(args.qwentts_model)
+            import signal
+            signal.signal(
+                signal.SIGTERM, lambda signum, frame: sys.exit(0))
+        else:
+            args.qwentts_bin = None
+            args.qwentts_model = None
+            args.qwentts_codec = None
+            args.qwentts_port = None
+        app.backend = actual_backend
+        app.model_id = args.model
+        app._bump_revision()
+
+        def factory():
+            return load_engine(
+                actual_backend, args.model, args.language, args.device,
+                qwentts_bin=args.qwentts_bin,
+                qwentts_model=args.qwentts_model,
+                qwentts_codec=args.qwentts_codec,
+                qwentts_port=args.qwentts_port,
+                ring_freq=args.fx_ring_freq,
+                ring_mix=args.fx_ring_mix)
+
+        app.set_lifecycle("loading", "The synthesis engine is loading.")
+        app.speaker = Speaker(
+            engine_factory=factory, voice_profile=voice_profile,
+            play_fn=segment_store,
+            speed=settings.default_synthesis_rate)
+        app.ensure_channels()
+        app.speaker._worker.initialized.wait()
+        if app.speaker._worker.initialization_error is not None:
+            raise app.speaker._worker.initialization_error
+    except BaseException as exc:
+        fail_startup(
+            exc, code="engine_load_failed",
+            message="The synthesis engine could not be loaded.")
+        threading.Event().wait()
+        return
+
+    _reach_ready_and_cleanup_migrations(
+        app, library, legacy_path,
+        cleanup_backups=args.ref_audio is None)
     print("ready")
     threading.Event().wait()
 
