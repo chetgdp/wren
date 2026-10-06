@@ -3,7 +3,7 @@ import {
 } from './soundtouch.js';
 
 let state = {
-  ctx: null, base: '', token: '', running: false,
+  ctx: null, base: '', running: false,
   rate: 1.0, lastSeq: -1, lastEpoch: -1,
   playedSeq: -1, pollAbort: null, nextTime: 0,
   scheduled: [], reportTimer: null,
@@ -150,12 +150,7 @@ async function loop() {
       + `&played=${state.playedSeq}`
       + `&timeout=20`;
     try {
-      const headers = {};
-      if (state.token)
-        headers.Authorization =
-          'Bearer ' + state.token;
       const res = await fetch(url, {
-        headers,
         signal: ac.signal,
       });
       if (!state.running) break;
@@ -309,7 +304,6 @@ function internalSetRate(target) {
 
 export async function start(opts) {
   state.base = opts.base;
-  state.token = opts.token || '';
   if (opts.rate != null)
     state.rate = clampRate(opts.rate);
   if (opts.cursor) {

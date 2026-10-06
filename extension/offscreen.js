@@ -19,7 +19,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.action === "start") {
     audio.start({
       base: msg.base,
-      token: msg.token,
       rate: msg.rate,
       flush: msg.flush,
       cursor: msg.cursor,

@@ -4,7 +4,6 @@ import {
 
 let ctx = null;
 let base = null;
-let token = "";
 let running = false;
 let lastSeq = 0;
 let lastEpoch = null;
@@ -93,8 +92,6 @@ function stretchBuffer(raw, tempo, fromSec) {
   return out;
 }
 
-const auth = () =>
-  token ? { Authorization: `Bearer ${token}` } : {};
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 export function flush() {
@@ -254,7 +251,7 @@ async function loop() {
       resp = await fetch(
         `${base}/segment?channel=extension&after=${lastSeq}` +
           `&played=${playedSeq}&timeout=20`,
-        { headers: auth(), signal: pollAbort.signal }
+        { signal: pollAbort.signal }
       );
     } catch (e) {
       pollAbort = null;
@@ -293,7 +290,6 @@ async function loop() {
 
 export function start(opts) {
   base = opts.base;
-  token = opts.token || "";
   if (opts.rate != null) rate = clampRate(opts.rate);
   if (opts.cursor) {
     lastSeq = Math.max(lastSeq, opts.cursor.played || 0);

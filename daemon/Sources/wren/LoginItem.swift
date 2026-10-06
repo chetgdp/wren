@@ -31,7 +31,7 @@ final class NativeLoginItem: LoginItemProviding {
         .appendingPathComponent(
             "Library/LaunchAgents",
             isDirectory: true)
-        .appendingPathComponent("com.digimata.wren.plist")
+        .appendingPathComponent("com.heavyetl.wren.plist")
 
     private let service: LoginItemService?
     private let legacyPlistURL: URL
@@ -41,7 +41,7 @@ final class NativeLoginItem: LoginItemProviding {
     convenience init(bundle: Bundle = .main) {
         let service: LoginItemService?
         if bundle.bundleURL.pathExtension == "app",
-            bundle.bundleIdentifier == WrenPaths.bundleIdentifier {
+            bundle.bundleIdentifier == WrenDefaults.bundleID {
             service = MainAppLoginItemService()
         } else {
             service = nil

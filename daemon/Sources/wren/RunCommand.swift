@@ -9,8 +9,8 @@ import Foundation
 struct RunApp: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "run",
-        abstract: "Run the menu bar app (default): manage and play "
-            + "the TTS daemon."
+        abstract: "Run the menu bar app (default): play this Mac's "
+            + "channel from the synthesis server."
     )
 
     /// Locals would deallocate when run() reaches app.run(); anchor the
@@ -24,7 +24,7 @@ struct RunApp: ParsableCommand {
             RunApp.appRefs.append(controller)
 
             // Ctrl-C in a terminal and SIGTERM from launchctl both go
-            // through NSApp.terminate so willTerminate kills the child.
+            // through NSApp.terminate so willTerminate stops playback.
             for sig in [SIGINT, SIGTERM] {
                 signal(sig, SIG_IGN)
                 let source = DispatchSource.makeSignalSource(

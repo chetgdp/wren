@@ -157,7 +157,7 @@ private final class AVAudioEngineOutputRoute:
     }
 }
 
-/// Native player for the daemon's local channel: long-polls GET /segment,
+/// Native player for this Mac's server channel: long-polls GET /segment,
 /// decodes each wav, and schedules it gaplessly on one AVAudioEngine graph
 /// (player -> AVAudioUnitTimePitch -> output). The Swift port of the
 /// extension's offscreen player, with AVAudioUnitTimePitch doing live
@@ -172,7 +172,6 @@ final class SegmentPlayer: @unchecked Sendable {
     private let queue = DispatchQueue(label: "wren.segment-player")
     private let session: URLSession
     private let base: URL
-    private let token: String?
     private let audioOutput: SegmentAudioOutput?
     private let outputDeviceApplier: SegmentOutputDeviceApplying
 
@@ -181,7 +180,7 @@ final class SegmentPlayer: @unchecked Sendable {
     private let timePitch = AVAudioUnitTimePitch()
     private var connectedFormat: AVAudioFormat?
 
-    private var poll = SegmentPoll()
+    private var poll: SegmentPoll
     private var running = false
     private var userPaused = false
     /// Bumped on every flush; segment-completion callbacks captured before
@@ -201,13 +200,13 @@ final class SegmentPlayer: @unchecked Sendable {
 
     init(
         base: URL,
-        token: String?,
+        channel: String,
         audioOutput: SegmentAudioOutput? = nil,
         outputDeviceApplier: SegmentOutputDeviceApplying =
             AVAudioEngineOutputDeviceApplier()
     ) {
         self.base = base
-        self.token = token
+        self.poll = SegmentPoll(channel: channel)
         self.audioOutput = audioOutput
         self.outputDeviceApplier = outputDeviceApplier
         let config = URLSessionConfiguration.ephemeral
@@ -242,9 +241,8 @@ final class SegmentPlayer: @unchecked Sendable {
         }
     }
 
-    /// Local, immediate pause: the daemon's pause flag can't stop audio the
-    /// player already fetched. The app calls this from the menu and when it
-    /// notices the local channel's paused flag flip on /health.
+    /// Local, immediate pause: the server's pause flag can't stop audio
+    /// the player already fetched. The app calls this from the menu.
     func setPaused(_ paused: Bool) {
         queue.async {
             guard paused != self.userPaused else { return }
@@ -296,13 +294,7 @@ final class SegmentPlayer: @unchecked Sendable {
 
     private func pollOnce() {
         guard running else { return }
-        var request = URLRequest(url: poll.url(base: base))
-        if let token {
-            request.setValue(
-                "Bearer \(token)",
-                forHTTPHeaderField: "Authorization"
-            )
-        }
+        let request = URLRequest(url: poll.url(base: base))
         currentTaskPlayed = poll.played
         let task = session.dataTask(with: request) {
             [weak self] data, response, error in
@@ -357,13 +349,12 @@ final class SegmentPlayer: @unchecked Sendable {
                 break
             }
             schedulePoll(after: 0)
-        case 404:
-            // Daemon-played local channel (no --local-player client): no
-            // stream to play. Keep checking slowly; a restart in client
-            // mode brings the stream up without restarting the app.
+        case 404, 503:
+            // Server starting up or an older server without this route:
+            // keep checking slowly so it comes up without an app restart.
             schedulePoll(after: 5.0)
         default:
-            // 401 bad token / 400: retrying won't change the answer fast;
+            // 400 and the like: retrying won't change the answer fast;
             // crawl so the log doesn't spin.
             NSLog("wren player: /segment returned \(http.statusCode)")
             schedulePoll(after: 30.0)

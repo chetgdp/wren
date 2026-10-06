@@ -18,29 +18,6 @@
 </style>
 <label for="base">Daemon URL</label>
 <input id="base" placeholder="http://127.0.0.1:8765">
-<label for="token">
-  Token (blank if daemon runs without --token)
-</label>
-<input id="token" type="password">
 <button id="save">Save</button>
 <span id="saved">saved</span>
-<script>
-const D = {base: "http://127.0.0.1:8765", token: ""};
-const $ = (id) => document.getElementById(id);
-chrome.storage.sync.get(D).then((c) => {
-  $("base").value = c.base;
-  $("token").value = c.token;
-});
-$("save").onclick = async () => {
-  const base = ($("base").value.trim() || D.base)
-    .replace(/\/+$/, "");
-  await chrome.storage.sync.set(
-    {base, token: $("token").value.trim()}
-  );
-  $("base").value = base;
-  $("saved").style.visibility = "visible";
-  setTimeout(
-    () => $("saved").style.visibility = "hidden", 1500
-  );
-};
-</script>
+<script src="options.js"></script>

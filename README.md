@@ -16,73 +16,60 @@ llama-server \
                                             --jinja
 ```
 
-for macOS daemon development (the standalone daemon plays locally)
-```
-uv run tts/serve.py -r samples/c3po_god.wav
-```
+## Synthesis server
 
-for linux cuda
-```
-uv run --no-group mlx tts/serve.py -r samples/c3po_god.wav -b qwentts \
-                                          --qwentts-bin ~/voice-ml/qwentts.cpp/build/tts-server \
-                                          --qwentts-model ~/voice-ml/qwentts.cpp/models/qwen-talker-1.7b-base-Q8_0.gguf \
-                                          --qwentts-codec ~/voice-ml/qwentts.cpp/models/qwen-tokenizer-12hz-Q8_0.gguf \
-                                          --host 0.0.0.0 --token "$VOICE_ML_TOKEN" --local-player client
-```
-
-## Command line options
-
-All tools run via `uv run <script>`. On Linux/CUDA use the torch dependency
-group: `uv run --no-group mlx --group torch <script>`.
-
-### tts/serve.py - TTS daemon
-
-Loads the model once, then serves the unversioned playback API (`POST /speak`,
-`/stop`, `/pause`, `/resume`, `/seek`; `GET /health`, `/segment`) and the
-management-v2 API (`GET /meta`, `/state`, `/voices`, `/operations/{id}`,
-`/settings`, plus typed voice and settings mutations).
+One server (any host, usually the CUDA box, reached over Tailscale) does all
+synthesis with qwentts.cpp. It never plays audio: each client plays its own
+channel by streaming `GET /segment`.
 
 ```
-uv run tts/serve.py -r samples/c3po_god.wav
+uv run tts/serve.py \
+    --qwentts-bin ~/voice-ml/qwentts.cpp/build/tts-server \
+    --qwentts-model ~/voice-ml/qwentts.cpp/models/qwen-talker-1.7b-base-Q8_0.gguf \
+    --qwentts-codec ~/voice-ml/qwentts.cpp/models/qwen-tokenizer-12hz-Q8_0.gguf \
+    --initial-voice c3po --host 0.0.0.0
 ```
 
 | option | default | description |
 |---|---|---|
-| `-r, --ref-audio` | none | explicit reference voice clip in the managed voice library |
-| `--ref-text` | sibling `.txt` of ref-audio | transcript of the reference clip |
-| `--config` | platform application config | old config used only as a one-time migration source |
-| `--voices-dir` | beside daemon settings | daemon-owned voice-profile library |
-| `--initial-voice` | none | stable bootstrap ID used only if v2 settings has no `active_voice`; it never overrides durable selection and is not mutable product config |
-| `-m, --model` | `models/Qwen3-TTS-12Hz-1.7B-Base-4bit` | TTS model id (HF repo or local path) |
-| `-b, --backend` | `auto` | `mlx`, `qwen-tts`, or `qwentts`; auto picks an installed backend |
-| `-l, --language` | `English` | text language (qwen-tts backend only) |
-| `-d, --device` | `auto` | torch device, `cuda` > `mps` > `cpu` (qwen-tts backend only) |
-| `--fx-ring-freq` | `40.0` | ring modulator carrier Hz |
-| `--fx-ring-mix` | `0.12` | ring modulator wet mix 0-1 |
+| `--host` | `127.0.0.1` | bind address |
 | `-p, --port` | `8765` | port to listen on |
-| `--host` | `127.0.0.1` | bind address; `0.0.0.0` serves the LAN (set `--token`) |
-| `--local-player` | `daemon` | who plays the local channel: `daemon` plays on this machine; `client` buffers segments for `GET /segment` (browser playback) |
-| `--token` | `$VOICE_ML_TOKEN` | require `Authorization: Bearer <token>` on every request |
+| `--data-dir` | `~/.local/share/wren` (Linux), `~/Library/Application Support/voice-ml` (macOS) | holds `voices/<id>/` and `settings.json` |
+| `--qwentts-bin` | required | qwentts.cpp `tts-server` binary |
+| `--qwentts-model` | required | talker GGUF (`qwen-talker-*.gguf`) |
+| `--qwentts-codec` | required | codec GGUF (`qwen-tokenizer-*.gguf`) |
+| `--language` | `English` | language passed to tts-server |
+| `--initial-voice` | none | voice id used only while `settings.json` has no active voice |
 
-### tts/clone.py - one-shot voice clone (torch backend)
+Each voice is a directory `voices/<id>/` with `profile.json`
+(`{"id", "display_name"}`), `reference.wav` (a few seconds of clean
+speech) and `transcript.txt` (exactly what the clip says). Add voices over
+HTTP with `POST /voices` (multipart: `id`, `display_name`, `audio`,
+`transcript`) or by creating the directory; switch with
+`PUT /voice {"voice": "<id>"}`. Effects and the default speech rate are set
+with `PATCH /settings {"effects": true, "default_rate": 1.2}` and persist in
+`settings.json`.
 
-```
-uv run --no-group mlx --group torch tts/clone.py -r samples/ref.wav -t "hello there"
-```
+Speech without a `channel` goes to the active client (see below); with no
+active client the server answers 409 `no_active_client`.
 
-| option | default | description |
-|---|---|---|
-| `-r, --ref-audio` | required | reference voice clip |
-| `--ref-text` | sibling `.txt` | transcript of the reference clip |
-| `-t, --text` | one of -t/-f required | text to speak, inline |
-| `-f, --text-file` | | file containing the text to speak |
-| `-o, --output` | `output_voice_clone.wav` | output wav path |
-| `-l, --language` | `English` | text language |
+Tests: `uv run pytest tts` (runs against a stub tts-server, no model needed).
+
+## Wren.app client
+
+- In Wren's Settings, enter the server host (e.g. `box:8765` on Tailscale).
+- Audio plays on the Mac you last used: Wren claims "active" when you touch
+  that Mac's keyboard or mouse, and speech moves there. Speech already
+  playing on the previous Mac stops.
+- The `wren` CLI (`wren say "..."`, including from an SSH session on
+  another machine) sends no channel, so the server routes it to that Mac.
+
+## Other tools
 
 ### tts/fx.py - droid effect chain on a wav
 
 ```
-uv run python tts/fx.py output_voice_clone.wav -o output_droid.wav
+uv run python tts/fx.py input.wav -o output_droid.wav
 ```
 
 | option | default | description |
@@ -92,19 +79,7 @@ uv run python tts/fx.py output_voice_clone.wav -o output_droid.wav
 | `--ring-freq` | `40.0` | ring modulator carrier Hz (lower = subtler growl) |
 | `--ring-mix` | `0.12` | ring modulator wet mix 0-1 (0 = off) |
 
-### tts/bench.py - model/backend RTF benchmark
-
-| option | default | description |
-|---|---|---|
-| `-r, --ref-audio` | required | reference voice clip |
-| `--ref-text` | sibling `.txt` | transcript of the reference clip |
-| `-m, --models` | built-in list | model ids to benchmark |
-| `-b, --backend` | `auto` | `mlx` or `qwen-tts` |
-| `-l, --language` | `English` | text language |
-| `-t, --text` | built-in text | text to synthesize |
-| `--runs` | `2` | timed runs after 1 warmup |
-
-### trs/transcribe.py - transcribe a clip (for ref-text)
+### trs/transcribe.py - transcribe a clip (for transcript.txt)
 
 | option | default | description |
 |---|---|---|

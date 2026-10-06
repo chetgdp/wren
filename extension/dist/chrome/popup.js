@@ -1,11 +1,11 @@
-const DEFAULTS = { base: "http://127.0.0.1:8765", token: "" };
+const DEFAULTS = { base: "http://127.0.0.1:8765" };
 
 const greeting = document.getElementById("greeting");
 const hostEl = document.getElementById("host");
 const portEl = document.getElementById("port");
 
 async function refresh() {
-  const { base, token } = await chrome.storage.sync.get(DEFAULTS);
+  const { base } = await chrome.storage.sync.get(DEFAULTS);
   const url = new URL(base);
   const port = url.port || (url.protocol === "https:" ? "443" : "80");
   hostEl.value = url.hostname;
@@ -13,9 +13,7 @@ async function refresh() {
   const where = `${url.hostname}:${port}`;
   greeting.textContent = "checking daemon…";
   try {
-    const res = await fetch(base + "/health", {
-      headers: token ? { Authorization: `Bearer ${token}` } : {},
-    });
+    const res = await fetch(base + "/health");
     if (!res.ok) throw new Error(res.status);
     greeting.textContent = `hello from ${where}`;
   } catch {

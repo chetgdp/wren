@@ -84,18 +84,20 @@ realtime vs torch bf16's 0.68x).
 From the voice-ml checkout on the box (winner from step 3 substituted):
 
 ```sh
-uv run --no-group mlx tts/serve.py -r samples/c3po_god.wav --fx -b qwentts \
+uv run tts/serve.py \
     --qwentts-bin ~/voice-ml/qwentts.cpp/build/tts-server \
     --qwentts-model ~/voice-ml/qwentts.cpp/models/qwen-talker-1.7b-base-Q8_0.gguf \
     --qwentts-codec ~/voice-ml/qwentts.cpp/models/qwen-tokenizer-12hz-Q8_0.gguf \
-    --host 0.0.0.0 --token <secret> --playback client
+    --initial-voice c3po --host 0.0.0.0
 ```
 
-`--qwentts-port` is optional (defaults to a free localhost port).
-tts-server binds 127.0.0.1 only; serve.py owns auth on the LAN side.
+Voices live in `~/.local/share/wren/voices/<id>/` (`--data-dir` to move
+it); `--initial-voice` only applies until a voice is chosen with
+`PUT /voice`. The tts-server port is picked automatically.
+tts-server binds 127.0.0.1 only; serve.py is the LAN-facing endpoint.
 Expected startup log: "starting tts-server", "tts-server ready",
-"voice 'serve_clone' registered", then the warmup synthesis with serve.py's
-own RTF line (audio/wall, higher is better).
+"listening on ...". `GET /state` reports `ready: true` once the initial
+voice is registered.
 
 ## 5. Verify from the laptop
 

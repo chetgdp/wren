@@ -14,12 +14,20 @@ struct SegmentPoll {
     private(set) var after = 0
     private(set) var played = 0
     private(set) var epoch: Int?
+    /// The server requires a channel on /segment; this Mac polls its own.
+    let channel: String
+
+    init(channel: String = ClientChannel.defaultChannel()) {
+        self.channel = channel
+    }
 
     func url(base: URL) -> URL {
         var components = URLComponents(
             url: base.appendingPathComponent("segment"),
-            resolvingAgainstBaseURL: false)!
+            resolvingAgainstBaseURL: false
+        )!
         components.queryItems = [
+            URLQueryItem(name: "channel", value: channel),
             URLQueryItem(name: "after", value: String(after)),
             URLQueryItem(name: "played", value: String(played)),
             URLQueryItem(name: "timeout", value: String(Int(Self.timeout))),

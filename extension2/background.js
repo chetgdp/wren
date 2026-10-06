@@ -1,5 +1,5 @@
 const IS_CHROME = typeof chrome.offscreen !== "undefined";
-const DEFAULTS = {base: "http://127.0.0.1:8765", token: "", rate: 1};
+const DEFAULTS = {base: "http://127.0.0.1:8765", rate: 1};
 let cfg = null, speakTabId = null, audioModule = null;
 
 function config() {
@@ -19,14 +19,16 @@ async function call(path, body) {
   const isGet = path === '/health';
   if (!isGet && CH.includes(path))
     body = {channel: 'extension', ...body};
-  const headers = {};
-  if (c.token) headers.Authorization = 'Bearer ' + c.token;
-  const opts = {method: isGet ? 'GET' : 'POST', headers};
+  const opts = {method: isGet ? 'GET' : 'POST'};
   if (!isGet && body)
     opts.body = JSON.stringify(body);
   const res = await fetch(c.base + path, opts);
-  const data = await res.json();
-  if (!res.ok) throw new Error(data.error || res.status);
+  const data = await res.json().catch(() => ({}));
+  // Server errors are {error: {code, message}}; older daemons sent a string.
+  if (!res.ok) {
+    const e = data.error;
+    throw new Error(e?.message || e?.code || (typeof e === "string" ? e : res.status));
+  }
   return data;
 }
 
@@ -64,11 +66,11 @@ async function ensureClientPlayback(flush) {
   if (IS_CHROME) {
     await ensureOffscreen();
     chrome.runtime.sendMessage({cmd: "player",
-      action: "start", base: c.base, token: c.token,
+      action: "start", base: c.base,
       rate: c.rate, flush, cursor});
   } else {
     if (!audioModule) audioModule = await import("./audio.js");
-    audioModule.start({base: c.base, token: c.token,
+    audioModule.start({base: c.base,
       rate: c.rate, flush, cursor,
       onPosition: sendPosition, onCursor});
   }

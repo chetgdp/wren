@@ -309,7 +309,7 @@ function injectOverlay() {
       resp => {
         if (chrome.runtime.lastError) return;
         const ch = resp?.channels?.extension;
-        if (!ch || ch.state === "idle") {
+        if (!ch || !(ch.active ?? (ch.speaking || ch.pending > 0))) {
           idlePolls++;
           if (idlePolls >= 6) removeOverlay();
         } else {
@@ -469,11 +469,11 @@ document.addEventListener("keydown", e => {
 
   switch (e.key) {
     case "i": {
-      const sel = window.getSelection();
-      if (sel && sel.toString().trim()) {
-        readPage(true);
-        e.preventDefault();
-      }
+      const sel = window.getSelection()?.toString().trim();
+      if (!sel) break;
+      e.preventDefault();
+      chrome.runtime.sendMessage(
+        { path: '/speak', body: { text: sel } });
       break;
     }
     case "p":

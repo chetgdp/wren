@@ -13,7 +13,7 @@ const audioModuleReady = IS_OFFSCREEN
     audioModule = module;
     return module;
   });
-const DEFAULTS = { base: "http://127.0.0.1:8765", token: "", rate: 1 };
+const DEFAULTS = { base: "http://127.0.0.1:8765", rate: 1 };
 const CHANNEL = "extension";
 // Calls that act on a channel; keeping them on the extension's own channel
 // means its pause/stop buttons never silence other channels' speech.
@@ -40,15 +40,18 @@ chrome.storage.onChanged.addListener((changes, area) => {
 const config = () => configInitPromise.then(() => cachedConfig);
 
 async function call(path, body) {
-  const { base, token } = await config();
+  const { base } = await config();
   if (CHANNEL_PATHS.includes(path)) body = { channel: CHANNEL, ...body };
   const res = await fetch(base + path, {
     method: path === "/health" ? "GET" : "POST",
-    headers: token ? { Authorization: `Bearer ${token}` } : {},
     body: body ? JSON.stringify(body) : undefined,
   });
-  const data = await res.json();
-  if (!res.ok) throw new Error(data.error || res.status);
+  const data = await res.json().catch(() => ({}));
+  // Server errors are {error: {code, message}}; older daemons sent a string.
+  if (!res.ok) {
+    const e = data.error;
+    throw new Error(e?.message || e?.code || (typeof e === "string" ? e : res.status));
+  }
   return data;
 }
 
@@ -56,7 +59,7 @@ async function post(path, body) {
   try {
     return await call(path, body);
   } catch (err) {
-    // 503 = model loading, 401 = bad token, network error = daemon not running
+    // 503 = model loading, network error = daemon not running
     chrome.action.setBadgeText({ text: "err" });
     chrome.action.setBadgeBackgroundColor({ color: "#c0392b" });
     setTimeout(() => chrome.action.setBadgeText({ text: "" }), 3000);
@@ -85,7 +88,7 @@ async function ensureOffscreenDocument() {
 }
 
 async function ensureClientPlayback(flush) {
-  const { base, token, rate } = await config();
+  const { base, rate } = await config();
   await ensureOffscreenDocument();
   if (IS_OFFSCREEN) {
     chrome.alarms.create("player-keepalive", {
@@ -96,7 +99,7 @@ async function ensureClientPlayback(flush) {
     chrome.runtime
       .sendMessage({
         cmd: "player", action: "start",
-        base, token, rate, flush,
+        base, rate, flush,
         cursor: flush ? null : playerCursor,
       })
       .catch(() => {});
@@ -105,7 +108,7 @@ async function ensureClientPlayback(flush) {
     const { playerCursor } =
       await chrome.storage.session.get("playerCursor");
     module.start({
-      base, token, rate, flush,
+      base, rate, flush,
       cursor: flush ? null : playerCursor,
       onPosition: (pos) => sendPosition(pos),
       onCursor: (cur) => {

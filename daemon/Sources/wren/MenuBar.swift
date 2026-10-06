@@ -1,10 +1,10 @@
 import AppKit
 
-/// Native menu-bar control surface rendered from one immutable AppState.
 @MainActor
 final class WrenMenuBar: NSObject {
     enum Action: Equatable {
         case refresh
+        case claimActive
         case activateVoice(id: String)
         case setSpeakingRate(Double)
         case setEffects(Bool)
@@ -13,44 +13,13 @@ final class WrenMenuBar: NSObject {
         case stopSpeaking
         case setLaunchAtLogin(Bool)
         case showSettings
-        case addVoice
-        case manageVoices
-        case retryStartup
-        case resetInvalidSettings
-        case revealLogs(URL)
         case quit
-    }
-
-    struct PersistentRowIDs: Equatable {
-        let statusItem: ObjectIdentifier
-        let statusView: ObjectIdentifier
-        let progressItem: ObjectIdentifier
-        let progressView: ObjectIdentifier
-        let loginItem: ObjectIdentifier
-        let loginView: ObjectIdentifier
-    }
-
-    private struct VisibleItems {
-        let voiceParent: NSMenuItem
-        let voiceChoices: [String: NSMenuItem]
-        let addVoice: NSMenuItem?
-        let manageVoices: NSMenuItem
-        let effects: NSMenuItem
-        let outputParent: NSMenuItem
-        let outputChoices: [String: NSMenuItem]
-        let outputMessage: WrenMenuMessageView?
-        let pause: NSMenuItem
-        let stop: NSMenuItem
-        let loginMessage: WrenMenuMessageView?
-        let recoveries: [NSMenuItem]
     }
 
     private let statusItem: NSStatusItem
     let menu = NSMenu()
     private let statusView = WrenMenuStatusView()
     private let statusRow = NSMenuItem()
-    private let progressView = WrenMenuProgressView()
-    private let progressRow = NSMenuItem()
     private let loginView = WrenMenuLoginView()
     private let loginRow = NSMenuItem()
     private let rateView = SliderMenuView(
@@ -59,21 +28,21 @@ final class WrenMenuBar: NSObject {
         max: LocalSpeakingRate.maximum
     )
     private let rateRow = NSMenuItem()
+
+    // Persistent menu items to avoid rebuild & flicker
+    private let clientItem = NSMenuItem()
+    private let playHereItem = NSMenuItem()
+    private let voiceParent = NSMenuItem()
+    private let voiceSubmenu = NSMenu()
+    private let effectsItem = NSMenuItem()
+    private let outputParent = NSMenuItem()
+    private let outputSubmenu = NSMenu()
+    private let pauseItem = NSMenuItem()
+    private let stopItem = NSMenuItem()
+    private let settingsItem = NSMenuItem()
+
     private var model: WrenMenuModel?
-    private var visibleItems: VisibleItems?
-
     var onAction: ((Action) -> Void)?
-
-    var persistentRowIDs: PersistentRowIDs {
-        PersistentRowIDs(
-            statusItem: ObjectIdentifier(statusRow),
-            statusView: ObjectIdentifier(statusView),
-            progressItem: ObjectIdentifier(progressRow),
-            progressView: ObjectIdentifier(progressView),
-            loginItem: ObjectIdentifier(loginRow),
-            loginView: ObjectIdentifier(loginView)
-        )
-    }
 
     override init() {
         statusItem = NSStatusBar.system.statusItem(
@@ -84,11 +53,14 @@ final class WrenMenuBar: NSObject {
         menu.autoenablesItems = false
         menu.delegate = self
         statusRow.view = statusView
-        progressRow.view = progressView
         loginRow.view = loginView
         rateRow.view = rateView
         statusItem.menu = menu
-        configureStatusButton()
+
+        if let button = statusItem.button {
+            button.image = Self.logoImage()
+            button.imagePosition = .imageOnly
+        }
 
         rateView.onChange = { [weak self] value in
             self?.onAction?(.setSpeakingRate(value))
@@ -96,533 +68,268 @@ final class WrenMenuBar: NSObject {
         loginView.onToggle = { [weak self] enabled in
             self?.onAction?(.setLaunchAtLogin(enabled))
         }
-        statusView.render(WrenMenuModel.Status(
-            title: "Starting Wren",
-            detail: "Connecting to the speech service",
-            tone: .normal
-        ))
-        rebuild()
+
+        buildMenuStructure()
     }
 
-    func render(_ state: AppState) {
-        let model = WrenMenuModel(state: state)
-        self.model = model
-        updatePersistentRows(model)
-        updateStatusButton(model)
-        updateVisibleItems(model)
-    }
-
-    func rebuild() {
+    private func buildMenuStructure() {
         menu.removeAllItems()
-        visibleItems = nil
-        guard let model else {
-            menu.addItem(statusRow)
-            menu.addItem(.separator())
-            menu.addItem(quitItem())
-            resizeCustomRows()
-            return
-        }
 
-        updatePersistentRows(model)
         menu.addItem(statusRow)
-        if model.progress != nil {
-            menu.addItem(progressRow)
-        }
         menu.addItem(.separator())
 
-        let voice = buildVoiceItem(model)
-        menu.addItem(voice.parent)
+        clientItem.title = "Connecting"
+        clientItem.isEnabled = false
+        menu.addItem(clientItem)
+
+        playHereItem.title = "Play here"
+        playHereItem.target = self
+        playHereItem.action = #selector(playHereClicked)
+        menu.addItem(playHereItem)
+
+        menu.addItem(.separator())
+
+        voiceParent.title = "Voice"
+        voiceParent.image = Self.symbol("waveform")
+        voiceParent.submenu = voiceSubmenu
+        voiceSubmenu.autoenablesItems = false
+        menu.addItem(voiceParent)
+
         menu.addItem(rateRow)
-        let effects = buildEffectsItem(model)
-        menu.addItem(effects)
-        let output = buildOutputItem(model)
-        menu.addItem(output.parent)
+
+        effectsItem.title = "Effects"
+        effectsItem.image = Self.symbol("waveform.path.ecg")
+        effectsItem.target = self
+        effectsItem.action = #selector(effectsClicked)
+        menu.addItem(effectsItem)
+
+        outputParent.title = "Output"
+        outputParent.image = Self.symbol("speaker.wave.2")
+        outputParent.submenu = outputSubmenu
+        outputSubmenu.autoenablesItems = false
+        menu.addItem(outputParent)
 
         menu.addItem(.separator())
-        let pause = actionItem(
-            title: model.pause.title,
-            action: #selector(pauseClicked),
-            symbol: model.pause.title == "Resume"
-                ? "play.fill"
-                : "pause.fill",
-            enabled: model.pause.isEnabled
-        )
-        let stop = actionItem(
-            title: model.stop.title,
-            action: #selector(stopClicked),
-            symbol: "stop.fill",
-            enabled: model.stop.isEnabled
-        )
-        menu.addItem(pause)
-        menu.addItem(stop)
+
+        pauseItem.title = "Pause"
+        pauseItem.image = Self.symbol("pause.fill")
+        pauseItem.target = self
+        pauseItem.action = #selector(pauseClicked)
+        menu.addItem(pauseItem)
+
+        stopItem.title = "Stop"
+        stopItem.image = Self.symbol("stop.fill")
+        stopItem.target = self
+        stopItem.action = #selector(stopClicked)
+        menu.addItem(stopItem)
 
         menu.addItem(.separator())
-        var loginMessage: WrenMenuMessageView?
-        if model.login.isVisible {
-            menu.addItem(loginRow)
-            if let error = model.login.error {
-                let message = messageItem(error, tone: .warning)
-                loginMessage = message.view
-                    as? WrenMenuMessageView
-                menu.addItem(message)
-            }
-        }
-        menu.addItem(actionItem(
-            title: "Settings…",
-            action: #selector(settingsClicked),
-            symbol: "gearshape",
-            enabled: true
-        ))
 
-        var recoveries: [NSMenuItem] = []
-        if !model.recoveryActions.isEmpty {
-            menu.addItem(.separator())
-            for recovery in model.recoveryActions {
-                let item = recoveryItem(recovery)
-                recoveries.append(item)
-                menu.addItem(item)
-            }
-        }
+        menu.addItem(loginRow)
+
+        settingsItem.title = "Settings…"
+        settingsItem.image = Self.symbol("gearshape")
+        settingsItem.target = self
+        settingsItem.action = #selector(settingsClicked)
+        menu.addItem(settingsItem)
 
         menu.addItem(.separator())
-        menu.addItem(quitItem())
-        Self.applyCheckmarks(menu)
-        resizeCustomRows()
-        visibleItems = VisibleItems(
-            voiceParent: voice.parent,
-            voiceChoices: voice.choices,
-            addVoice: voice.add,
-            manageVoices: voice.manage,
-            effects: effects,
-            outputParent: output.parent,
-            outputChoices: output.choices,
-            outputMessage: output.message,
-            pause: pause,
-            stop: stop,
-            loginMessage: loginMessage,
-            recoveries: recoveries
-        )
-        updateVisibleItems(model)
-    }
-}
 
-private extension WrenMenuBar {
-    typealias VoiceItems = (
-        parent: NSMenuItem,
-        choices: [String: NSMenuItem],
-        add: NSMenuItem?,
-        manage: NSMenuItem
-    )
-
-    typealias OutputItems = (
-        parent: NSMenuItem,
-        choices: [String: NSMenuItem],
-        message: WrenMenuMessageView?
-    )
-
-    func buildVoiceItem(_ model: WrenMenuModel) -> VoiceItems {
-        let parent = NSMenuItem(
-            title: "Voice",
-            action: nil,
-            keyEquivalent: ""
-        )
-        parent.image = Self.symbol("waveform", description: "Voice")
-        parent.badge = NSMenuItemBadge(string: model.voiceBadge)
-        let submenu = NSMenu()
-        submenu.autoenablesItems = false
-        var choices: [String: NSMenuItem] = [:]
-        if model.voices.isEmpty {
-            submenu.addItem(messageItem(
-                "No ready voices. Add or repair one in Settings.",
-                tone: .normal
-            ))
-        } else {
-            for choice in model.voices {
-                let item = actionItem(
-                    title: choice.title,
-                    action: #selector(voiceClicked(_:)),
-                    symbol: "waveform",
-                    enabled: choice.isEnabled,
-                    representedObject: choice.id
-                )
-                item.state = choice.isChecked ? .on : .off
-                choices[choice.id] = item
-                submenu.addItem(item)
-            }
-        }
-        submenu.addItem(.separator())
-        var add: NSMenuItem?
-        if model.addVoiceVisible {
-            let item = actionItem(
-                title: "Add Voice…",
-                action: #selector(addVoiceClicked),
-                symbol: "plus",
-                enabled: model.addVoiceEnabled
-            )
-            if !model.addVoiceEnabled {
-                item.toolTip = "Another action is in progress."
-            }
-            submenu.addItem(item)
-            add = item
-        }
-        let manage = actionItem(
-            title: "Manage Voices…",
-            action: #selector(manageVoicesClicked),
-            symbol: "slider.horizontal.3",
-            enabled: model.manageVoicesEnabled
-        )
-        submenu.addItem(manage)
-        parent.submenu = submenu
-        return (parent, choices, add, manage)
-    }
-
-    func buildEffectsItem(_ model: WrenMenuModel) -> NSMenuItem {
-        let item = actionItem(
-            title: "Effects",
-            action: #selector(effectsClicked),
-            symbol: "waveform.path.ecg",
-            enabled: model.effectsEnabled
-        )
-        item.state = model.effectsOn ? .on : .off
-        return item
-    }
-
-    func buildOutputItem(_ model: WrenMenuModel) -> OutputItems {
-        let parent = NSMenuItem(
-            title: "Output",
-            action: nil,
-            keyEquivalent: ""
-        )
-        parent.image = Self.symbol(
-            "speaker.wave.2",
-            description: "Output"
-        )
-        parent.badge = NSMenuItemBadge(string: model.outputBadge)
-        parent.isEnabled = true
-        let submenu = NSMenu()
-        submenu.autoenablesItems = false
-        var choices: [String: NSMenuItem] = [:]
-        for choice in model.outputChoices {
-            let symbolName: String
-            switch choice.target {
-            case .systemDefault:
-                symbolName = "speaker.wave.2"
-            case .device:
-                symbolName = "hifispeaker"
-            case .unavailable:
-                symbolName = "speaker.slash"
-            }
-            let item = actionItem(
-                title: choice.title,
-                action: #selector(outputClicked(_:)),
-                symbol: symbolName,
-                enabled: choice.isEnabled,
-                representedObject: choice.target
-            )
-            item.state = choice.isChecked ? .on : .off
-            let key = Self.outputKey(choice.target)
-            choices[key] = item
-            submenu.addItem(item)
-        }
-        var messageView: WrenMenuMessageView?
-        if let message = model.outputMessage {
-            submenu.addItem(.separator())
-            let item = messageItem(message, tone: .warning)
-            messageView = item.view as? WrenMenuMessageView
-            submenu.addItem(item)
-        }
-        parent.submenu = submenu
-        return (parent, choices, messageView)
-    }
-
-    func actionItem(
-        title: String,
-        action: Selector,
-        symbol: String,
-        enabled: Bool,
-        representedObject: Any? = nil
-    ) -> NSMenuItem {
-        let item = NSMenuItem(
-            title: title,
-            action: action,
-            keyEquivalent: ""
-        )
-        item.target = self
-        item.image = Self.symbol(symbol, description: title)
-        item.isEnabled = enabled
-        item.representedObject = representedObject
-        return item
-    }
-
-    func messageItem(
-        _ text: String,
-        tone: WrenMenuModel.Tone
-    ) -> NSMenuItem {
-        let item = NSMenuItem()
-        item.view = WrenMenuMessageView(text: text, tone: tone)
-        return item
-    }
-
-    func recoveryItem(
-        _ recovery: WrenMenuModel.RecoveryAction
-    ) -> NSMenuItem {
-        let symbolName: String
-        switch recovery.kind {
-        case .retryStartup:
-            symbolName = "arrow.clockwise"
-        case .resetInvalidSettings:
-            symbolName = "arrow.counterclockwise"
-        case .revealLogs:
-            symbolName = "doc.text.magnifyingglass"
-        }
-        return actionItem(
-            title: recovery.title,
-            action: #selector(recoveryClicked(_:)),
-            symbol: symbolName,
-            enabled: recovery.isEnabled,
-            representedObject: recovery.kind
-        )
-    }
-
-    func quitItem() -> NSMenuItem {
-        let item = actionItem(
+        let quit = NSMenuItem(
             title: "Quit Wren",
             action: #selector(quitClicked),
-            symbol: "power",
-            enabled: true
+            keyEquivalent: "q"
         )
-        item.keyEquivalent = "q"
-        return item
+        quit.target = self
+        menu.addItem(quit)
     }
 
-    func updatePersistentRows(_ model: WrenMenuModel) {
-        statusView.render(model.status)
-        progressView.render(model.progress)
-        loginView.render(model.login)
-        rateView.value = model.speakingRate
-        rateView.isEnabled = model.speakingRateEnabled
+    /// Counts submenu rebuilds so tests can prove unchanged structure
+    /// never re-creates items.
+    private(set) var voiceRebuilds = 0
+    private(set) var outputRebuilds = 0
+    private var voiceItems: [String: NSMenuItem] = [:]
+    private var outputItems: [String: NSMenuItem] = [:]
+
+    func render(_ state: AppState) {
+        let next = WrenMenuModel(state: state)
+        guard next != model else { return }
+        let previous = model
+        model = next
+        apply(next, previous: previous)
     }
 
-    func updateVisibleItems(_ model: WrenMenuModel) {
-        guard let items = visibleItems else { return }
-        items.voiceParent.badge = NSMenuItemBadge(
-            string: model.voiceBadge
-        )
-        for choice in model.voices {
-            guard let item = items.voiceChoices[choice.id] else {
-                continue
-            }
-            item.title = choice.title
-            item.state = choice.isChecked ? .on : .off
-            item.isEnabled = choice.isEnabled
+    /// Diff render: each row is touched only when its slice of the model
+    /// changed, and submenus are rebuilt only when items appear or vanish.
+    /// Re-setting unchanged values on an open menu (or re-adding items)
+    /// makes AppKit redraw the rows, which shows as flicker.
+    private func apply(_ model: WrenMenuModel, previous: WrenMenuModel?) {
+        if previous?.status != model.status {
+            statusView.render(model.status)
         }
-        items.addVoice?.isEnabled = model.addVoiceEnabled
-        items.manageVoices.isEnabled = model.manageVoicesEnabled
-        items.effects.state = model.effectsOn ? .on : .off
-        items.effects.isEnabled = model.effectsEnabled
-        items.outputParent.badge = NSMenuItemBadge(
-            string: model.outputBadge
-        )
-        for choice in model.outputChoices {
-            let key = Self.outputKey(choice.target)
-            guard let item = items.outputChoices[key] else {
-                continue
-            }
-            item.title = choice.title
-            item.state = choice.isChecked ? .on : .off
-            item.isEnabled = choice.isEnabled
+        if previous?.clientTitle != model.clientTitle {
+            clientItem.title = model.clientTitle
         }
-        if let messageView = items.outputMessage {
-            messageView.render(
-                text: model.outputMessage ?? "",
-                tone: .warning
+        if previous?.showsPlayHere != model.showsPlayHere {
+            playHereItem.isHidden = !model.showsPlayHere
+        }
+
+        if previous?.structure.voiceIDs != model.structure.voiceIDs {
+            rebuildVoices(model.voices)
+        }
+        if previous?.voices != model.voices {
+            for voice in model.voices {
+                guard let item = voiceItems[voice.id] else { continue }
+                if item.title != voice.title { item.title = voice.title }
+                let state: NSControl.StateValue = voice.isChecked ? .on : .off
+                if item.state != state { item.state = state }
+            }
+        }
+        if previous?.voiceBadge != model.voiceBadge {
+            voiceParent.badge = NSMenuItemBadge(string: model.voiceBadge)
+        }
+
+        if previous?.effectsOn != model.effectsOn {
+            effectsItem.state = model.effectsOn ? .on : .off
+        }
+        if previous?.isConnected != model.isConnected {
+            effectsItem.isEnabled = model.isConnected
+            voiceParent.isEnabled = model.isConnected
+        }
+        if previous?.speakingRate != model.speakingRate {
+            rateView.value = model.speakingRate
+        }
+
+        if previous?.structure.outputKeys != model.structure.outputKeys {
+            rebuildOutputs(model.outputChoices)
+        }
+        if previous?.outputChoices != model.outputChoices {
+            for choice in model.outputChoices {
+                guard let item = outputItems[choice.target.key] else {
+                    continue
+                }
+                if item.title != choice.title { item.title = choice.title }
+                item.representedObject = choice.target
+                let state: NSControl.StateValue = choice.isChecked ? .on : .off
+                if item.state != state { item.state = state }
+            }
+        }
+        if previous?.outputBadge != model.outputBadge {
+            outputParent.badge = NSMenuItemBadge(string: model.outputBadge)
+        }
+
+        if previous?.isPaused != model.isPaused {
+            pauseItem.title = model.isPaused ? "Resume" : "Pause"
+            pauseItem.image = Self.symbol(
+                model.isPaused ? "play.fill" : "pause.fill"
             )
         }
-        items.pause.title = model.pause.title
-        items.pause.image = Self.symbol(
-            model.pause.title == "Resume"
-                ? "play.fill"
-                : "pause.fill",
-            description: model.pause.title
-        )
-        items.pause.isEnabled = model.pause.isEnabled
-        items.stop.isEnabled = model.stop.isEnabled
-        if let messageView = items.loginMessage {
-            messageView.render(
-                text: model.login.error ?? "",
-                tone: .warning
-            )
-        }
-        for item in items.recoveries {
-            guard let kind = item.representedObject
-                as? WrenMenuModel.RecoveryKind,
-                let recovery = model.recoveryActions.first(
-                    where: { $0.kind == kind }
-                )
-            else {
-                item.isEnabled = false
-                continue
-            }
-            item.title = recovery.title
-            item.isEnabled = recovery.isEnabled
+        if previous?.login != model.login {
+            loginView.render(model.login)
         }
     }
 
-    func resizeCustomRows() {
+    private func rebuildVoices(_ voices: [WrenMenuModel.VoiceChoice]) {
+        voiceRebuilds += 1
+        voiceSubmenu.removeAllItems()
+        voiceItems = [:]
+        guard !voices.isEmpty else {
+            let item = NSMenuItem(
+                title: "No voices",
+                action: nil,
+                keyEquivalent: ""
+            )
+            item.isEnabled = false
+            voiceSubmenu.addItem(item)
+            return
+        }
+        for voice in voices {
+            let item = NSMenuItem(
+                title: voice.title,
+                action: #selector(voiceClicked(_:)),
+                keyEquivalent: ""
+            )
+            item.target = self
+            item.representedObject = voice.id
+            item.state = voice.isChecked ? .on : .off
+            voiceSubmenu.addItem(item)
+            voiceItems[voice.id] = item
+        }
+    }
+
+    private func rebuildOutputs(_ choices: [WrenMenuModel.OutputChoice]) {
+        outputRebuilds += 1
+        outputSubmenu.removeAllItems()
+        outputItems = [:]
+        for choice in choices {
+            let item = NSMenuItem(
+                title: choice.title,
+                action: #selector(outputClicked(_:)),
+                keyEquivalent: ""
+            )
+            item.target = self
+            item.representedObject = choice.target
+            item.state = choice.isChecked ? .on : .off
+            outputSubmenu.addItem(item)
+            outputItems[choice.target.key] = item
+        }
+    }
+
+    /// Custom-view rows do not track the menu's width on their own.
+    private func resizeCustomRows() {
         let width = max(menu.size.width, WrenMenuMetrics.minimumWidth)
         statusView.setMenuWidth(width)
-        progressView.setMenuWidth(width)
         loginView.setMenuWidth(width)
         rateView.setMenuWidth(width)
     }
 
-    func configureStatusButton() {
-        guard let button = statusItem.button else { return }
-        button.image = Self.logoImage()
-        button.image?.isTemplate = true
-        button.imagePosition = .imageLeft
-        button.title = ""
+    @objc private func playHereClicked() {
+        onAction?(.claimActive)
     }
 
-    func updateStatusButton(_ model: WrenMenuModel) {
-        statusItem.button?.appearsDisabled = model.statusItemDimmed
-        statusItem.button?.title = model.statusBarBadge.map {
-            " \($0)"
-        } ?? ""
-    }
-
-    @objc func voiceClicked(_ sender: NSMenuItem) {
-        guard let id = sender.representedObject as? String,
-              model?.voices.first(
-                where: { $0.id == id }
-              )?.isChecked == false
-        else { return }
+    @objc private func voiceClicked(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
         onAction?(.activateVoice(id: id))
     }
 
-    @objc func addVoiceClicked() {
-        onAction?(.addVoice)
-    }
-
-    @objc func manageVoicesClicked() {
-        onAction?(.manageVoices)
-    }
-
-    @objc func effectsClicked() {
+    @objc private func effectsClicked() {
         guard let model else { return }
         onAction?(.setEffects(!model.effectsOn))
     }
 
-    @objc func outputClicked(_ sender: NSMenuItem) {
+    @objc private func outputClicked(_ sender: NSMenuItem) {
         guard let target = sender.representedObject
-            as? WrenMenuModel.OutputTarget
-        else { return }
+            as? WrenMenuModel.OutputTarget else { return }
         switch target {
         case .systemDefault:
             onAction?(.setOutputDevice(nil))
-        case .device(let device):
-            onAction?(.setOutputDevice(device))
-        case .unavailable:
-            return
+        case .device(let dev):
+            onAction?(.setOutputDevice(dev))
         }
     }
 
-    @objc func pauseClicked() {
+    @objc private func pauseClicked() {
         guard let model else { return }
-        onAction?(.setPaused(model.pause.title != "Resume"))
+        onAction?(.setPaused(!model.isPaused))
     }
 
-    @objc func stopClicked() {
+    @objc private func stopClicked() {
         onAction?(.stopSpeaking)
     }
 
-    @objc func settingsClicked() {
+    @objc private func settingsClicked() {
         onAction?(.showSettings)
     }
 
-    @objc func recoveryClicked(_ sender: NSMenuItem) {
-        guard let kind = sender.representedObject
-            as? WrenMenuModel.RecoveryKind
-        else { return }
-        switch kind {
-        case .retryStartup:
-            onAction?(.retryStartup)
-        case .resetInvalidSettings:
-            onAction?(.resetInvalidSettings)
-        case .revealLogs(let url):
-            onAction?(.revealLogs(url))
-        }
-    }
-
-    @objc func quitClicked() {
+    @objc private func quitClicked() {
         onAction?(.quit)
     }
 
-    static func outputKey(
-        _ target: WrenMenuModel.OutputTarget
-    ) -> String {
-        switch target {
-        case .systemDefault:
-            return "default"
-        case .device(let device):
-            return "device:\(device.uid)"
-        case .unavailable(let uid):
-            return "unavailable:\(uid)"
-        }
+    private static func symbol(_ name: String) -> NSImage? {
+        NSImage(systemSymbolName: name, accessibilityDescription: nil)
     }
 
-    static func applyCheckmarks(_ menu: NSMenu) {
-        for item in menu.items {
-            item.onStateImage = checkmark
-            if let submenu = item.submenu {
-                applyCheckmarks(submenu)
-            }
-        }
-    }
-
-    static func symbol(
-        _ name: String,
-        description: String
-    ) -> NSImage? {
-        let image = NSImage(
-            systemSymbolName: name,
-            accessibilityDescription: description
-        )?.withSymbolConfiguration(
-            .init(paletteColors: [.secondaryLabelColor])
-        )
-        image?.isTemplate = false
-        return image
-    }
-
-    static let checkmark: NSImage? = {
-        guard let base = NSImage(
-            systemSymbolName: "checkmark",
-            accessibilityDescription: "Selected"
-        )?.withSymbolConfiguration(
-            .init(pointSize: 12, weight: .semibold)
-        ) else { return nil }
-        let padding = WrenMenuMetrics.space2
-        let size = NSSize(
-            width: base.size.width + padding * 2,
-            height: base.size.height
-        )
-        let image = NSImage(
-            size: size,
-            flipped: false
-        ) { _ in
-            base.draw(
-                at: NSPoint(x: padding, y: 0),
-                from: .zero,
-                operation: .sourceOver,
-                fraction: 1
-            )
-            return true
-        }
-        image.isTemplate = true
-        return image
-    }()
-
-    static func logoImage() -> NSImage? {
+    private static func logoImage() -> NSImage? {
         guard let data = Logo.svg.data(using: .utf8),
               let image = NSImage(data: data)
         else { return nil }
@@ -632,13 +339,9 @@ private extension WrenMenuBar {
 }
 
 extension WrenMenuBar: NSMenuDelegate {
-    func menuNeedsUpdate(_ menu: NSMenu) {
-        guard menu === self.menu else { return }
-        rebuild()
-    }
-
     func menuWillOpen(_ menu: NSMenu) {
         guard menu === self.menu else { return }
+        resizeCustomRows()
         onAction?(.refresh)
     }
 }

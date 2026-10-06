@@ -22,23 +22,19 @@ enum AudioOutputDeviceChange: Sendable {
     case defaultOutput
 }
 
-enum AudioOutputError: Error, Equatable, Sendable,
-    CustomStringConvertible {
+enum AudioOutputError: Error, Equatable, Sendable, CustomStringConvertible {
     case osStatus(operation: String, status: OSStatus)
     case invalidProperty(operation: String)
     case deviceDisconnected(uid: String)
     case noDefaultOutput
     case missingAudioUnit
-    case readbackMismatch(
-        requested: AudioDeviceID,
-        actual: AudioDeviceID
-    )
+    case readbackMismatch(requested: AudioDeviceID, actual: AudioDeviceID)
     case engineRestart(String)
 
     var description: String {
         switch self {
         case .osStatus(let operation, let status):
-            return "\(operation) failed (\(Self.describe(status)))."
+            return "\(operation) failed (\(status))."
         case .invalidProperty(let operation):
             return "\(operation) returned invalid property data."
         case .deviceDisconnected(let uid):
@@ -47,28 +43,11 @@ enum AudioOutputError: Error, Equatable, Sendable,
             return "No system default output device is available."
         case .missingAudioUnit:
             return "The audio engine has no output AudioUnit."
-        case .readbackMismatch(let requested, let actual):
-            return "Output device readback was \(actual), expected "
-                + "\(requested)."
+        case .readbackMismatch(let req, let act):
+            return "Output device readback mismatch: req \(req), act \(act)."
         case .engineRestart(let detail):
             return "The audio engine could not restart: \(detail)"
         }
-    }
-
-    private static func describe(_ status: OSStatus) -> String {
-        let value = UInt32(bitPattern: status)
-        let bytes = [
-            UInt8((value >> 24) & 0xff),
-            UInt8((value >> 16) & 0xff),
-            UInt8((value >> 8) & 0xff),
-            UInt8(value & 0xff),
-        ]
-        let printable = bytes.allSatisfy { $0 >= 32 && $0 <= 126 }
-        guard printable, let fourCC = String(bytes: bytes,
-                                             encoding: .ascii) else {
-            return String(status)
-        }
-        return "\(status), '\(fourCC)'"
     }
 }
 
@@ -99,16 +78,13 @@ final class AudioPropertyListenerRegistration {
 
 protocol AudioHardwareBackend: AnyObject {
     func deviceIDs() throws -> [AudioDeviceID]
-    func outputChannelCount(
-        deviceID: AudioDeviceID
-    ) throws -> UInt32
+    func outputChannelCount(deviceID: AudioDeviceID) throws -> UInt32
+    func transportType(deviceID: AudioDeviceID) throws -> UInt32
     func deviceUID(deviceID: AudioDeviceID) throws -> String
     func deviceName(deviceID: AudioDeviceID) throws -> String
     func translate(uid: String) throws -> AudioDeviceID?
     func defaultOutputDeviceID() throws -> AudioDeviceID
-    func addListener(
-        _ registration: AudioPropertyListenerRegistration
-    ) throws
+    func addListener(_ registration: AudioPropertyListenerRegistration) throws
     func removeListener(
         _ registration: AudioPropertyListenerRegistration
     ) throws
@@ -123,7 +99,8 @@ final class CoreAudioOutputDeviceProvider: AudioOutputDeviceProviding {
     init(
         backend: AudioHardwareBackend = CoreAudioHardwareBackend(),
         listenerQueue: DispatchQueue = DispatchQueue(
-            label: "wren.audio-output-devices")
+            label: "wren.audio-output-devices"
+        )
     ) {
         self.backend = backend
         self.listenerQueue = listenerQueue
@@ -134,8 +111,10 @@ final class CoreAudioOutputDeviceProvider: AudioOutputDeviceProviding {
     }
 
     func snapshot() throws -> AudioOutputDeviceSnapshot {
+        // A device that vanishes or misreports mid-enumeration (unplugged
+        // USB DAC) is skipped rather than emptying the whole list.
         let resolved = try backend.deviceIDs().compactMap { deviceID in
-            try resolve(deviceID: deviceID)
+            (try? resolve(deviceID: deviceID)) ?? nil
         }
         let devices = resolved
             .map(\.device)
@@ -145,19 +124,23 @@ final class CoreAudioOutputDeviceProvider: AudioOutputDeviceProviding {
             }
         let defaultID = try backend.defaultOutputDeviceID()
         guard defaultID != kAudioObjectUnknown,
-              let defaultDevice = try resolve(deviceID: defaultID) else {
+              let defaultDevice = try resolve(
+                deviceID: defaultID,
+                allowNonStandard: true
+              ) else {
             throw AudioOutputError.noDefaultOutput
         }
         return AudioOutputDeviceSnapshot(
             devices: devices,
-            defaultDevice: defaultDevice)
+            defaultDevice: defaultDevice
+        )
     }
 
     func resolve(uid: String) throws -> ResolvedAudioOutputDevice? {
         guard let deviceID = try backend.translate(uid: uid) else {
             return nil
         }
-        return try resolve(deviceID: deviceID)
+        return try resolve(deviceID: deviceID, allowNonStandard: true)
     }
 
     func startObserving(
@@ -167,45 +150,36 @@ final class CoreAudioOutputDeviceProvider: AudioOutputDeviceProviding {
         let descriptors = [
             (
                 address: Self.address(
-                    selector: kAudioHardwarePropertyDevices),
+                    selector: kAudioHardwarePropertyDevices
+                ),
                 change: AudioOutputDeviceChange.devices
             ),
             (
                 address: Self.address(
-                    selector: kAudioHardwarePropertyDefaultOutputDevice),
+                    selector: kAudioHardwarePropertyDefaultOutputDevice
+                ),
                 change: AudioOutputDeviceChange.defaultOutput
             ),
         ]
         var added: [AudioPropertyListenerRegistration] = []
-        do {
-            for descriptor in descriptors {
-                let expected = descriptor.address.mSelector
-                let change = descriptor.change
-                let block: AudioObjectPropertyListenerBlock = {
-                    count, addresses in
-                    for index in 0 ..< Int(count)
-                    where addresses[index].mSelector == expected {
-                        handler(change)
-                        return
-                    }
-                }
-                let registration = AudioPropertyListenerRegistration(
-                    address: descriptor.address,
-                    queue: listenerQueue,
-                    block: block)
-                try backend.addListener(registration)
-                added.append(registration)
-            }
-        } catch {
-            for listener in added.reversed() {
-                do {
-                    try backend.removeListener(listener)
-                } catch {
-                    NSLog(
-                        "wren output listener rollback failed: \(error)")
+        for descriptor in descriptors {
+            let expected = descriptor.address.mSelector
+            let change = descriptor.change
+            let block: AudioObjectPropertyListenerBlock = {
+                count, addresses in
+                for index in 0 ..< Int(count)
+                where addresses[index].mSelector == expected {
+                    handler(change)
+                    return
                 }
             }
-            throw error
+            let reg = AudioPropertyListenerRegistration(
+                address: descriptor.address,
+                queue: listenerQueue,
+                block: block
+            )
+            try backend.addListener(reg)
+            added.append(reg)
         }
         lock.lock()
         listeners = added
@@ -218,25 +192,38 @@ final class CoreAudioOutputDeviceProvider: AudioOutputDeviceProviding {
         listeners = []
         lock.unlock()
         for listener in current.reversed() {
-            do {
-                try backend.removeListener(listener)
-            } catch {
-                NSLog("wren output listener removal failed: \(error)")
-            }
+            try? backend.removeListener(listener)
         }
     }
 
     private func resolve(
-        deviceID: AudioDeviceID
+        deviceID: AudioDeviceID,
+        allowNonStandard: Bool = false
     ) throws -> ResolvedAudioOutputDevice? {
+        // Input-only devices (microphones) report zero output channels.
         guard try backend.outputChannelCount(deviceID: deviceID) > 0 else {
             return nil
         }
+        // Aggregates and virtual drivers (Zoom, BlackHole, Teams) are not
+        // speakers a user picks; the system default still resolves even
+        // when it is one of them, so playback never loses its route.
+        let transport = try backend.transportType(deviceID: deviceID)
+        let excludedTransports: Set<UInt32> = [
+            kAudioDeviceTransportTypeAggregate,
+            kAudioDeviceTransportTypeAutoAggregate,
+            kAudioDeviceTransportTypeVirtual,
+        ]
+        if !allowNonStandard && excludedTransports.contains(transport) {
+            return nil
+        }
+
         return ResolvedAudioOutputDevice(
             device: AudioOutputDevice(
                 uid: try backend.deviceUID(deviceID: deviceID),
-                name: try backend.deviceName(deviceID: deviceID)),
-            objectID: deviceID)
+                name: try backend.deviceName(deviceID: deviceID)
+            ),
+            objectID: deviceID
+        )
     }
 
     private static func address(
@@ -245,73 +232,66 @@ final class CoreAudioOutputDeviceProvider: AudioOutputDeviceProviding {
         AudioObjectPropertyAddress(
             mSelector: selector,
             mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain)
+            mElement: kAudioObjectPropertyElementMain
+        )
     }
-
 }
 
 final class CoreAudioHardwareBackend: AudioHardwareBackend {
     private let systemObject = AudioObjectID(kAudioObjectSystemObject)
 
     func deviceIDs() throws -> [AudioDeviceID] {
-        do {
-            return try readDeviceIDs()
-        } catch {
-            return try readDeviceIDs()
-        }
-    }
-
-    private func readDeviceIDs() throws -> [AudioDeviceID] {
         let address = propertyAddress(
-            selector: kAudioHardwarePropertyDevices)
+            selector: kAudioHardwarePropertyDevices
+        )
         let size = try propertySize(
             objectID: systemObject,
             address: address,
-            operation: "Enumerating audio devices")
+            operation: "Enumerating audio devices"
+        )
         let stride = UInt32(MemoryLayout<AudioDeviceID>.stride)
         guard size > 0, size % stride == 0 else {
             throw AudioOutputError.invalidProperty(
-                operation: "Enumerating audio devices")
+                operation: "Enumerating audio devices"
+            )
         }
         var ids = [AudioDeviceID](
             repeating: kAudioObjectUnknown,
-            count: Int(size / stride))
+            count: Int(size / stride)
+        )
         var returnedSize = size
+        var mutableAddress = address
         let status = ids.withUnsafeMutableBytes { bytes in
-            var address = address
-            return AudioObjectGetPropertyData(
+            AudioObjectGetPropertyData(
                 systemObject,
-                &address,
+                &mutableAddress,
                 0,
                 nil,
                 &returnedSize,
-                bytes.baseAddress!)
+                bytes.baseAddress!
+            )
         }
         try requireSuccess(status, operation: "Enumerating audio devices")
-        guard returnedSize == size else {
-            throw AudioOutputError.invalidProperty(
-                operation: "Enumerating audio devices")
-        }
         return ids
     }
 
-    func outputChannelCount(
-        deviceID: AudioDeviceID
-    ) throws -> UInt32 {
+    func outputChannelCount(deviceID: AudioDeviceID) throws -> UInt32 {
         let address = propertyAddress(
             selector: kAudioDevicePropertyStreamConfiguration,
-            scope: kAudioObjectPropertyScopeOutput)
+            scope: kAudioObjectPropertyScopeOutput
+        )
         let size = try propertySize(
             objectID: deviceID,
             address: address,
-            operation: "Reading output channels")
+            operation: "Reading output channels"
+        )
         guard size >= UInt32(MemoryLayout<UInt32>.size) else {
-            throw AudioOutputError.invalidProperty(
-                operation: "Reading output channels")
+            return 0
         }
         let raw = UnsafeMutableRawPointer.allocate(
             byteCount: Int(size),
-            alignment: MemoryLayout<AudioBufferList>.alignment)
+            alignment: MemoryLayout<AudioBufferList>.alignment
+        )
         defer { raw.deallocate() }
         var returnedSize = size
         var mutableAddress = address
@@ -321,74 +301,94 @@ final class CoreAudioHardwareBackend: AudioHardwareBackend {
             0,
             nil,
             &returnedSize,
-            raw)
+            raw
+        )
         try requireSuccess(status, operation: "Reading output channels")
-        guard returnedSize == size else {
-            throw AudioOutputError.invalidProperty(
-                operation: "Reading output channels")
-        }
         return try Self.outputChannelCount(
-            from: UnsafeRawBufferPointer(start: raw, count: Int(size)))
+            from: UnsafeRawBufferPointer(start: raw, count: Int(size))
+        )
     }
 
     static func outputChannelCount(
         from raw: UnsafeRawBufferPointer
     ) throws -> UInt32 {
-        let operation = "Reading output channels"
         guard raw.count >= MemoryLayout<UInt32>.size,
               let bufferOffset = MemoryLayout<AudioBufferList>.offset(
-                of: \AudioBufferList.mBuffers),
+                of: \AudioBufferList.mBuffers
+              ),
               let channelOffset = MemoryLayout<AudioBuffer>.offset(
-                of: \AudioBuffer.mNumberChannels)
+                of: \AudioBuffer.mNumberChannels
+              )
         else {
-            throw AudioOutputError.invalidProperty(operation: operation)
-        }
-        let bufferCount = UInt64(raw.load(as: UInt32.self))
-        guard bufferCount > 0 else {
             return 0
         }
+        let bufferCount = UInt64(raw.load(as: UInt32.self))
+        guard bufferCount > 0 else { return 0 }
         let bufferStride = MemoryLayout<AudioBuffer>.stride
         guard bufferStride >= MemoryLayout<UInt32>.size,
               channelOffset <= bufferStride - MemoryLayout<UInt32>.size,
               bufferOffset <= raw.count,
               bufferCount <= UInt64(
-                (raw.count - bufferOffset) / bufferStride)
+                (raw.count - bufferOffset) / bufferStride
+              )
         else {
-            throw AudioOutputError.invalidProperty(operation: operation)
+            return 0
         }
         var channelCount: UInt32 = 0
         for index in 0 ..< Int(bufferCount) {
             let offset = bufferOffset + index * bufferStride + channelOffset
             let channels = raw.load(
                 fromByteOffset: offset,
-                as: UInt32.self)
-            let (updatedCount, overflow) =
+                as: UInt32.self
+            )
+            let (updated, overflow) =
                 channelCount.addingReportingOverflow(channels)
-            guard !overflow else {
-                throw AudioOutputError.invalidProperty(operation: operation)
-            }
-            channelCount = updatedCount
+            guard !overflow else { return channelCount }
+            channelCount = updated
         }
         return channelCount
+    }
+
+    func transportType(deviceID: AudioDeviceID) throws -> UInt32 {
+        var address = propertyAddress(
+            selector: kAudioDevicePropertyTransportType
+        )
+        var transport: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        let status = AudioObjectGetPropertyData(
+            deviceID,
+            &address,
+            0,
+            nil,
+            &size,
+            &transport
+        )
+        if status != noErr {
+            return 0
+        }
+        return transport
     }
 
     func deviceUID(deviceID: AudioDeviceID) throws -> String {
         try stringProperty(
             deviceID: deviceID,
             selector: kAudioDevicePropertyDeviceUID,
-            operation: "Reading audio device UID")
+            operation: "Reading audio device UID"
+        )
     }
 
     func deviceName(deviceID: AudioDeviceID) throws -> String {
         try stringProperty(
             deviceID: deviceID,
             selector: kAudioObjectPropertyName,
-            operation: "Reading audio device name")
+            operation: "Reading audio device name"
+        )
     }
 
     func translate(uid: String) throws -> AudioDeviceID? {
         var address = propertyAddress(
-            selector: kAudioHardwarePropertyTranslateUIDToDevice)
+            selector: kAudioHardwarePropertyTranslateUIDToDevice
+        )
         let qualifierValue = uid as CFString
         var qualifier = Unmanaged.passUnretained(qualifierValue)
         var result = AudioDeviceID(kAudioObjectUnknown)
@@ -400,19 +400,17 @@ final class CoreAudioHardwareBackend: AudioHardwareBackend {
                 UInt32(MemoryLayout<Unmanaged<CFString>>.stride),
                 pointer,
                 &size,
-                &result)
+                &result
+            )
         }
         try requireSuccess(status, operation: "Resolving audio device UID")
-        guard size == UInt32(MemoryLayout<AudioDeviceID>.size) else {
-            throw AudioOutputError.invalidProperty(
-                operation: "Resolving audio device UID")
-        }
         return result == kAudioObjectUnknown ? nil : result
     }
 
     func defaultOutputDeviceID() throws -> AudioDeviceID {
         var address = propertyAddress(
-            selector: kAudioHardwarePropertyDefaultOutputDevice)
+            selector: kAudioHardwarePropertyDefaultOutputDevice
+        )
         var result = AudioDeviceID(kAudioObjectUnknown)
         var size = UInt32(MemoryLayout<AudioDeviceID>.size)
         let status = AudioObjectGetPropertyData(
@@ -421,15 +419,9 @@ final class CoreAudioHardwareBackend: AudioHardwareBackend {
             0,
             nil,
             &size,
-            &result)
+            &result
+        )
         try requireSuccess(status, operation: "Reading default output")
-        guard size == UInt32(MemoryLayout<AudioDeviceID>.size) else {
-            throw AudioOutputError.invalidProperty(
-                operation: "Reading default output")
-        }
-        guard result != kAudioObjectUnknown else {
-            throw AudioOutputError.noDefaultOutput
-        }
         return result
     }
 
@@ -441,7 +433,8 @@ final class CoreAudioHardwareBackend: AudioHardwareBackend {
             systemObject,
             &address,
             registration.queue,
-            registration.block)
+            registration.block
+        )
         try requireSuccess(status, operation: "Adding audio device listener")
     }
 
@@ -453,10 +446,9 @@ final class CoreAudioHardwareBackend: AudioHardwareBackend {
             systemObject,
             &address,
             registration.queue,
-            registration.block)
-        try requireSuccess(
-            status,
-            operation: "Removing audio device listener")
+            registration.block
+        )
+        try requireSuccess(status, operation: "Removing audio device listener")
     }
 
     private func stringProperty(
@@ -466,8 +458,7 @@ final class CoreAudioHardwareBackend: AudioHardwareBackend {
     ) throws -> String {
         var address = propertyAddress(selector: selector)
         var value: Unmanaged<CFString>?
-        let expectedSize =
-            UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+        let expectedSize = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
         var size = expectedSize
         let status = withUnsafeMutablePointer(to: &value) { pointer in
             AudioObjectGetPropertyData(
@@ -476,17 +467,14 @@ final class CoreAudioHardwareBackend: AudioHardwareBackend {
                 0,
                 nil,
                 &size,
-                pointer)
+                pointer
+            )
         }
         try requireSuccess(status, operation: operation)
         guard size == expectedSize, let value else {
             throw AudioOutputError.invalidProperty(operation: operation)
         }
-        let string = value.takeRetainedValue() as String
-        guard !string.isEmpty else {
-            throw AudioOutputError.invalidProperty(operation: operation)
-        }
-        return string
+        return value.takeRetainedValue() as String
     }
 
     private func propertySize(
@@ -501,7 +489,8 @@ final class CoreAudioHardwareBackend: AudioHardwareBackend {
             &address,
             0,
             nil,
-            &size)
+            &size
+        )
         try requireSuccess(status, operation: operation)
         return size
     }
@@ -513,7 +502,8 @@ final class CoreAudioHardwareBackend: AudioHardwareBackend {
         AudioObjectPropertyAddress(
             mSelector: selector,
             mScope: scope,
-            mElement: kAudioObjectPropertyElementMain)
+            mElement: kAudioObjectPropertyElementMain
+        )
     }
 
     private func requireSuccess(
@@ -523,7 +513,8 @@ final class CoreAudioHardwareBackend: AudioHardwareBackend {
         guard status == noErr else {
             throw AudioOutputError.osStatus(
                 operation: operation,
-                status: status)
+                status: status
+            )
         }
     }
 }

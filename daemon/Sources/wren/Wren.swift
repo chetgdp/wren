@@ -5,52 +5,48 @@ import Foundation
 struct Wren: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "wren",
-        abstract: "The wren TTS daemon: menu bar app (default) "
-            + "and CLI for tts/serve.py.",
+        abstract: "Wren speech client: menu bar app (default) and CLI.",
         subcommands: [
             RunApp.self, Say.self, Yell.self, Stop.self, Pause.self,
             Resume.self, Voices.self, Voice.self, Effects.self,
             StateCommand.self, Status.self, Doctor.self,
         ],
-        // Spotlight launches the bundle binary with no arguments; bare
-        // `wren` in a terminal does the same thing on purpose (one
-        // executable, one behavior). The CLI lives in the subcommands.
         defaultSubcommand: RunApp.self
     )
 }
 
-/// --host/--token shared by every subcommand; resolution order is
-/// flag > WREN_HOST/WREN_TOKEN env > 127.0.0.1:8765 / no token.
 struct ClientOptions: ParsableArguments {
-    @Option(
-        name: .long,
-        help: ArgumentHelp(
-            "Daemon host:port (default: $WREN_HOST or "
-                + "\(DaemonClient.defaultHost))."))
+    @Option(name: .long, help: "Server host:port (env WREN_HOST).")
     var host: String?
 
-    @Option(name: .long, help: "Bearer token (default: $WREN_TOKEN).")
-    var token: String?
-
-    var client: DaemonClient {
+    /// Flag beats env beats saved (see Endpoint).
+    func client(
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        saved: EndpointPersisting = SystemEndpointStore()
+    ) -> DaemonClient {
         DaemonClient(
-            host: DaemonClient.resolveHost(flag: host),
-            token: DaemonClient.resolveToken(flag: token)
+            host: Endpoint.resolveHost(
+                flag: host,
+                environment: environment,
+                saved: saved.savedHost
+            )
         )
     }
 }
 
-/// Report to stderr and exit nonzero without ArgumentParser's "Error:"
-/// prefix, so scripts see the daemon's message verbatim.
-func fail(_ error: Error) -> ExitCode {
-    let message = String(describing: error)
-    FileHandle.standardError.write(Data("\(message)\n".utf8))
-    return ExitCode(1)
+/// Runs one request and turns any failure into a one-line stderr message
+/// and exit 1, instead of ArgumentParser's usage dump.
+func request<T: Sendable>(
+    _ body: @escaping @Sendable () async throws -> T
+) throws -> T {
+    do {
+        return try blocking(body)
+    } catch {
+        FileHandle.standardError.write(Data("wren: \(error)\n".utf8))
+        throw ExitCode(1)
+    }
 }
 
-/// Where say/yell text comes from: arguments joined with spaces (fish
-/// substitutions split lines into words, loose typing gives several
-/// arguments), else piped stdin. Injectable so tests need no real pipe.
 enum SpeakInput {
     static func resolve(
         arguments: [String],
@@ -61,834 +57,407 @@ enum SpeakInput {
     ) throws -> String {
         if !arguments.isEmpty { return arguments.joined(separator: " ") }
         guard !stdinIsTTY() else {
-            throw ValidationFailure(
-                "no text to speak: pass words or pipe text in")
+            throw ValidationError("no text to speak: pass words or pipe text")
         }
         let text = String(decoding: readStdin(), as: UTF8.self)
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else {
-            throw ValidationFailure("no text to speak: stdin was empty")
+            throw ValidationError("no text to speak: stdin was empty")
         }
         return text
     }
 }
 
-struct Say: ParsableCommand {
-    static let configuration = CommandConfiguration(
-        abstract: "Speak text through the daemon (POST /speak)."
-    )
-
-    @Argument(
-        help: ArgumentHelp(
-            "Text to speak; several arguments are joined, "
-                + "none reads stdin."))
+struct SpeakOptions: ParsableArguments {
+    @Argument(help: "Text to speak (or pipe it on stdin).")
     var text: [String] = []
 
-    @Flag(name: .long, help: "Skip the daemon's markdown stripping.")
-    var raw: Bool = false
+    @Flag(name: .long, help: "Skip markdown stripping.")
+    var raw = false
 
-    @Option(
-        name: .long,
-        help: ArgumentHelp(
-            "Playback speed 0.5-3.0, pitch-preserving; "
-                + "sticks until changed."))
+    @Option(name: .long, help: "Playback speed 0.5-3.0.")
     var speed: Double?
 
-    @OptionGroup var options: ClientOptions
-
-    // Always queue: concurrent callers (user + agents) must never cut each
-    // other off; preemption is reserved for `wren stop`.
-    var body: SpeakRequest {
-        SpeakRequest(
-            text: text.joined(separator: " "),
-            append: true,
-            raw: raw ? true : nil,
-            speed: speed
-        )
+    func validate() throws {
+        if let speed, !(0.5...3.0).contains(speed) {
+            throw ValidationError("--speed must be between 0.5 and 3.0")
+        }
     }
 
+    /// No channel: the server routes CLI speech to the active Mac, which
+    /// is the whole point of running `wren say` over SSH.
+    func body(append: Bool) throws -> SpeakRequest {
+        SpeakRequest(
+            text: try SpeakInput.resolve(arguments: text),
+            append: append,
+            raw: raw ? true : nil,
+            speed: speed,
+            channel: nil
+        )
+    }
+}
+
+struct Say: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        abstract: "Queue text on the active Mac (POST /speak, append)."
+    )
+
+    @OptionGroup var speak: SpeakOptions
+    @OptionGroup var options: ClientOptions
+
     func run() throws {
-        let client = options.client
-        var payload = body
-        payload.text = try SpeakInput.resolve(arguments: text)
-        let request = payload
-        do {
-            let response: SpeakResponse = try blocking {
-                try await client.post("/speak", body: request)
-            }
-            print("queued \(response.queued)")
-        } catch {
-            throw fail(error)
-        }
+        let client = options.client()
+        let body = try speak.body(append: true)
+        let res = try request { try await client.speak(body) }
+        print("queued \(res.queued) on \(res.channel ?? "active client")")
     }
 }
 
 struct Yell: ParsableCommand {
     static let configuration = CommandConfiguration(
-        abstract: "Speak immediately, cutting off the current queue "
-            + "(POST /speak)."
+        abstract: "Speak now, cutting off the active Mac (POST /speak)."
     )
 
-    @Argument(
-        help: ArgumentHelp(
-            "Text to speak; several arguments are joined, "
-                + "none reads stdin."))
-    var text: [String] = []
-
-    @Flag(name: .long, help: "Skip the daemon's markdown stripping.")
-    var raw: Bool = false
-
-    @Option(
-        name: .long,
-        help: ArgumentHelp(
-            "Playback speed 0.5-3.0, pitch-preserving; "
-                + "sticks until changed."))
-    var speed: Double?
-
+    @OptionGroup var speak: SpeakOptions
     @OptionGroup var options: ClientOptions
 
-    // The one deliberate preemption path: append stays off the wire so the
-    // daemon cuts whatever is playing; `wren say` can never cut anyone off.
-    var body: SpeakRequest {
-        SpeakRequest(
-            text: text.joined(separator: " "),
-            append: nil,
-            raw: raw ? true : nil,
-            speed: speed
-        )
-    }
-
     func run() throws {
-        let client = options.client
-        var payload = body
-        payload.text = try SpeakInput.resolve(arguments: text)
-        let request = payload
-        do {
-            let response: SpeakResponse = try blocking {
-                try await client.post("/speak", body: request)
-            }
-            print("queued \(response.queued)")
-        } catch {
-            throw fail(error)
-        }
+        let client = options.client()
+        let body = try speak.body(append: false)
+        let res = try request { try await client.speak(body) }
+        print("queued \(res.queued) on \(res.channel ?? "active client")")
     }
 }
 
 struct Stop: ParsableCommand {
     static let configuration = CommandConfiguration(
-        abstract: "Stop speech and clear the queue (POST /stop)."
+        abstract: "Stop speech on the active Mac (POST /stop)."
     )
+
+    @Flag(name: .long, help: "Stop every channel.")
+    var all = false
 
     @OptionGroup var options: ClientOptions
 
     func run() throws {
-        let client = options.client
-        do {
-            let _: StopResponse = try blocking {
-                try await client.post("/stop")
-            }
-            print("stopped")
-        } catch {
-            throw fail(error)
-        }
+        let client = options.client()
+        let all = all
+        _ = try request { try await client.stop(all: all) }
+        print(all ? "stopped all" : "stopped")
     }
 }
 
 struct Pause: ParsableCommand {
     static let configuration = CommandConfiguration(
-        abstract: "Pause playback (POST /pause)."
+        abstract: "Pause the active Mac (POST /pause)."
     )
 
     @OptionGroup var options: ClientOptions
 
     func run() throws {
-        let client = options.client
-        do {
-            let response: PauseResponse = try blocking {
-                try await client.post("/pause")
-            }
-            print(response.paused ? "paused" : "not paused")
-        } catch {
-            throw fail(error)
-        }
+        let client = options.client()
+        let res = try request { try await client.pause() }
+        print(res.paused ? "paused" : "not paused")
     }
 }
 
 struct Resume: ParsableCommand {
     static let configuration = CommandConfiguration(
-        abstract: "Resume paused playback (POST /resume)."
+        abstract: "Resume the active Mac (POST /resume)."
     )
 
     @OptionGroup var options: ClientOptions
 
     func run() throws {
-        let client = options.client
-        do {
-            let response: PauseResponse = try blocking {
-                try await client.post("/resume")
-            }
-            print(response.paused ? "still paused" : "resumed")
-        } catch {
-            throw fail(error)
-        }
-    }
-}
-
-struct CLICommandFailure: Error, CustomStringConvertible {
-    let description: String
-}
-
-func freshRequestID() -> String {
-    UUID().uuidString
-}
-
-enum MutationResolution {
-    typealias Delay = () async throws -> Void
-
-    static func pollDelay() async throws {
-        try await Task.sleep(nanoseconds: 100_000_000)
-    }
-
-    static func wait(
-        client: DaemonClient,
-        requestID: String,
-        instanceID: String,
-        initial: OperationResponse?,
-        delay: @escaping Delay = pollDelay
-    ) async throws -> OperationResponse {
-        var operation = initial
-        while true {
-            if operation == nil {
-                let meta = try await client.meta()
-                try DaemonClient.validateIdentity(meta)
-                guard meta.instanceID == instanceID else {
-                    throw CLICommandFailure(
-                        description: "daemon instance changed from "
-                            + "\(instanceID) to \(meta.instanceID) while "
-                            + "operation \(requestID) was running"
-                    )
-                }
-                operation = try await client.operation(requestID: requestID)
-            }
-            guard let current = operation else {
-                throw CLICommandFailure(
-                    description: "operation \(requestID) disappeared"
-                )
-            }
-            guard current.id == requestID else {
-                throw CLICommandFailure(
-                    description: "daemon returned operation \(current.id) "
-                        + "for request \(requestID)"
-                )
-            }
-
-            switch current.phase {
-            case .succeeded:
-                return current
-            case .failed:
-                if let error = current.error {
-                    throw CLICommandFailure(
-                        description: "\(error.code): \(error.message)"
-                    )
-                }
-                throw CLICommandFailure(
-                    description: "operation \(requestID) failed without "
-                        + "error detail"
-                )
-            case .pending, .preparing, .committing:
-                try await delay()
-                operation = nil
-            default:
-                throw CLICommandFailure(
-                    description: "operation \(requestID) has unknown phase "
-                        + "'\(current.phase.rawValue)'"
-                )
-            }
-        }
-    }
-
-    static func submit(
-        client: DaemonClient,
-        requestID: String,
-        instanceID: String,
-        delay: @escaping Delay = pollDelay,
-        operation: () async throws -> OperationResponse
-    ) async throws -> OperationResponse {
-        let initial = try await submitAttempt(
-            requestID: requestID,
-            operation: operation)
-        do {
-            return try await wait(
-                client: client,
-                requestID: requestID,
-                instanceID: instanceID,
-                initial: initial,
-                delay: delay)
-        } catch {
-            guard initial == nil, isUnknown(error) else { throw error }
-        }
-        try await validateInstance(
-            client: client,
-            instanceID: instanceID,
-            requestID: requestID)
-        let retried = try await submitAttempt(
-            requestID: requestID,
-            operation: operation)
-        return try await wait(
-            client: client,
-            requestID: requestID,
-            instanceID: instanceID,
-            initial: retried,
-            delay: delay)
-    }
-
-    static func validateInstance(
-        client: DaemonClient,
-        instanceID: String,
-        requestID: String
-    ) async throws {
-        let meta = try await client.meta()
-        try DaemonClient.validateIdentity(meta)
-        guard meta.instanceID == instanceID else {
-            throw CLICommandFailure(
-                description: "daemon instance changed from \(instanceID) "
-                    + "to \(meta.instanceID) while operation \(requestID) "
-                    + "was running")
-        }
-    }
-
-    static func isUnknown(_ error: Error) -> Bool {
-        guard case .management(_, let detail) = error as? DaemonError else {
-            return false
-        }
-        return detail.code == "operation_result_unknown"
-    }
-
-    private static func submitAttempt(
-        requestID: String,
-        operation: () async throws -> OperationResponse
-    ) async throws -> OperationResponse? {
-        do {
-            return try await operation()
-        } catch let error as DaemonError {
-            guard case .ambiguousSubmittedMutation(
-                let ambiguousID,
-                _
-            ) = error, ambiguousID == requestID else {
-                throw error
-            }
-            return nil
-        }
+        let client = options.client()
+        let res = try request { try await client.resume() }
+        print(res.paused ? "still paused" : "resumed")
     }
 }
 
 struct Voices: ParsableCommand {
     static let configuration = CommandConfiguration(
-        abstract: "List daemon voice profiles (GET /voices)."
+        abstract: "List voices; * marks the active one (GET /voices)."
     )
 
     @OptionGroup var options: ClientOptions
 
-    static func output(_ response: VoiceListResponse) -> [String] {
-        guard !response.voices.isEmpty else { return ["no voices"] }
-        return response.voices.flatMap { profile in
-            var lines = [
-                "\(profile.id)\t\(profile.displayName)"
-                    + "\t\(profile.status.rawValue)",
-            ]
-            lines += profile.issues.map { issue in
-                let field = issue.field.map { "\($0): " } ?? ""
-                return "  \(field)\(issue.message) [\(issue.code)]"
-            }
-            return lines
-        }
-    }
-
-    static func execute(client: DaemonClient) async throws -> [String] {
-        let meta = try await client.meta()
-        try DaemonClient.validateIdentity(
-            meta,
-            requiredCapabilities: [.voiceList])
-        return output(try await client.voices())
-    }
-
     func run() throws {
-        do {
-            let lines = try blocking {
-                try await Self.execute(client: options.client)
-            }
-            lines.forEach { print($0) }
-        } catch {
-            throw fail(error)
+        let client = options.client()
+        let res = try request { try await client.voices() }
+        for voice in res.voices {
+            let mark = voice.id == res.activeVoice ? "*" : " "
+            print("\(mark) \(voice.id)\t\(voice.displayName)")
         }
     }
 }
 
 struct Voice: ParsableCommand {
     static let configuration = CommandConfiguration(
-        abstract: "Manage the active daemon voice.",
-        subcommands: [VoiceUse.self]
+        abstract: "Manage voices.",
+        subcommands: [
+            VoiceUse.self, VoiceAdd.self, VoiceRename.self, VoiceDelete.self,
+        ]
     )
 }
 
 struct VoiceUse: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "use",
-        abstract: "Activate a ready voice profile."
+        abstract: "Activate a voice; waits until it is loaded (PUT /voice)."
     )
 
-    @Argument(help: "Stable voice profile ID.")
+    @Argument(help: "Voice id.")
     var voice: String
 
     @OptionGroup var options: ClientOptions
 
-    static func execute(
-        client: DaemonClient,
-        voice: String,
-        requestID: String = freshRequestID(),
-        delay: @escaping MutationResolution.Delay =
-            MutationResolution.pollDelay
-    ) async throws -> String {
-        let meta = try await client.meta()
-        try DaemonClient.validateIdentity(
-            meta,
-            requiredCapabilities: [.voiceActivate]
-        )
-        _ = try await MutationResolution.submit(
-            client: client,
-            requestID: requestID,
-            instanceID: meta.instanceID,
-            delay: delay
-        ) {
-            try await client.activateVoice(
-                voice,
-                requestID: requestID)
+    func run() throws {
+        let client = options.client()
+        let voice = voice
+        let state = try request { try await client.activateVoice(voice) }
+        print("voice \(state.activeVoice ?? voice)")
+    }
+}
+
+struct VoiceAdd: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "add",
+        abstract: "Upload a voice from a WAV clip (POST /voices)."
+    )
+
+    @Argument(help: "Voice id ([a-z0-9_-]).")
+    var id: String
+
+    @Option(name: .long, help: "Display name (defaults to the id).")
+    var name: String?
+
+    @Option(name: .long, help: "Reference WAV file.")
+    var audio: String
+
+    @Option(name: .long, help: "Transcript of the clip.")
+    var transcript: String?
+
+    @Option(name: .long, help: "File holding the transcript.")
+    var transcriptFile: String?
+
+    func validate() throws {
+        if (transcript == nil) == (transcriptFile == nil) {
+            throw ValidationError(
+                "pass exactly one of --transcript or --transcript-file"
+            )
         }
-        return "voice \(voice)"
     }
 
+    @OptionGroup var options: ClientOptions
+
     func run() throws {
-        do {
-            let line = try blocking {
-                try await Self.execute(
-                    client: options.client,
-                    voice: voice
+        let client = options.client()
+        let text: String
+        if let transcriptFile {
+            do {
+                text = try String(
+                    contentsOfFile: transcriptFile,
+                    encoding: .utf8
                 )
+            } catch {
+                throw ValidationError("cannot read \(transcriptFile)")
             }
-            print(line)
-        } catch {
-            throw fail(error)
+        } else {
+            text = transcript ?? ""
         }
+        let url = URL(fileURLWithPath: audio)
+        guard FileManager.default.isReadableFile(atPath: url.path) else {
+            throw ValidationError("cannot read \(audio)")
+        }
+        let id = id
+        let name = name ?? id
+        let clean = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let res = try request {
+            try await client.addVoice(
+                id: id,
+                name: name,
+                audioURL: url,
+                transcript: clean
+            )
+        }
+        print("added \(res.id)\t\(res.displayName)")
+    }
+}
+
+struct VoiceRename: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "rename",
+        abstract: "Change a voice's display name (PATCH /voices/<id>)."
+    )
+
+    @Argument(help: "Voice id.")
+    var id: String
+
+    @Argument(help: "New display name.")
+    var name: String
+
+    @OptionGroup var options: ClientOptions
+
+    func run() throws {
+        let client = options.client()
+        let id = id
+        let name = name
+        let res = try request {
+            try await client.renameVoice(id: id, displayName: name)
+        }
+        print("renamed \(res.id)\t\(res.displayName)")
+    }
+}
+
+struct VoiceDelete: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "delete",
+        abstract: "Delete a voice (DELETE /voices/<id>)."
+    )
+
+    @Argument(help: "Voice id.")
+    var id: String
+
+    @OptionGroup var options: ClientOptions
+
+    func run() throws {
+        let client = options.client()
+        let id = id
+        _ = try request { try await client.deleteVoice(id: id) }
+        print("deleted \(id)")
     }
 }
 
 struct Effects: ParsableCommand {
     enum Setting: String, ExpressibleByArgument {
-        case on
-        case off
-
-        var enabled: Bool { self == .on }
+        case on, off
     }
 
     static let configuration = CommandConfiguration(
-        abstract: "Enable or disable daemon synthesis effects."
+        abstract: "Toggle synthesis effects (PATCH /settings)."
     )
 
-    @Argument(help: "The new daemon-global effects setting.")
+    @Argument(help: "on or off.")
     var setting: Setting
 
     @OptionGroup var options: ClientOptions
 
-    static func execute(
-        client: DaemonClient,
-        setting: Setting,
-        requestID: String = freshRequestID(),
-        delay: @escaping MutationResolution.Delay =
-            MutationResolution.pollDelay
-    ) async throws -> String {
-        let meta = try await client.meta()
-        try DaemonClient.validateIdentity(
-            meta,
-            requiredCapabilities: [.settingsV2]
-        )
-        let update = SettingsUpdateRequest(
-            effects: setting.enabled,
-            defaultSynthesisRate: nil)
-        let state: DaemonStateResponse
-        do {
-            state = try await client.updateSettings(
-                update,
-                requestID: requestID)
-        } catch let error as DaemonError {
-            guard case .ambiguousSubmittedMutation(
-                let ambiguousID,
-                _
-            ) = error, ambiguousID == requestID else {
-                throw error
-            }
-            do {
-                _ = try await MutationResolution.wait(
-                    client: client,
-                    requestID: requestID,
-                    instanceID: meta.instanceID,
-                    initial: nil,
-                    delay: delay)
-            } catch {
-                guard MutationResolution.isUnknown(error) else {
-                    throw error
-                }
-                try await MutationResolution.validateInstance(
-                    client: client,
-                    instanceID: meta.instanceID,
-                    requestID: requestID)
-                do {
-                    state = try await client.updateSettings(
-                        update,
-                        requestID: requestID)
-                    return state.synthesis.effects
-                        ? "effects on"
-                        : "effects off"
-                } catch let retryError as DaemonError {
-                    guard case .ambiguousSubmittedMutation(
-                        let retryID,
-                        _
-                    ) = retryError, retryID == requestID else {
-                        throw retryError
-                    }
-                    _ = try await MutationResolution.wait(
-                        client: client,
-                        requestID: requestID,
-                        instanceID: meta.instanceID,
-                        initial: nil,
-                        delay: delay)
-                }
-            }
-            state = try await client.state()
-        }
-        return state.synthesis.effects ? "effects on" : "effects off"
-    }
-
     func run() throws {
-        do {
-            let line = try blocking {
-                try await Self.execute(
-                    client: options.client,
-                    setting: setting
-                )
-            }
-            print(line)
-        } catch {
-            throw fail(error)
-        }
+        let client = options.client()
+        let update = SettingsUpdateRequest(
+            effects: setting == .on,
+            defaultRate: nil
+        )
+        let res = try request { try await client.updateSettings(update) }
+        print(res.effects == true ? "effects on" : "effects off")
     }
 }
 
 struct StateCommand: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "state",
-        abstract: "Print daemon management state as JSON."
+        abstract: "Print the server's /state as JSON."
     )
 
-    @Flag(name: .long, help: "Emit stable snake_case JSON.")
+    @Flag(name: .long, help: "Emit JSON (required).")
     var json = false
 
     @OptionGroup var options: ClientOptions
 
     func validate() throws {
         guard json else {
-            throw ArgumentParser.ValidationError(
-                "state output requires --json"
-            )
+            throw ValidationError("state output requires --json")
         }
-    }
-
-    static func output(_ state: DaemonStateResponse) throws -> String {
-        let encoder = JSONEncoder()
-        encoder.keyEncodingStrategy = .convertToSnakeCase
-        encoder.outputFormatting = [.sortedKeys]
-        return String(
-            decoding: try encoder.encode(state),
-            as: UTF8.self
-        )
-    }
-
-    static func execute(client: DaemonClient) async throws -> String {
-        let meta = try await client.meta()
-        try DaemonClient.validateIdentity(
-            meta,
-            requiredCapabilities: [.stateV2])
-        return try output(try await client.state())
     }
 
     func run() throws {
-        do {
-            print(try blocking {
-                try await Self.execute(client: options.client)
-            })
-        } catch {
-            throw fail(error)
+        let client = options.client()
+        let state = try request { try await client.state() }
+        let data = try DaemonClient.encoder.encode(state)
+        print(String(decoding: data, as: UTF8.self))
+    }
+}
+
+enum StatusReport {
+    static func lines(host: String, state: DaemonStateResponse) -> [String] {
+        let active = state.activeClient.map { $0.label ?? $0.channel }
+        var lines = [
+            "endpoint:      \(host)",
+            "ready:         \(state.ready)"
+                + (state.error.map { " (\($0))" } ?? ""),
+            "backend:       \(state.backend ?? "-")",
+            "voice:         \(state.activeVoice ?? "-")",
+            "effects:       \(state.effects == true ? "on" : "off")",
+            "active client: \(active ?? "none")",
+        ]
+        for (name, info) in (state.channels ?? [:]).sorted(by: {
+            $0.key < $1.key
+        }) {
+            let flags = [
+                info.speaking ? "speaking" : nil,
+                info.paused ? "paused" : nil,
+                info.pending > 0 ? "\(info.pending) pending" : nil,
+            ].compactMap { $0 }
+            let label = info.label.map { " (\($0))" } ?? ""
+            let detail = flags.isEmpty ? "idle" : flags.joined(separator: ", ")
+            lines.append("channel:       \(name)\(label): \(detail)")
         }
+        return lines
     }
 }
 
 struct Status: ParsableCommand {
     static let configuration = CommandConfiguration(
-        abstract: "Show effective daemon status (GET /meta and /state)."
+        abstract: "Summarize server state (GET /state)."
     )
 
     @OptionGroup var options: ClientOptions
 
-    static func output(
-        meta: MetaResponse,
-        state: DaemonStateResponse
-    ) -> [String] {
-        var lifecycle = state.lifecycle.phase.rawValue
-        if let message = state.lifecycle.message {
-            lifecycle += " (\(message))"
-        }
-        var operation = "-"
-        if let active = state.operation {
-            operation = "\(active.kind) \(active.phase.rawValue)"
-            if let target = active.target {
-                operation += " \(target)"
-            }
-            if let progress = active.progress {
-                operation += " \(Int(progress * 100))%"
-            }
-        }
-        return [
-            "service:   \(meta.service) protocol \(meta.protocolVersion)",
-            "instance:  \(meta.instanceID)",
-            "lifecycle: \(lifecycle)",
-            "voice:     \(state.synthesis.activeVoice ?? "-")",
-            "backend:   \(state.synthesis.backend)",
-            "playback:  speaking=\(state.playback.speaking) "
-                + "paused=\(state.playback.paused) "
-                + "pending=\(state.playback.pending)",
-            "operation: \(operation)",
-        ]
-    }
-
-    static func execute(client: DaemonClient) async throws -> [String] {
-        let meta = try await client.meta()
-        try DaemonClient.validateIdentity(
-            meta,
-            requiredCapabilities: [.stateV2]
-        )
-        return output(meta: meta, state: try await client.state())
-    }
-
     func run() throws {
-        do {
-            let lines = try blocking {
-                try await Self.execute(client: options.client)
-            }
-            lines.forEach { print($0) }
-        } catch {
-            throw fail(error)
-        }
+        let client = options.client()
+        let state = try request { try await client.state() }
+        StatusReport.lines(host: client.host, state: state)
+            .forEach { print($0) }
     }
-}
-
-struct DoctorLocalSnapshot: Equatable, Sendable {
-    let settingsPresent: Bool
-    let migrationSourcePresent: Bool
-    let missingAssets: [String]
-    let output: String
-    let loginItem: LoginItemState
 }
 
 struct Doctor: ParsableCommand {
     static let configuration = CommandConfiguration(
-        abstract: "Diagnose management-v2 and local macOS state."
+        abstract: "Diagnose endpoint, active client, and audio output."
     )
 
     @OptionGroup var options: ClientOptions
 
-    static func output(
-        configuredHost: String,
-        meta: MetaResponse,
-        state: DaemonStateResponse,
-        voices: VoiceListResponse,
-        local: DoctorLocalSnapshot
-    ) -> [String] {
-        let capabilities = meta.capabilities
-            .map(\.rawValue)
-            .sorted()
-            .joined(separator: ",")
-        let effectiveHost = state.synthesis.host ?? "unknown"
-        let effectivePort = state.synthesis.port.map(String.init) ?? "unknown"
-        let readyVoices = voices.voices.filter {
-            $0.status == .ready
-        }.count
-        let unavailableVoices = voices.voices.count - readyVoices
-        let issueCount = voices.voices.reduce(0) {
-            $0 + $1.issues.count
-        }
-        let settingsStatus = local.settingsPresent
-            ? "settings.json present"
-            : "settings.json absent"
-        let migrationStatus = local.migrationSourcePresent
-            ? "legacy migration source retained"
-            : "no legacy migration source"
-        let assets = local.missingAssets.isEmpty
-            ? "local assets ready"
-            : "missing local assets: "
-                + local.missingAssets.joined(separator: ", ")
-        let login = loginItemDescription(local.loginItem)
-
-        return [
-            "protocol: wren v\(meta.protocolVersion) "
-                + "instance=\(meta.instanceID) capabilities=\(capabilities)",
-            "endpoint: configured=\(configuredHost) "
-                + "effective=\(effectiveHost):\(effectivePort)",
-            "state: revision=\(state.revision) "
-                + "lifecycle=\(state.lifecycle.phase.rawValue)",
-            "settings: effects=\(state.synthesis.effects) "
-                + "default_rate=\(state.synthesis.defaultSynthesisRate) "
-                + "\(settingsStatus); \(migrationStatus)",
-            "voices: revision=\(voices.revision) ready=\(readyVoices) "
-                + "unavailable=\(unavailableVoices) issues=\(issueCount) "
-                + "active=\(state.synthesis.activeVoice ?? "-")",
-            "engine: backend=\(state.synthesis.backend) "
-                + "model=\(state.synthesis.model); \(assets)",
-            "output: \(local.output)",
-            "login item: \(login)",
-        ]
-    }
-
-    static func execute(client: DaemonClient) async -> [String] {
-        let local = localSnapshot()
-        do {
-            let meta = try await client.meta()
-            try DaemonClient.validateIdentity(
-                meta,
-                requiredCapabilities: [
-                    .stateV2,
-                    .voiceList,
-                    .voiceActivate,
-                    .settingsV2,
-                    .segmentPlayer,
-                ])
-            let state = try await client.state()
-            let voices = try await client.voices()
-            return output(
-                configuredHost: client.host,
-                meta: meta,
-                state: state,
-                voices: voices,
-                local: local)
-        } catch {
-            return failureOutput(
-                configuredHost: client.host,
-                error: error,
-                local: local)
-        }
-    }
-
     func run() throws {
-        let client = options.client
-        let lines = try blocking {
-            await Self.execute(client: client)
-        }
-        lines.forEach { print($0) }
-    }
-
-    static func failureOutput(
-        configuredHost: String,
-        error: Error,
-        local: DoctorLocalSnapshot
-    ) -> [String] {
-        let settings = local.settingsPresent
-            ? "settings.json present"
-            : "settings.json absent"
-        let migration = local.migrationSourcePresent
-            ? "legacy migration source retained"
-            : "no legacy migration source"
-        let assets = local.missingAssets.isEmpty
-            ? "local assets ready"
-            : "missing local assets: "
-                + local.missingAssets.joined(separator: ", ")
-        return [
-            "protocol: unavailable (\(error))",
-            "endpoint: configured=\(configuredHost) conflict or unavailable",
-            "state: unavailable",
-            "settings: \(settings); \(migration)",
-            "voices: unavailable",
-            "engine: \(assets)",
-            "output: \(local.output)",
-            "login item: \(loginItemDescription(local.loginItem))",
-        ]
-    }
-
-    private static func localSnapshot(
-        paths: WrenPaths = .standard(),
-        fileManager: FileManager = .default,
-        userDefaults: UserDefaults = .standard,
-        audioDevices: AudioOutputDeviceProviding =
-            CoreAudioOutputDeviceProvider(),
-        loginItem: LoginItemProviding = NativeLoginItem()
-    ) -> DoctorLocalSnapshot {
-        let assets = [
-            ("python environment", paths.python),
-            ("daemon server", paths.servePy),
-            ("qwentts engine", paths.engineBinary),
-        ] + ModelFile.all.map {
-            ("model \($0.name)", paths.models.appendingPathComponent($0.name))
-        }
-        let missingAssets = assets.compactMap { name, url in
-            fileManager.fileExists(atPath: url.path) ? nil : name
-        }
-        return DoctorLocalSnapshot(
-            settingsPresent: fileManager.fileExists(
-                atPath: paths.settingsFile.path),
-            migrationSourcePresent: fileManager.fileExists(
-                atPath: paths.configFile.path),
-            missingAssets: missingAssets,
-            output: outputDescription(
-                devices: audioDevices,
-                userDefaults: userDefaults),
-            loginItem: loginItem.refresh())
-    }
-
-    private static func outputDescription(
-        devices: AudioOutputDeviceProviding,
-        userDefaults: UserDefaults
-    ) -> String {
+        let client = options.client()
+        var healthy = true
+        print("endpoint:      \(client.host)")
+        print("this mac:      \(ClientChannel.defaultChannel())")
         do {
-            let snapshot = try devices.snapshot()
-            guard let uid = userDefaults.string(
-                forKey: WrenStore.outputUIDKey
-            ) else {
-                return "system default "
-                    + "(\(snapshot.defaultDevice.device.name))"
+            let state = try blocking { try await client.state() }
+            print("connection:    ok")
+            print("ready:         \(state.ready)"
+                + (state.error.map { " (\($0))" } ?? ""))
+            healthy = healthy && state.ready
+            if let active = state.activeClient {
+                print("active client: \(active.label ?? active.channel)"
+                    + " [\(active.channel)]")
+            } else {
+                print("active client: none: CLI speech will fail with 409")
+                healthy = false
             }
-            if let selected = snapshot.devices.first(
-                where: { $0.uid == uid }
-            ) {
-                return "selected \(selected.name) [\(uid)]"
-            }
-            let savedName = userDefaults.string(
-                forKey: WrenStore.outputNameKey
-            ) ?? uid
-            return "selected \(savedName) unavailable; effective system "
-                + "default (\(snapshot.defaultDevice.device.name))"
         } catch {
-            return "unavailable (\(error))"
+            print("connection:    FAILED (\(error))")
+            healthy = false
         }
-    }
 
-    private static func loginItemDescription(
-        _ state: LoginItemState
-    ) -> String {
-        let status: String
-        if !state.isAvailable {
-            status = "unavailable (CLI cannot query "
-                + "authoritative native-app login state)"
-        } else {
-            status = state.isEnabled ? "enabled" : "disabled"
+        do {
+            let snapshot = try CoreAudioOutputDeviceProvider().snapshot()
+            print("output device: \(snapshot.defaultDevice.device.name)")
+        } catch {
+            print("output device: unavailable (\(error))")
         }
-        guard let error = state.error else { return status }
-        return "\(status) (\(error))"
+        if !healthy { throw ExitCode(1) }
     }
 }

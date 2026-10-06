@@ -8,7 +8,8 @@ const DIST = path.join(SRC, "dist");
 
 const SHARED = [
   "audio.js", "background.js", "content.js",
-  "soundtouch.js", "popup.html", "options.html",
+  "soundtouch.js", "popup.html", "popup.js",
+  "options.html", "options.js",
 ];
 
 const chromeManifest = JSON.parse(
