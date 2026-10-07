@@ -46,8 +46,8 @@ Each voice is a directory `voices/<id>/` with `profile.json`
 speech) and `transcript.txt` (exactly what the clip says). Add voices over
 HTTP with `POST /voices` (multipart: `id`, `display_name`, `audio`,
 `transcript`) or by creating the directory; switch with
-`PUT /voice {"voice": "<id>"}`. Effects and the default speech rate are set
-with `PATCH /settings {"effects": true, "default_rate": 1.2}` and persist in
+`PUT /voice {"voice": "<id>"}`. Effects are set
+with `PATCH /settings {"effects": true}` and persist in
 `settings.json`.
 
 Speech without a `channel` goes to the active client (see below); with no
@@ -63,6 +63,33 @@ Tests: `uv run pytest tts` (runs against a stub tts-server, no model needed).
   playing on the previous Mac stops.
 - The `wren` CLI (`wren say "..."`, including from an SSH session on
   another machine) sends no channel, so the server routes it to that Mac.
+
+### Managed local synthesis server
+
+Wren can automatically launch and supervise a local synthesis server when
+configured with a loopback host (`127.0.0.1:8765` or `localhost:8765`).
+
+- **Toggle**: "Run Local Server" menu row toggles child supervision on and off
+  (defaults to enabled; persisted in defaults key `run_local_server`).
+- **Script**: Defaults key `server_script` specifies the executable path
+  (defaults to `scripts/serve.sh` in repo, configured during `scripts/build.sh`).
+- **Logs**: Output is appended to `~/Library/Logs/wren/server.log`.
+- **Adoption**: If an external server is already responding on the port at launch,
+  Wren adopts it without spawning a child process and never terminates it.
+- **Tailscale / Loopback**: The managed server binds to loopback (`127.0.0.1:8765`).
+  To share it across your tailnet, use `tailscale serve`. If a non-loopback host
+  is selected in Settings, the local server supervision is marked unavailable.
+
+### Building and installing
+
+```sh
+scripts/build.sh
+```
+
+Runs `swift test`, builds release, creates `Wren.app` (`com.heavyetl.wren`), signs with `WREN_SIGN_IDENTITY` (defaults to `otis_local_sign_test`), atomically installs to `~/Applications/Wren.app`, and points the `~/.local/bin/wren` CLI symlink at it.
+
+- Options: pass `--skip-tests` (`-T`) to skip unit tests, `--unsigned` if no signing identity is present in the keychain, or `--identity <name>` to override the signing identity.
+- Smoke test: `scripts/smoke-installed.sh ~/Applications/Wren.app`.
 
 ## Other tools
 

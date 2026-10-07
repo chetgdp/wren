@@ -5,7 +5,6 @@ struct SpeakRequest: Encodable {
     var text: String
     var append: Bool?
     var raw: Bool?
-    var speed: Double?
     var channel: String?
 }
 
@@ -100,8 +99,6 @@ struct RenameVoiceRequest: Encodable, Equatable, Sendable {
 
 struct SettingsUpdateRequest: Encodable, Equatable, Sendable {
     var effects: Bool?
-    var defaultRate: Double?
-
 }
 
 struct DaemonStateResponse: Codable, Equatable, Sendable {
@@ -111,11 +108,9 @@ struct DaemonStateResponse: Codable, Equatable, Sendable {
     var model: String?
     var activeVoice: String?
     var effects: Bool?
-    var defaultRate: Double?
     var activeClient: ClientInfo?
     var channels: [String: ChannelInfo]?
     var voices: [VoiceProfile]?
-
 }
 
 struct ManagementErrorDetail: Codable, Equatable, Sendable {

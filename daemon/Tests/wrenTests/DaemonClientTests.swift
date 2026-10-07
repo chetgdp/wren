@@ -44,14 +44,12 @@ final class RequestBuildingTests: XCTestCase {
             text: "hello",
             append: true,
             raw: nil,
-            speed: 1.5,
             channel: nil
         ))
         assertBase(request, "POST", "/speak")
         let body = jsonBody(request)
         XCTAssertEqual(body["text"] as? String, "hello")
         XCTAssertEqual(body["append"] as? Bool, true)
-        XCTAssertEqual(body["speed"] as? Double, 1.5)
         XCTAssertNil(body["channel"], "CLI speech must route to active")
         XCTAssertNil(body["raw"])
     }
@@ -90,21 +88,22 @@ final class RequestBuildingTests: XCTestCase {
         let request = try client.activateVoiceRequest("c3po")
         assertBase(request, "PUT", "/voice")
         XCTAssertEqual(jsonBody(request) as NSDictionary, ["voice": "c3po"])
+        XCTAssertGreaterThanOrEqual(request.timeoutInterval, 180.0)
     }
 
     func testSettingsUsesSnakeCaseAndOmitsNil() throws {
-        let both = try client.settingsRequest(
-            SettingsUpdateRequest(effects: true, defaultRate: 1.25)
+        let request = try client.settingsRequest(
+            SettingsUpdateRequest(effects: true)
         )
-        assertBase(both, "PATCH", "/settings")
+        assertBase(request, "PATCH", "/settings")
         XCTAssertEqual(
-            jsonBody(both) as NSDictionary,
-            ["effects": true, "default_rate": 1.25]
+            jsonBody(request) as NSDictionary,
+            ["effects": true]
         )
-        let one = try client.settingsRequest(
-            SettingsUpdateRequest(effects: false, defaultRate: nil)
+        let off = try client.settingsRequest(
+            SettingsUpdateRequest(effects: false)
         )
-        XCTAssertEqual(jsonBody(one) as NSDictionary, ["effects": false])
+        XCTAssertEqual(jsonBody(off) as NSDictionary, ["effects": false])
     }
 
     func testRenameAndDeleteEncodeIdSegment() throws {
@@ -208,7 +207,6 @@ final class TransportTests: XCTestCase {
                 "model": "m",
                 "active_voice": "c3po",
                 "effects": true,
-                "default_rate": 1.2,
                 "active_client": ["channel": "mac-a_b", "label": "A"],
                 "channels": [
                     "mac-a_b": [
@@ -228,7 +226,6 @@ final class TransportTests: XCTestCase {
         )
         let state = try await client.state()
         XCTAssertEqual(state.activeVoice, "c3po")
-        XCTAssertEqual(state.defaultRate, 1.2)
         XCTAssertEqual(state.activeClient?.channel, "mac-a_b")
         // Dictionary keys must survive the snake-case strategy verbatim.
         let channel = try XCTUnwrap(state.channels?["mac-a_b"])

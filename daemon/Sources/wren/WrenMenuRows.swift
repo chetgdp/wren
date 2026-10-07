@@ -194,12 +194,7 @@ final class WrenMenuLoginView: NSView {
                         )
                 }
                 .opacity(model.isEnabled ? 1 : 0.5)
-                .animation(
-                    .easeOut(
-                        duration: WrenMenuMetrics.transitionDuration
-                    ),
-                    value: model.isOn
-                )
+                .animation(nil, value: model.isOn)
         }
 
         private var trackColor: Color {
@@ -209,18 +204,16 @@ final class WrenMenuLoginView: NSView {
             return Color(nsColor: .quaternaryLabelColor)
         }
     }
-
-    private let titleLabel = NSTextField(
-        labelWithString: "Launch at Login"
-    )
+    private let titleLabel: NSTextField
     private let warningView = NSImageView()
     private let model: ToggleModel
     private let host: NSHostingView<LoginSwitch>
     var onToggle: ((Bool) -> Void)?
 
-    init() {
+    init(title: String = "Launch at Login") {
         let model = ToggleModel()
         self.model = model
+        titleLabel = NSTextField(labelWithString: title)
         host = NSHostingView(
             rootView: LoginSwitch(model: model)
         )
@@ -234,7 +227,7 @@ final class WrenMenuLoginView: NSView {
         titleLabel.lineBreakMode = .byTruncatingTail
         warningView.image = NSImage(
             systemSymbolName: "exclamationmark.triangle.fill",
-            accessibilityDescription: "Launch at Login warning"
+            accessibilityDescription: "\(title) warning"
         )
         warningView.contentTintColor = .systemOrange
         warningView.isHidden = true
@@ -243,9 +236,8 @@ final class WrenMenuLoginView: NSView {
         addSubview(host)
         setAccessibilityElement(true)
         setAccessibilityRole(.checkBox)
-        setAccessibilityLabel("Launch at Login")
+        setAccessibilityLabel(title)
     }
-
     @available(*, unavailable)
     required init?(coder: NSCoder) {
         fatalError()
@@ -280,18 +272,39 @@ final class WrenMenuLoginView: NSView {
             height: WrenMenuMetrics.titleHeight
         )
     }
-
     func render(_ login: WrenMenuModel.Login) {
-        model.isOn = login.isOn
-        model.isEnabled = login.isEnabled
-        titleLabel.textColor = login.isEnabled
+        render(
+            isOn: login.isOn,
+            isEnabled: login.isEnabled,
+            detail: login.error,
+            tone: login.error == nil ? .normal : .warning
+        )
+    }
+
+    func render(
+        isOn: Bool,
+        isEnabled: Bool,
+        detail: String?,
+        tone: WrenMenuModel.Tone = .normal
+    ) {
+        model.isOn = isOn
+        model.isEnabled = isEnabled
+        titleLabel.textColor = isEnabled
             ? .labelColor
             : .disabledControlTextColor
-        warningView.isHidden = login.error == nil
-        warningView.toolTip = login.error
-        toolTip = login.error
-        setAccessibilityValue(login.isOn)
-        setAccessibilityEnabled(login.isEnabled)
+        warningView.isHidden = detail == nil
+        warningView.toolTip = detail
+        switch tone {
+        case .error:
+            warningView.contentTintColor = .systemRed
+        case .warning:
+            warningView.contentTintColor = .systemOrange
+        case .normal:
+            warningView.contentTintColor = .secondaryLabelColor
+        }
+        toolTip = detail
+        setAccessibilityValue(isOn)
+        setAccessibilityEnabled(isEnabled)
         layoutSubtreeIfNeeded()
     }
 

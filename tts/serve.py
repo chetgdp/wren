@@ -7,14 +7,14 @@ the ACTIVE client: the Mac whose user most recently claimed it via
 POST /clients/active.
 
 Routes (JSON unless noted; errors are {"error": {"code", "message"}}):
-    POST /speak {text | blocks, raw?, append?, speed?, channel?}
+    POST /speak {text | blocks, raw?, append?, channel?}
     POST /stop {channel?, all?}   POST /pause, /resume {channel?}
     POST /seek {delta | block, channel?}
     GET  /segment?channel=&after=&played=&timeout=   audio/wav long-poll
     POST /clients/active {channel, label?}
     GET  /health   GET /state   GET /voices   PUT /voice {voice}
     POST /voices (multipart)   PATCH|DELETE /voices/{id}
-    PATCH /settings {effects?, default_rate?}
+    PATCH /settings {effects?}
 
 Run:
     uv run tts/serve.py --qwentts-bin .../tts-server \\
@@ -55,8 +55,6 @@ MAX_UPLOAD_BYTES = 64 * 1024 * 1024
 # pages. Extension clients pass; non-browser clients send no Origin.
 ALLOWED_ORIGIN_SCHEMES = (
     "chrome-extension:", "moz-extension:", "safari-web-extension:")
-# Rubber Band artifacts dominate outside this range.
-SPEED_MIN, SPEED_MAX = 0.5, 3.0
 SEGMENT_POLL_TIMEOUT = 20.0
 MAX_POLL_TIMEOUT = 25.0
 # Channels are created on first use by name, so abandoned ones (a Mac that
@@ -77,13 +75,6 @@ class ApiError(Exception):
 
 def _bad(message, code="bad_request"):
     return ApiError(400, code, message)
-
-
-def _rate(value, field):
-    if (not isinstance(value, (int, float)) or isinstance(value, bool)
-            or not SPEED_MIN <= value <= SPEED_MAX):
-        raise _bad(f"{field} must be a number in [{SPEED_MIN}, {SPEED_MAX}]")
-    return float(value)
 
 
 def _channel_name(value):
@@ -337,16 +328,15 @@ class App:
 
     # --- voices and settings ---
 
-    def capture(self, rate=None):
-        """Snapshot voice/effects/rate and pin the voice for this request."""
+    def capture(self):
+        """Snapshot voice/effects and pin the voice for this request."""
         with self._lock:
             context = self._context
             if context is None or not self.ready_locked():
                 raise ApiError(503, "not_ready",
                                "The synthesis engine is not ready.")
             snapshot = SynthesisSnapshot(
-                context, bool(self.settings["effects"]),
-                self.settings["default_rate"] if rate is None else rate)
+                context, bool(self.settings["effects"]))
             # Under the lock: a concurrent PUT /voice releases the old
             # context only after swapping, so this pin always lands first.
             self.worker.retain(context)
@@ -395,7 +385,7 @@ class App:
             self.settings = updated
 
     def update_settings(self, body):
-        unknown = set(body) - {"effects", "default_rate"}
+        unknown = set(body) - {"effects"}
         if unknown:
             raise _bad(f"unknown setting: {sorted(unknown)[0]}")
         changes = {}
@@ -403,9 +393,6 @@ class App:
             if not isinstance(body["effects"], bool):
                 raise _bad("effects must be a boolean")
             changes["effects"] = body["effects"]
-        if "default_rate" in body:
-            changes["default_rate"] = _rate(body["default_rate"],
-                                            "default_rate")
         if changes:
             self._persist(**changes)
 
@@ -426,7 +413,6 @@ class App:
             "model": self.model,
             "active_voice": self.active_voice() or settings["active_voice"],
             "effects": bool(settings["effects"]),
-            "default_rate": float(settings["default_rate"]),
             "active_client": self.channels.active(),
             "channels": self.channels.state(),
             "voices": self.voices(),
@@ -611,9 +597,6 @@ class Handler(BaseHTTPRequestHandler):
     def speak(self, url):
         body = self._json_body()
         append = bool(body.get("append"))
-        speed = body.get("speed")
-        if speed is not None:
-            speed = _rate(speed, "speed")
         raw = bool(body.get("raw"))
         if "blocks" in body:
             blocks = body["blocks"]
@@ -636,7 +619,7 @@ class Handler(BaseHTTPRequestHandler):
         if not items:
             self._send_json(200, {"queued": 0, "channel": channel})
             return
-        snapshot = self.app.capture(rate=speed)
+        snapshot = self.app.capture()
         try:
             with self.app.channels.use(channel) as ch:
                 queued = ch.speaker.speak(snapshot, items, append=append)

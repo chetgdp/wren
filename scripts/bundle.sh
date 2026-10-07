@@ -1,15 +1,78 @@
 #!/bin/sh
-# Assemble, sign, and install ~/Applications/Wren.app.
+# Assemble and optionally sign/install Wren.app.
+# Local use only (no notarization, no sparkle).
 set -e
 cd "$(dirname "$0")/.."
 . scripts/release-lib.sh
 
 SOURCE_ROOT="$(pwd)"
-BIN="${1:-daemon/.build/release/wren}"
+BIN=""
+OUTPUT=""
 IDENTITY="${WREN_SIGN_IDENTITY:-otis_local_sign_test}"
-APP="${WREN_INSTALL_APP:-$HOME/Applications/Wren.app}"
-STAGE="${WREN_STAGE_APP:-daemon/.build/Wren.app}"
-CLI_LINK="${WREN_CLI_LINK:-$HOME/.local/bin/wren}"
+UNSIGNED=false
+INSTALL=false
+
+print_usage() {
+    cat <<'EOF' >&2
+usage: scripts/bundle.sh [options] [BIN] [OUTPUT]
+
+Arguments:
+  BIN       Path to compiled binary (default: daemon/.build/release/wren)
+  OUTPUT    Path to target .app bundle
+
+Options:
+  --unsigned    Allow assembling bundle unsigned if signing identity is absent
+  --install     Install atomically to ~/Applications and ~/.local/bin/wren
+  --identity ID Codesigning identity (default: otis_local_sign_test)
+  -h, --help    Show this message
+EOF
+    exit 2
+}
+
+POSITIONAL_ARGS=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --unsigned)
+            UNSIGNED=true
+            shift
+            ;;
+        --install)
+            INSTALL=true
+            shift
+            ;;
+        --identity)
+            IDENTITY="$2"
+            shift 2
+            ;;
+        -h|--help)
+            print_usage
+            ;;
+        *)
+            if [ -z "$BIN" ]; then
+                BIN="$1"
+            elif [ -z "$OUTPUT" ]; then
+                OUTPUT="$1"
+            else
+                echo "unexpected argument: $1" >&2
+                print_usage
+            fi
+            shift
+            ;;
+    esac
+done
+
+[ -n "$BIN" ] || BIN="daemon/.build/release/wren"
+
+BUNDLE_ID="com.heavyetl.wren"
+BUNDLE_NAME="Wren"
+DEFAULT_STAGE="daemon/.build/Wren.app"
+DEFAULT_APP="$HOME/Applications/Wren.app"
+DEFAULT_CLI_LINK="$HOME/.local/bin/wren"
+
+STAGE="${OUTPUT:-$DEFAULT_STAGE}"
+APP="${WREN_INSTALL_APP:-$DEFAULT_APP}"
+CLI_LINK="${WREN_CLI_LINK:-$DEFAULT_CLI_LINK}"
+
 VERSION_LABEL=$(git describe --tags --always 2>/dev/null || echo 0.0.0)
 VERSION_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo 0.0.0)
 VERSION_CORE=${VERSION_TAG#v}
@@ -45,11 +108,11 @@ cat > "$STAGE/Contents/Info.plist" <<EOF
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
     <key>CFBundleIdentifier</key>
-    <string>com.heavyetl.wren</string>
+    <string>$BUNDLE_ID</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
-    <string>Wren</string>
+    <string>$BUNDLE_NAME</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
@@ -64,12 +127,29 @@ cat > "$STAGE/Contents/Info.plist" <<EOF
 </plist>
 EOF
 
-wren_validate_bundle "$STAGE"
+wren_validate_bundle "$STAGE" "$BUNDLE_ID"
 
+HAS_IDENTITY=false
 if security find-identity -v -p codesigning | grep -q "\"$IDENTITY\""; then
-    codesign --force --sign "$IDENTITY" "$STAGE"
-    codesign --verify --strict "$STAGE"
+    HAS_IDENTITY=true
 fi
 
-wren_install_bundle "$STAGE" "$APP" "$CLI_LINK"
-echo "installed $APP ($VERSION_LABEL)"
+if [ "$HAS_IDENTITY" = true ]; then
+    codesign --force --sign "$IDENTITY" "$STAGE"
+    codesign --verify --strict "$STAGE"
+else
+    if [ "$UNSIGNED" = true ]; then
+        echo "warning: signing identity '$IDENTITY' not found; assembling unsigned (--unsigned)" >&2
+    else
+        echo "signing identity '$IDENTITY' not found in keychain" >&2
+        echo "(set WREN_SIGN_IDENTITY to override, or pass --unsigned)" >&2
+        exit 1
+    fi
+fi
+
+if [ "$INSTALL" = true ]; then
+    wren_install_bundle "$STAGE" "$APP" "$CLI_LINK"
+    echo "installed $APP ($VERSION_LABEL)"
+else
+    echo "assembled $STAGE ($VERSION_LABEL, id: $BUNDLE_ID)"
+fi

@@ -19,7 +19,6 @@ class Fixture:
         self.active_client = None
         self.active_voice = "c3po"
         self.effects = False
-        self.default_rate = 1.0
         self.paused = False
         self.stopped = False
         self.voices = [
@@ -55,7 +54,6 @@ class Fixture:
                 "model": "qwen-test",
                 "active_voice": self.active_voice,
                 "effects": self.effects,
-                "default_rate": self.default_rate,
                 "active_client": self.active_client,
                 "channels": {},
                 "voices": self.voices,

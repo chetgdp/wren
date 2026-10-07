@@ -69,11 +69,4 @@ struct SegmentPoll {
         played = seq
         return true
     }
-
-    /// A rebuilt player resumes from the persisted cursor: segments fetched
-    /// but never finished must be re-fetched, not skipped.
-    mutating func resume(fromPlayed seq: Int) {
-        played = max(played, seq)
-        after = max(after, seq)
-    }
 }

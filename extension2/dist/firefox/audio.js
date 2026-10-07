@@ -37,48 +37,49 @@ function stopEntry(s, when) {
 }
 
 function stretchBuffer(raw, tempo, fromSec) {
-  const ch = raw.numberOfChannels;
+  const ch = Math.min(raw.numberOfChannels, 2);
   const sr = raw.sampleRate;
   const dur = raw.duration - fromSec;
   if (dur <= 0) return null;
 
   const st = new SoundTouch();
   st.tempo = tempo;
-  const src = new WebAudioBufferSource(raw);
-  src.position = Math.floor(fromSec * sr);
-  const filter = new SimpleFilter(src, st);
+  const base = new WebAudioBufferSource(raw);
+  // SimpleFilter only processes full 16384-frame batches and drops a
+  // short final batch, so feed silence past the end to flush the tail.
+  const padded = {
+    extract(target, numFrames, position) {
+      const got = Math.max(0, base.extract(target, numFrames, position));
+      target.fill(0, got * 2, numFrames * 2);
+      return numFrames;
+    },
+  };
+  const filter = new SimpleFilter(padded, st);
+  // SimpleFilter passes its own sourcePosition to every extract call,
+  // so setting the source's position would be overwritten.
+  filter.sourcePosition = Math.floor(fromSec * sr);
 
-  // pad output to account for stretching
-  const outLen = Math.ceil(
-    (dur / tempo + 1) * sr
-  );
-  const outBuf = state.ctx.createBuffer(
-    ch, outLen, sr
-  );
-  const interleaved = new Float32Array(outLen * ch);
-  const extracted = filter.extract(
-    interleaved, outLen
-  );
+  const frames = Math.round(dur / tempo * sr);
+  if (frames === 0) return null;
+  // SoundTouch always emits interleaved stereo, even for mono input.
+  const interleaved = new Float32Array(frames * 2);
+  let extracted = 0;
+  while (extracted < frames) {
+    const n = filter.extract(
+      interleaved.subarray(extracted * 2), frames - extracted);
+    if (n === 0) break;
+    extracted += n;
+  }
   if (extracted === 0) return null;
 
-  // de-interleave into output buffer
+  const out = state.ctx.createBuffer(ch, extracted, sr);
   for (let c = 0; c < ch; c++) {
-    const chan = outBuf.getChannelData(c);
+    const chan = out.getChannelData(c);
     for (let i = 0; i < extracted; i++) {
-      chan[i] = interleaved[i * ch + c];
+      chan[i] = interleaved[i * 2 + c];
     }
   }
-
-  // trim to actual content
-  const trimmed = state.ctx.createBuffer(
-    ch, extracted, sr
-  );
-  for (let c = 0; c < ch; c++) {
-    trimmed.getChannelData(c).set(
-      outBuf.getChannelData(c).subarray(0, extracted)
-    );
-  }
-  return trimmed;
+  return out;
 }
 
 function play(raw, when, contentSec, block, seq) {
@@ -100,7 +101,8 @@ function play(raw, when, contentSec, block, seq) {
   const entry = {
     source, gain, block, seq,
     start: when, end: when + dur,
-    buf: raw, contentSec, stopped: false,
+    buf: raw, contentSec, origin: 0, rate: state.rate,
+    stopped: false,
   };
   source.onended = () => { entry.stopped = true; };
   state.scheduled.push(entry);
@@ -241,7 +243,6 @@ function report() {
 function internalSetRate(target) {
   const newRate = clampRate(target);
   if (newRate === state.rate) return;
-  const oldRate = state.rate;
   state.rate = newRate;
 
   const now = state.ctx.currentTime;
@@ -254,9 +255,8 @@ function internalSetRate(target) {
   let nextAt = Math.max(now + 0.005, now);
   for (const s of live) {
     const elapsed = Math.max(0, now - s.start);
-    // how far into original content
-    const origPos = elapsed
-      * (oldRate !== 1 ? oldRate : 1);
+    // An entry that was itself re-stretched starts mid-chunk at its origin.
+    const origPos = s.origin + elapsed * s.rate;
     const remaining = s.contentSec - origPos;
     if (remaining <= 0) continue;
 
@@ -274,7 +274,7 @@ function internalSetRate(target) {
         source, gain, block: s.block, seq: s.seq,
         start: nextAt, end: nextAt + dur,
         buf: s.buf, contentSec: s.contentSec,
-        stopped: false,
+        origin: origPos, rate: newRate, stopped: false,
       };
       source.onended = () => {
         entry.stopped = true;
@@ -290,7 +290,7 @@ function internalSetRate(target) {
         source, gain, block: s.block, seq: s.seq,
         start: nextAt, end: nextAt + dur,
         buf: s.buf, contentSec: s.contentSec,
-        stopped: false,
+        origin: origPos, rate: newRate, stopped: false,
       };
       source.onended = () => {
         entry.stopped = true;

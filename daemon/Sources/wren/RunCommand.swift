@@ -13,29 +13,12 @@ struct RunApp: ParsableCommand {
             + "channel from the synthesis server."
     )
 
-    /// Locals would deallocate when run() reaches app.run(); anchor the
-    /// controller and signal sources for the process's life.
-    @MainActor private static var appRefs: [Any] = []
-
     func run() throws {
-        Task { @MainActor in
-            NSApplication.shared.setActivationPolicy(.accessory)
-            let controller = AppController()
-            RunApp.appRefs.append(controller)
-
-            // Ctrl-C in a terminal and SIGTERM from launchctl both go
-            // through NSApp.terminate so willTerminate stops playback.
-            for sig in [SIGINT, SIGTERM] {
-                signal(sig, SIG_IGN)
-                let source = DispatchSource.makeSignalSource(
-                    signal: sig,
-                    queue: .main
-                )
-                source.setEventHandler { NSApp.terminate(nil) }
-                source.resume()
-                RunApp.appRefs.append(source)
-            }
+        MainActor.assumeIsolated {
+            let coordinator = AppCoordinator()
+            coordinator.start()
+            NSApplication.shared.run()
+            withExtendedLifetime(coordinator) {}
         }
-        NSApplication.shared.run()
     }
 }

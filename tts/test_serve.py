@@ -348,19 +348,30 @@ def test_segment_requires_channel(server):
     assert json.loads(body)["error"]["code"] == "invalid_channel"
 
 
+def test_played_segments_are_not_served_to_a_restarted_client(tmp_path):
+    from speaker import SegmentStore
+
+    clip = tmp_path / "clip.wav"
+    with wave.open(str(clip), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(24000)
+        w.writeframes(b"\0\0" * 2400)
+    store = SegmentStore()
+    for _ in range(3):
+        store.submit(clip, None)
+    assert store.next_after(0, 0)[0] == 1
+    store.report_played(2)
+    # A restarted client polls from 0 again; only the unplayed clip is left.
+    assert store.next_after(0, 0)[0] == 3
+    assert store.unplayed() == 1
+
+
 def test_speak_validation(server):
     assert server.post("/speak", {"text": "", "channel": "a"})[0] == 400
-    assert server.post("/speak", {"text": "x", "speed": 9,
-                                  "channel": "a"})[0] == 400
     assert server.post("/speak", {"text": "x", "channel": "BAD"})[0] == 400
     assert server.post("/clients/active", {})[0] == 400
 
-
-def test_speed_applies(server):
-    server.post("/speak", {"text": "fast.", "channel": "s", "speed": 2.0})
-    _, _, wav = server.segment("s")
-    with wave.open(io.BytesIO(wav)) as w:
-        assert w.getnframes() < 12000 * 0.75
 
 
 def test_not_ready_without_voice(stub_bin, tmp_path):
@@ -452,39 +463,54 @@ def test_voice_upload_rename_delete(server):
 def test_settings_persist_across_restart(stub_bin, data_dir):
     s = Server(stub_bin, data_dir, initial_voice="alpha")
     try:
-        status, state = s.json("PATCH", "/settings",
-                               {"effects": True, "default_rate": 1.5})
+        status, state = s.json("PATCH", "/settings", {"effects": True})
         assert status == 200
-        assert state["effects"] is True and state["default_rate"] == 1.5
+        assert state["effects"] is True
+        assert "default_rate" not in state
+        assert "rate" not in state
         assert s.json("PUT", "/voice", {"voice": "beta"})[0] == 200
-        assert s.json("PATCH", "/settings", {"default_rate": 7})[0] == 400
+        assert s.json("PATCH", "/settings", {"default_rate": 1.5})[0] == 400
+        assert s.json("PATCH", "/settings", {"rate": 1.5})[0] == 400
         assert s.json("PATCH", "/settings", {"bogus": 1})[0] == 400
     finally:
         s.close()
     saved = json.loads((data_dir / "settings.json").read_text())
-    assert saved == {"active_voice": "beta", "effects": True,
-                     "default_rate": 1.5}
+    assert saved == {"active_voice": "beta", "effects": True}
     s = Server(stub_bin, data_dir, initial_voice="alpha")
     try:
         state = s.get("/state")
         assert state["active_voice"] == "beta"
-        assert state["effects"] is True and state["default_rate"] == 1.5
+        assert state["effects"] is True
+        assert "default_rate" not in state
+        assert "rate" not in state
     finally:
         s.close()
 
 
-def test_legacy_settings_key_loads(stub_bin, data_dir):
+def test_legacy_settings_keys_dropped(stub_bin, data_dir):
     (data_dir / "settings.json").write_text(json.dumps({
         "active_voice": "beta", "effects": False,
+        "default_rate": 1.4,
+        "rate": 1.4,
         "default_synthesis_rate": 1.25}))
     s = Server(stub_bin, data_dir)
     try:
         state = s.get("/state")
         assert state["active_voice"] == "beta"
-        assert state["default_rate"] == 1.25
+        assert "default_rate" not in state
+        assert "rate" not in state
+        health = s.get("/health")
+        assert "default_rate" not in health
+        assert "rate" not in health
+        # Trigger save by updating a setting; legacy keys must be dropped on save
+        s.json("PATCH", "/settings", {"effects": True})
     finally:
         s.close()
-
+    saved = json.loads((data_dir / "settings.json").read_text())
+    assert saved == {"active_voice": "beta", "effects": True}
+    assert "default_rate" not in saved
+    assert "rate" not in saved
+    assert "default_synthesis_rate" not in saved
 
 def test_channel_gc_clears_active(server):
     server.post("/clients/active", {"channel": "gone"})

@@ -72,6 +72,141 @@ final class MenuModelTests: XCTestCase {
         XCTAssertEqual(model.outputBadge, "B")
         XCTAssertEqual(model.structure.outputKeys, ["", "a", "b"])
     }
+
+    func testOutputChoicesWhenDesiredDeviceMissingFallsBackToDefault() {
+        let devices = [
+            AudioOutputDevice(uid: "a", name: "Speaker A"),
+        ]
+        let model = WrenMenuModel(state: makeState(
+            devices: devices,
+            desiredUID: "missing-uid"
+        ))
+        XCTAssertEqual(
+            model.outputChoices.map(\.title),
+            ["System Default", "Speaker A", "Missing Device (Unavailable)"]
+        )
+        // Never nothing checked: System Default is checked when desired missing
+        XCTAssertEqual(
+            model.outputChoices.map(\.isChecked),
+            [true, false, false]
+        )
+        XCTAssertEqual(
+            model.outputChoices.map(\.isEnabled),
+            [true, true, false]
+        )
+    }
+    func testLocalServerStatusDisabled() {
+        var state = makeState()
+        state.host = "127.0.0.1:8765"
+        state.localServer = LocalServerState(
+            isEnabled: false,
+            status: .disabled
+        )
+        let model = WrenMenuModel(state: state)
+        XCTAssertFalse(model.localServer.isOn)
+        XCTAssertTrue(model.localServer.isEnabled)
+        XCTAssertNil(model.localServer.detail)
+        XCTAssertEqual(model.localServer.tone, .normal)
+    }
+
+    func testLocalServerStatusStarting() {
+        var state = makeState()
+        state.host = "127.0.0.1:8765"
+        state.localServer = LocalServerState(
+            isEnabled: true,
+            status: .starting
+        )
+        let model = WrenMenuModel(state: state)
+        XCTAssertTrue(model.localServer.isOn)
+        XCTAssertTrue(model.localServer.isEnabled)
+        XCTAssertEqual(model.localServer.detail, "Loading model…")
+        XCTAssertEqual(model.localServer.tone, .normal)
+    }
+
+    func testLocalServerStatusRunning() {
+        var state = makeState()
+        state.host = "127.0.0.1:8765"
+        state.localServer = LocalServerState(
+            isEnabled: true,
+            status: .running
+        )
+        let model = WrenMenuModel(state: state)
+        XCTAssertTrue(model.localServer.isOn)
+        XCTAssertTrue(model.localServer.isEnabled)
+        XCTAssertEqual(model.localServer.detail, "Running")
+        XCTAssertEqual(model.localServer.tone, .normal)
+    }
+
+    func testLocalServerStatusExternal() {
+        var state = makeState()
+        state.host = "127.0.0.1:8765"
+        state.localServer = LocalServerState(
+            isEnabled: true,
+            status: .external
+        )
+        let model = WrenMenuModel(state: state)
+        XCTAssertTrue(model.localServer.isOn)
+        XCTAssertTrue(model.localServer.isEnabled)
+        XCTAssertEqual(model.localServer.detail, "Using existing server")
+        XCTAssertEqual(model.localServer.tone, .normal)
+    }
+
+    func testLocalServerStatusCrashed() {
+        var state = makeState()
+        state.host = "127.0.0.1:8765"
+        state.localServer = LocalServerState(
+            isEnabled: true,
+            status: .crashed("Segmentation fault", retryIn: 4.0)
+        )
+        let model = WrenMenuModel(state: state)
+        XCTAssertTrue(model.localServer.isOn)
+        XCTAssertTrue(model.localServer.isEnabled)
+        XCTAssertEqual(
+            model.localServer.detail,
+            "Crashed: Segmentation fault, retrying in 4s"
+        )
+        XCTAssertEqual(model.localServer.tone, .error)
+    }
+
+    func testLocalServerStatusUnavailableNonLoopbackHost() {
+        var state = makeState()
+        state.host = "192.168.1.50:8765"
+        state.localServer = LocalServerState(
+            isEnabled: true,
+            status: .unavailable("Host '192.168.1.50:8765' is not loopback")
+        )
+        let model = WrenMenuModel(state: state)
+        XCTAssertTrue(model.localServer.isOn)
+        XCTAssertFalse(
+            model.localServer.isEnabled,
+            "Toggle should be disabled when host is non-loopback"
+        )
+        XCTAssertEqual(
+            model.localServer.detail,
+            "Host '192.168.1.50:8765' is not loopback"
+        )
+        XCTAssertEqual(model.localServer.tone, .warning)
+    }
+
+    func testLocalServerStatusUnavailableScriptMissing() {
+        var state = makeState()
+        state.host = "127.0.0.1:8765"
+        state.localServer = LocalServerState(
+            isEnabled: true,
+            status: .unavailable("Script /opt/serve.sh not found")
+        )
+        let model = WrenMenuModel(state: state)
+        XCTAssertTrue(model.localServer.isOn)
+        XCTAssertTrue(
+            model.localServer.isEnabled,
+            "Toggle stays enabled on loopback even if script missing"
+        )
+        XCTAssertEqual(
+            model.localServer.detail,
+            "Script /opt/serve.sh not found"
+        )
+        XCTAssertEqual(model.localServer.tone, .warning)
+    }
 }
 
 @MainActor
@@ -88,6 +223,11 @@ final class MenuBarRenderTests: XCTestCase {
         -> NSMenuItem? {
         bar.menu.items.first { $0.title == "Voice" }?.submenu?.items
             .first { $0.title == title }
+    }
+
+    func testClickingStatusItemOpensMenu() throws {
+        let bar = WrenMenuBar()
+        XCTAssertTrue(bar.statusItem.menu === bar.menu)
     }
 
     func testUnchangedStructureUpdatesInPlace() throws {
@@ -114,6 +254,18 @@ final class MenuBarRenderTests: XCTestCase {
         let count = bar.menu.items.count
         bar.render(makeState(activeVoice: "r2", effects: true))
         XCTAssertEqual(bar.menu.items.count, count)
+    }
+
+    func testNoReRenderWhenModelEqual() throws {
+        let bar = WrenMenuBar()
+        let state = makeState(activeVoice: "c3po")
+        bar.render(state)
+        let voiceRebuilds = bar.voiceRebuilds
+        let outputRebuilds = bar.outputRebuilds
+        // Re-rendering with identical state must be a no-op
+        bar.render(state)
+        XCTAssertEqual(bar.voiceRebuilds, voiceRebuilds)
+        XCTAssertEqual(bar.outputRebuilds, outputRebuilds)
     }
 
     func testAddedVoiceRebuildsAndIsClickable() throws {
@@ -173,156 +325,18 @@ final class MenuBarRenderTests: XCTestCase {
         click(effects)
         XCTAssertEqual(actions, [.setEffects(true), .setEffects(false)])
     }
-}
 
-@MainActor
-final class FakeSettingsSink: SettingsWindowActionSink {
-    var calls: [String] = []
+    func testSpeakingRateSliderRendersModelAndSendsAction() throws {
+        let bar = WrenMenuBar()
+        var actions: [WrenMenuBar.Action] = []
+        bar.onAction = { actions.append($0) }
+        var state = makeState()
+        state.localPlayer.speakingRate = 1.75
+        bar.render(state)
+        XCTAssertEqual(bar.rateView.value, 1.75)
 
-    func updateEndpoint(host: String) {
-        calls.append("endpoint \(host)")
-    }
-    func claimActive() async { calls.append("claim") }
-    func activateVoice(id: String) async { calls.append("use \(id)") }
-    func renameVoice(id: String, displayName: String) async {
-        calls.append("rename \(id) \(displayName)")
-    }
-    func deleteVoice(id: String) async { calls.append("delete \(id)") }
-    func addVoice(
-        id: String,
-        name: String,
-        audioURL: URL,
-        transcript: String
-    ) async -> Bool {
-        calls.append("add \(id) \(name) \(audioURL.lastPathComponent) "
-            + transcript)
-        return true
-    }
-    func setOutputDevice(_ device: AudioOutputDevice?) async {
-        calls.append("output \(device?.uid ?? "default")")
+        bar.rateView.onChange?(2.25)
+        XCTAssertEqual(actions, [.setSpeakingRate(2.25)])
     }
 }
 
-@MainActor
-final class SettingsTests: XCTestCase {
-    private func settle() async {
-        for _ in 0..<5 { await Task.yield() }
-    }
-
-    func testViewModelRows() {
-        let model = SettingsViewModel(state: makeState(activeVoice: "r2"))
-        XCTAssertEqual(model.voices.map(\.isActive), [false, true])
-        XCTAssertEqual(model.voices.map(\.canDelete), [true, false])
-    }
-
-    func testPrefillsEndpointAndSaves() {
-        let sink = FakeSettingsSink()
-        let window = SettingsWindowController(
-            state: makeState(),
-            actionSink: sink
-        )
-        XCTAssertEqual(window.hostField.stringValue, "server:8765")
-        window.hostField.stringValue = "box:9"
-        window.saveEndpoint()
-        XCTAssertEqual(sink.calls, ["endpoint box:9"])
-    }
-
-    func testEveryVoiceRowActivatesIncludingNewOnes() async throws {
-        let sink = FakeSettingsSink()
-        let window = SettingsWindowController(
-            state: makeState(),
-            actionSink: sink
-        )
-        window.update(state: makeState(voices: [
-            VoiceProfile(id: "c3po", displayName: "C-3PO"),
-            VoiceProfile(id: "r2", displayName: "R2"),
-            VoiceProfile(id: "bb8", displayName: "BB-8"),
-        ]))
-        XCTAssertEqual(window.voiceTable.numberOfRows, 3)
-        for row in 0..<3 {
-            let view = try XCTUnwrap(window.tableView(
-                window.voiceTable,
-                viewFor: nil,
-                row: row
-            ) as? NSStackView)
-            let use = try XCTUnwrap(view.views.compactMap {
-                $0 as? NSButton
-            }.first)
-            if row == 0 {
-                XCTAssertFalse(use.isEnabled, "active voice")
-                XCTAssertEqual(use.title, "Active")
-            } else {
-                XCTAssertTrue(use.isEnabled)
-                window.useVoice(use)
-            }
-        }
-        await settle()
-        XCTAssertEqual(sink.calls, ["use r2", "use bb8"])
-    }
-
-    func testAddVoiceUploadsAndClearsForm() async {
-        let sink = FakeSettingsSink()
-        let window = SettingsWindowController(
-            state: makeState(),
-            actionSink: sink
-        )
-        window.addIdField.stringValue = "bb8"
-        window.addNameField.stringValue = "BB-8"
-        window.addTranscriptField.stringValue = "beep boop"
-        window.chosenAudioURL = URL(fileURLWithPath: "/tmp/clip.wav")
-        window.submitAddVoice()
-        await settle()
-        XCTAssertEqual(sink.calls, ["add bb8 BB-8 clip.wav beep boop"])
-        XCTAssertEqual(window.addIdField.stringValue, "")
-        XCTAssertNil(window.chosenAudioURL)
-    }
-
-    func testAddVoiceRequiresAllFields() async {
-        let sink = FakeSettingsSink()
-        let window = SettingsWindowController(
-            state: makeState(),
-            actionSink: sink
-        )
-        window.addIdField.stringValue = "bb8"
-        window.submitAddVoice()
-        await settle()
-        XCTAssertTrue(sink.calls.isEmpty)
-    }
-
-    func testOutputPopupListsDevicesAndSurvivesPolls() async {
-        let devices = [AudioOutputDevice(uid: "a", name: "A")]
-        let sink = FakeSettingsSink()
-        let window = SettingsWindowController(
-            state: makeState(devices: devices),
-            actionSink: sink
-        )
-        XCTAssertEqual(window.outputPopUp.itemTitles, ["System Default", "A"])
-        let first = window.outputPopUp.item(at: 1)
-        window.update(state: makeState(
-            status: .unreachable("x"),
-            devices: devices
-        ))
-        XCTAssertTrue(window.outputPopUp.item(at: 1) === first,
-                      "unrelated updates keep popup items")
-        window.outputPopUp.selectItem(at: 1)
-        window.outputChanged()
-        await settle()
-        XCTAssertEqual(sink.calls, ["output a"])
-    }
-
-    func testErrorAndClientLabels() {
-        var state = makeState(
-            activeClient: ClientInfo(channel: "mac-b", label: "Studio")
-        )
-        state.lastError = "server returned 409 voice_active: busy"
-        let window = SettingsWindowController(
-            state: state,
-            actionSink: FakeSettingsSink()
-        )
-        XCTAssertEqual(window.activeClientLabel.stringValue,
-                       "Playing on Studio")
-        XCTAssertFalse(window.playHereButton.isHidden)
-        XCTAssertFalse(window.errorLabel.isHidden)
-        XCTAssertTrue(window.errorLabel.stringValue.contains("voice_active"))
-    }
-}

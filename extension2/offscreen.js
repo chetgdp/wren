@@ -1,7 +1,10 @@
 import * as audio from "./audio.js";
 
-chrome.runtime.onMessage.addListener((msg, _sender, respond) => {
-  if (msg.cmd !== "player") return;
+chrome.runtime.onMessage.addListener((msg, sender, respond) => {
+  // Content scripts and the popup reach this page directly as well as via
+  // background, which relays; answering both applied every command twice.
+  if (msg.cmd !== "player" || !sender.url?.endsWith("/background.js"))
+    return;
   const pos = p =>
     chrome.runtime.sendMessage({cmd: "position", ...p})
       .catch(() => {});

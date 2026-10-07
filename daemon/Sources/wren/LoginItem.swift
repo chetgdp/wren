@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 import ServiceManagement
 
@@ -206,6 +207,112 @@ final class NativeLoginItem: LoginItemProviding {
         guard enabled else { return nil }
         return "The legacy login item remains active while Wren finishes "
             + "migration."
+    }
+}
+
+@MainActor
+final class ObservableLoginItemState: ObservableObject {
+    struct WriteResult {
+        let enabled: Bool
+        let error: Error?
+
+        init(enabled: Bool, error: Error? = nil) {
+            self.enabled = enabled
+            self.error = error
+        }
+    }
+
+    let isAvailable: Bool
+    @Published private(set) var isEnabled: Bool?
+    @Published private(set) var error: String?
+
+    private let readEnabled: @MainActor () async -> Bool
+    private let applyEnabled: @MainActor (Bool) async -> WriteResult
+    private var refreshTask: Task<Void, Never>?
+    private var refreshGeneration: UInt = 0
+    private var writeTask: Task<Void, Never>?
+    private var pendingEnabled: Bool?
+
+    init(
+        isAvailable: Bool = Bundle.main.bundlePath.hasSuffix(".app"),
+        readEnabled: @escaping @MainActor () async -> Bool = {
+            await Task.detached {
+                SMAppService.mainApp.status == .enabled
+            }.value
+        },
+        applyEnabled: @escaping @MainActor (Bool) async -> WriteResult = {
+            enabled in
+            await Task.detached {
+                var writeError: Error?
+                do {
+                    if enabled {
+                        try SMAppService.mainApp.register()
+                    } else {
+                        try SMAppService.mainApp.unregister()
+                    }
+                } catch {
+                    writeError = error
+                }
+                return WriteResult(
+                    enabled: SMAppService.mainApp.status == .enabled,
+                    error: writeError
+                )
+            }.value
+        }
+    ) {
+        self.isAvailable = isAvailable
+        self.readEnabled = readEnabled
+        self.applyEnabled = applyEnabled
+        refresh()
+    }
+
+    func refresh() {
+        guard refreshTask == nil, writeTask == nil else { return }
+        refreshGeneration &+= 1
+        let generation = refreshGeneration
+        refreshTask = Task { [weak self, readEnabled] in
+            guard !Task.isCancelled else { return }
+            let enabled = await readEnabled()
+            guard let self,
+                  self.refreshGeneration == generation
+            else { return }
+            self.refreshTask = nil
+            self.isEnabled = enabled
+        }
+    }
+
+    func setEnabled(_ enabled: Bool) {
+        guard isAvailable else { return }
+        refreshGeneration &+= 1
+        refreshTask?.cancel()
+        refreshTask = nil
+        isEnabled = enabled
+        error = nil
+        pendingEnabled = enabled
+        guard writeTask == nil else { return }
+        writeTask = Task { [weak self] in
+            await self?.applyPendingChanges()
+        }
+    }
+
+    private func applyPendingChanges() async {
+        defer { writeTask = nil }
+        while let enabled = pendingEnabled {
+            pendingEnabled = nil
+            let result = await applyEnabled(enabled)
+            if let pending = pendingEnabled {
+                guard pending == result.enabled else { continue }
+                pendingEnabled = nil
+                isEnabled = result.enabled
+            } else {
+                isEnabled = result.enabled
+                error = result.error?.localizedDescription
+                if let error = result.error {
+                    let msg = "launch at login toggle failed: \(error)\n"
+                    FileHandle.standardError.write(Data(msg.utf8))
+                }
+            }
+        }
     }
 }
 

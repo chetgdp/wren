@@ -5,7 +5,7 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 . "$SCRIPT_DIR/release-lib.sh"
 
 if [ "$#" -ne 1 ]; then
-    echo "usage: $0 <Wren.app>" >&2
+    echo "usage: $0 <path/to/Wren.app>" >&2
     exit 1
 fi
 APP=$1

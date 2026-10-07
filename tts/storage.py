@@ -95,14 +95,9 @@ class SettingsStore:
             try:
                 data = json.loads(self.path.read_text(encoding="utf-8"))
                 if isinstance(data, dict):
-                    # Normalize field names if loaded from legacy settings.json
-                    rate = data.get("default_rate")
-                    if rate is None:
-                        rate = data.get("default_synthesis_rate", 1.0)
                     return {
                         "active_voice": data.get("active_voice"),
                         "effects": bool(data.get("effects", False)),
-                        "default_rate": float(rate),
                     }
             except Exception:
                 pass
@@ -111,7 +106,6 @@ class SettingsStore:
         default_settings = {
             "active_voice": initial_voice,
             "effects": False,
-            "default_rate": 1.0,
         }
         self.save(default_settings)
         return default_settings

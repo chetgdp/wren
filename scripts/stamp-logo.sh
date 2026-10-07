@@ -1,7 +1,7 @@
 #!/bin/sh
 # Stamp assets/logo.svg into Sources/wren/Logo.generated.swift so the
 # binary stays single-file (no resource bundle). Run standalone after swapping
-# the icon, or let scripts/dev.sh call it before every build.
+# the icon, or let scripts/build.sh call it before every build.
 set -e
 
 cd "$(dirname "$0")/.."

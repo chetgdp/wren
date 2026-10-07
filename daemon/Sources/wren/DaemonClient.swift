@@ -113,11 +113,15 @@ struct DaemonClient: Sendable {
     }
 
     func activateVoiceRequest(_ voice: String) throws -> URLRequest {
-        try jsonRequest(
+        var req = try jsonRequest(
             path: "/voice",
             method: "PUT",
             body: ActivateVoiceRequest(voice: voice)
         )
+        // Voice loading can invoke model checkpoint loading on the server,
+        // which may exceed the default 60s URLSession timeout.
+        req.timeoutInterval = 180.0
+        return req
     }
 
     func settingsRequest(_ update: SettingsUpdateRequest) throws
@@ -160,7 +164,7 @@ struct DaemonClient: Sendable {
                 ("display_name", name),
                 ("transcript", transcript),
             ],
-            file: (
+            file: Multipart.File(
                 name: "audio",
                 filename: "reference.wav",
                 type: "audio/wav",
@@ -282,10 +286,17 @@ struct DaemonClient: Sendable {
 }
 
 enum Multipart {
+    struct File {
+        let name: String
+        let filename: String
+        let type: String
+        let data: Data
+    }
+
     static func body(
         boundary: String,
         fields: [(String, String)],
-        file: (name: String, filename: String, type: String, data: Data)
+        file: File
     ) -> Data {
         var body = Data()
         func line(_ text: String) { body.append(Data((text + "\r\n").utf8)) }

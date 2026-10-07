@@ -158,17 +158,22 @@ chrome.runtime.onMessage.addListener(
       return true;
     }
     if (msg.cmd === "player") {
-      if (IS_CHROME)
-        ensureOffscreen().then(
-          () => chrome.runtime.sendMessage(msg));
-      else if (audioModule) {
+      if (IS_CHROME) {
+        ensureOffscreen()
+          .then(() => chrome.runtime.sendMessage(msg))
+          .catch(() => null)
+          .then(reply);
+        return true;
+      }
+      if (audioModule) {
         const a = msg.action;
         if (a === "start") audioModule.start({...msg,
           onPosition: sendPosition, onCursor});
         else if (a === "stop") audioModule.stop();
-        else if (a === "toggle") audioModule.toggle();
-        else if (a === "rate") audioModule.setRate(msg);
+        else if (a === "toggle") audioModule.toggle().then(reply);
+        else if (a === "rate") reply(audioModule.setRate(msg));
         else if (a === "flush") audioModule.flush();
+        return a === "toggle";
       }
       return;
     }

@@ -264,7 +264,10 @@ function injectOverlay() {
 
   const rateSpan = document.createElement("span");
   rateSpan.className = "rate";
-  rateSpan.textContent = "1.0×";
+  rateSpan.textContent = "1.00×";
+  chrome.storage.sync.get({ rate: 1 }).then(({ rate }) => {
+    rateSpan.textContent = rate.toFixed(2) + "×";
+  });
 
   const rateUp = document.createElement("button");
   rateUp.textContent = "+";
@@ -352,22 +355,14 @@ function injectOverlay() {
       chrome.runtime.sendMessage(
         { cmd: "player", action: "rate", delta },
         resp => {
-          if (resp?.rate != null) {
-            rateSpan.textContent =
-              resp.rate.toFixed(2) + "×";
-          }
+          if (resp?.rate == null) return;
+          rateSpan.textContent = resp.rate.toFixed(2) + "×";
+          clearTimeout(rateSaveTimer);
+          rateSaveTimer = setTimeout(() => {
+            chrome.storage.sync.set({ rate: resp.rate });
+          }, 500);
         }
       );
-      // debounced persist to storage.sync
-      clearTimeout(rateSaveTimer);
-      rateSaveTimer = setTimeout(() => {
-        const cur = parseFloat(
-          rateSpan.textContent
-        );
-        if (!isNaN(cur)) {
-          chrome.storage.sync.set({ rate: cur });
-        }
-      }, 500);
     }
   };
 

@@ -46,6 +46,24 @@ final class AudioOutputDeviceProviderTests: XCTestCase {
             AudioOutputDevice(uid: "speaker", name: "Real Speakers"),
         ])
     }
+    func testSnapshotExcludesHiddenAndCannotBeDefaultDevices() throws {
+        let backend = TestAudioHardwareBackend()
+        backend.ids = [1, 2, 3]
+        backend.channels = [1: 2, 2: 2, 3: 2]
+        backend.uids = [1: "speaker", 2: "hidden", 3: "cant-be-dflt"]
+        backend.names = [1: "Real Speakers", 2: "Secret", 3: "Aux Only"]
+        backend.hidden = [2: true]
+        backend.canBeDefault = [3: false]
+        backend.defaultID = 1
+        let provider = CoreAudioOutputDeviceProvider(backend: backend)
+
+        let snapshot = try provider.snapshot()
+
+        XCTAssertEqual(snapshot.devices, [
+            AudioOutputDevice(uid: "speaker", name: "Real Speakers"),
+        ])
+    }
+
 
     func testUIDTranslationTreatsUnknownAsDisconnected() throws {
         let backend = TestAudioHardwareBackend()
@@ -68,6 +86,8 @@ private final class TestAudioHardwareBackend: AudioHardwareBackend {
     var channels: [AudioDeviceID: UInt32] = [:]
     var transports: [AudioDeviceID: UInt32] = [:]
     var uids: [AudioDeviceID: String] = [:]
+    var hidden: [AudioDeviceID: Bool] = [:]
+    var canBeDefault: [AudioDeviceID: Bool] = [:]
     var names: [AudioDeviceID: String] = [:]
     var translations: [String: AudioDeviceID] = [:]
     var defaultID = AudioDeviceID(kAudioObjectUnknown)
@@ -78,6 +98,12 @@ private final class TestAudioHardwareBackend: AudioHardwareBackend {
     }
     func transportType(deviceID: AudioDeviceID) throws -> UInt32 {
         transports[deviceID, default: 0]
+    }
+    func isHidden(deviceID: AudioDeviceID) throws -> Bool {
+        hidden[deviceID, default: false]
+    }
+    func canBeDefaultOutput(deviceID: AudioDeviceID) throws -> Bool {
+        canBeDefault[deviceID, default: true]
     }
     func deviceUID(deviceID: AudioDeviceID) throws -> String {
         uids[deviceID] ?? ""

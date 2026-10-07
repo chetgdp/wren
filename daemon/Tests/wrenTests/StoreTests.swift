@@ -86,7 +86,7 @@ final class StoreTests: XCTestCase {
         await store.pollState()
         XCTAssertFalse(store.state.isPlayingHere)
         XCTAssertEqual(
-            SettingsViewModel.activeClientText(store.state),
+            SettingsModel.activeClientText(store.state),
             "Playing on Other"
         )
 
@@ -144,6 +144,30 @@ final class StoreTests: XCTestCase {
         XCTAssertEqual(WrenMenuModel(state: store.state).voiceBadge, "R2")
         XCTAssertNil(store.state.lastError)
     }
+    func testApplyDoesNotClobberActiveVoiceWithNil() async {
+        let store = makeStore()
+        await store.pollState()
+        XCTAssertEqual(store.state.activeVoice, "c3po")
+
+        // Simulate a /state response where activeVoice is nil.
+        model.activeVoice = nil
+        await store.pollState()
+        XCTAssertEqual(
+            store.state.activeVoice,
+            "c3po",
+            "apply() must not clobber activeVoice with nil"
+        )
+    }
+
+    func testStalePollDoesNotRevertNewerMutation() async {
+        let store = makeStore()
+        await store.pollState()
+        XCTAssertEqual(store.state.activeVoice, "c3po")
+
+        // Start a voice activation that sets activeVoice to r2.
+        await store.activateVoice(id: "r2")
+        XCTAssertEqual(store.state.activeVoice, "r2")
+    }
 
     func testNewlyAddedVoiceCanBeActivated() async throws {
         let store = makeStore()
@@ -164,9 +188,7 @@ final class StoreTests: XCTestCase {
 
         await store.activateVoice(id: "added")
         XCTAssertEqual(store.state.activeVoice, "added")
-        let row = SettingsViewModel(state: store.state).voices
-            .first { $0.id == "added" }
-        XCTAssertEqual(row?.isActive, true)
+        XCTAssertTrue(store.state.voices.contains { $0.id == "added" })
     }
 
     func testFailedActivationIsReported() async {
@@ -234,6 +256,17 @@ final class StoreTests: XCTestCase {
         XCTAssertEqual(makeStore().state.localPlayer.speakingRate, 1.4)
     }
 
+    func testSpeakingRateClampedBetweenLimits() {
+        let store = makeStore()
+        store.setSpeakingRate(0.2)
+        XCTAssertEqual(store.state.localPlayer.speakingRate, 0.5)
+        XCTAssertEqual(defaults.double(forKey: WrenStore.rateKey), 0.5)
+
+        store.setSpeakingRate(5.0)
+        XCTAssertEqual(store.state.localPlayer.speakingRate, 3.0)
+        XCTAssertEqual(defaults.double(forKey: WrenStore.rateKey), 3.0)
+    }
+
     func testOutputDeviceSelectionPersists() async {
         let store = makeStore()
         let device = AudioOutputDevice(uid: "speakers", name: "Speakers")
@@ -251,10 +284,43 @@ final class FakeMenu: AppMenuPresenting {
     var rendered: [AppState] = []
     func render(_ state: AppState) { rendered.append(state) }
 }
+@MainActor
+final class FakeSupervisor: LocalServerSupervising {
+    var onChange: (@MainActor (LocalServerState) -> Void)?
+    var state: LocalServerState = LocalServerState(
+        isEnabled: true,
+        status: .disabled
+    )
+    var startedHost: String?
+    var setEnabledCalls: [Bool] = []
+    var hostChangedCalls: [String] = []
+    var shutdownCallCount = 0
+
+    func start(host: String) {
+        startedHost = host
+    }
+
+    func setEnabled(_ enabled: Bool) {
+        setEnabledCalls.append(enabled)
+        state.isEnabled = enabled
+        state.status = enabled ? .running : .disabled
+        onChange?(state)
+    }
+
+    func hostChanged(_ host: String) {
+        hostChangedCalls.append(host)
+    }
+
+    func shutdown() {
+        shutdownCallCount += 1
+    }
+}
 
 @MainActor
-final class AppControllerTests: XCTestCase {
-    private func waitUntil(_ condition: () -> Bool) async throws {
+final class AppCoordinatorTests: XCTestCase {
+    private func waitUntil(
+        _ condition: @MainActor () -> Bool
+    ) async throws {
         for _ in 0..<500 where !condition() {
             try await Task.sleep(nanoseconds: 2_000_000)
         }
@@ -279,12 +345,12 @@ final class AppControllerTests: XCTestCase {
         )
         let menu = FakeMenu()
         var quit = false
-        let controller = AppController(
+        let coordinator = AppCoordinator(
             store: store,
             menuBar: menu,
-            notificationCenter: NotificationCenter(),
             terminate: { quit = true }
         )
+        coordinator.start()
         XCTAssertEqual(menu.rendered.count, 1, "initial render")
 
         // Sequential on purpose: the two actions race on the wire, and a
@@ -299,6 +365,50 @@ final class AppControllerTests: XCTestCase {
 
         menu.onAction?(.quit)
         XCTAssertTrue(quit)
-        withExtendedLifetime(controller) {}
+        withExtendedLifetime(coordinator) {}
+    }
+    func testSupervisorToggleAndTermination() async throws {
+        let model = ContractModel()
+        let server = FakeServer { model.handle($0) }
+        let suite = "wren-app-sup-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = WrenStore(
+            endpoint: MemoryEndpointStore(host: "127.0.0.1:8765"),
+            environment: [:],
+            userDefaults: defaults,
+            audioDevices: FakeAudioProvider(),
+            loginItem: FakeLoginItem(),
+            hostname: "studio",
+            transport: server.transport,
+            runsServices: false
+        )
+        let supervisor = FakeSupervisor()
+        let menu = FakeMenu()
+        let coordinator = AppCoordinator(
+            store: store,
+            supervisor: supervisor,
+            menuBar: menu
+        )
+        coordinator.start()
+
+        XCTAssertEqual(supervisor.startedHost, "127.0.0.1:8765")
+
+        menu.onAction?(.setRunLocalServer(false))
+        XCTAssertEqual(supervisor.setEnabledCalls, [false])
+        XCTAssertEqual(store.state.localServer.isEnabled, false)
+
+        menu.onAction?(.setRunLocalServer(true))
+        XCTAssertEqual(supervisor.setEnabledCalls, [false, true])
+        XCTAssertEqual(store.state.localServer.isEnabled, true)
+        XCTAssertEqual(store.state.localServer.status, .running)
+
+        NotificationCenter.default.post(
+            name: NSApplication.willTerminateNotification,
+            object: NSApplication.shared
+        )
+        XCTAssertEqual(supervisor.shutdownCallCount, 1)
+
+        withExtendedLifetime(coordinator) {}
     }
 }

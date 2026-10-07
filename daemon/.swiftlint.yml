@@ -1,0 +1,17 @@
+line_length:
+  warning: 80
+  error: 200
+
+disabled_rules:
+  - identifier_name
+  - trailing_comma
+  - function_body_length
+  - type_body_length
+  - file_length
+  - nesting
+  - cyclomatic_complexity
+  - force_cast
+
+excluded:
+  - .build
+  - Sources/wren/Logo.generated.swift

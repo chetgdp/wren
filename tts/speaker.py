@@ -27,30 +27,19 @@ def wav_seconds(path):
         return 0.0
 
 
-def stretch_wav(path, speed):
-    """Time-stretch a wav in place by speed (>1 = faster), preserving pitch.
-    Server-side so every client gets the requested rate for free."""
-    import soundfile as sf
-    from pedalboard import time_stretch
-    data, sr = sf.read(path, dtype="float32", always_2d=True)
-    stretched = time_stretch(data.T, sr, stretch_factor=speed)
-    sf.write(path, stretched.T, sr)
-
 
 @dataclass(frozen=True)
 class SynthesisSnapshot:
-    """Voice, effects and rate captured once when a request is accepted, so
+    """Voice and effects captured once when a request is accepted, so
     a later PUT /voice or PATCH /settings never changes queued speech."""
 
     context: object
     effects: bool
-    rate: float
     identity: tuple = field(init=False)
 
     def __post_init__(self):
         object.__setattr__(
-            self, "identity", (self.context.key, self.effects, self.rate))
-
+            self, "identity", (self.context.key, self.effects))
 
 class SegmentStore:
     """One channel's rendered segments, held for GET /segment long-polls.
@@ -116,6 +105,16 @@ class SegmentStore:
             self._played = seq
             for s in [s for s in self._durations if s <= seq]:
                 del self._durations[s]
+            # Played clips are never re-fetched within an epoch; keeping
+            # them would replay them to a restarted client and hold memory
+            # until the byte cap.
+            kept = []
+            for entry in self._segments:
+                if entry[0] <= seq:
+                    self._bytes -= len(entry[2])
+                else:
+                    kept.append(entry)
+            self._segments = kept
 
     def unplayed(self):
         """Segments released this epoch that the client has not reported
@@ -462,12 +461,6 @@ class SynthWorker:
             speaker._batch = None
             batch.close()
             return
-        if batch.snapshot.rate != 1.0:
-            try:
-                stretch_wav(path, batch.snapshot.rate)
-            except Exception as exc:
-                print(f"time-stretch failed ({exc}); playing at 1.0x",
-                      file=sys.stderr)
         seg_start = batch.audio_s
         batch.audio_s += wav_seconds(path)
         seg_block = (block_span(batch.layout, seg_start, batch.audio_s,

@@ -9,6 +9,7 @@ wren_die() {
 
 wren_validate_bundle() {
     bundle=$1
+    expected_id=${2:-}
     contents="$bundle/Contents"
     resources="$contents/Resources"
 
@@ -28,8 +29,17 @@ wren_validate_bundle() {
     bundle_identifier=$(/usr/libexec/PlistBuddy \
         -c 'Print :CFBundleIdentifier' "$contents/Info.plist" 2>/dev/null) || \
         wren_die "Info.plist has no bundle identifier" || return
-    [ "$bundle_identifier" = "com.heavyetl.wren" ] || \
-        wren_die "Info.plist has the wrong bundle identifier" || return
+    if [ -n "$expected_id" ]; then
+        [ "$bundle_identifier" = "$expected_id" ] || \
+            wren_die "Info.plist has the wrong bundle identifier ($bundle_identifier != $expected_id)" || return
+    else
+        case "$bundle_identifier" in
+            com.heavyetl.wren) ;;
+            *)
+                wren_die "unexpected bundle identifier: $bundle_identifier" || return
+                ;;
+        esac
+    fi
     bundle_executable=$(/usr/libexec/PlistBuddy \
         -c 'Print :CFBundleExecutable' "$contents/Info.plist" 2>/dev/null) || \
         wren_die "Info.plist has no executable name" || return
@@ -67,9 +77,12 @@ wren_validate_bundle() {
 wren_install_bundle() {
     stage=$1
     dest=$2
-    cli_link=$3
+    cli_link=${3:-}
 
-    mkdir -p "$(dirname "$dest")" "$(dirname "$cli_link")"
+    mkdir -p "$(dirname "$dest")"
+    if [ -n "$cli_link" ]; then
+        mkdir -p "$(dirname "$cli_link")"
+    fi
     old="$dest.old"
     rm -rf "$old"
     if [ -d "$dest" ]; then
@@ -81,12 +94,14 @@ wren_install_bundle() {
         fi
         wren_die "bundle swap failed" || return
     fi
-    if ! ln -sfn "$dest/Contents/MacOS/wren" "$cli_link"; then
-        rm -rf "$dest"
-        if [ -d "$old" ]; then
-            mv "$old" "$dest"
+    if [ -n "$cli_link" ]; then
+        if ! ln -sfn "$dest/Contents/MacOS/wren" "$cli_link"; then
+            rm -rf "$dest"
+            if [ -d "$old" ]; then
+                mv "$old" "$dest"
+            fi
+            wren_die "cli symlink update failed" || return
         fi
-        wren_die "cli symlink update failed" || return
     fi
     rm -rf "$old"
 }

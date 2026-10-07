@@ -80,6 +80,8 @@ protocol AudioHardwareBackend: AnyObject {
     func deviceIDs() throws -> [AudioDeviceID]
     func outputChannelCount(deviceID: AudioDeviceID) throws -> UInt32
     func transportType(deviceID: AudioDeviceID) throws -> UInt32
+    func isHidden(deviceID: AudioDeviceID) throws -> Bool
+    func canBeDefaultOutput(deviceID: AudioDeviceID) throws -> Bool
     func deviceUID(deviceID: AudioDeviceID) throws -> String
     func deviceName(deviceID: AudioDeviceID) throws -> String
     func translate(uid: String) throws -> AudioDeviceID?
@@ -207,14 +209,22 @@ final class CoreAudioOutputDeviceProvider: AudioOutputDeviceProviding {
         // Aggregates and virtual drivers (Zoom, BlackHole, Teams) are not
         // speakers a user picks; the system default still resolves even
         // when it is one of them, so playback never loses its route.
-        let transport = try backend.transportType(deviceID: deviceID)
-        let excludedTransports: Set<UInt32> = [
-            kAudioDeviceTransportTypeAggregate,
-            kAudioDeviceTransportTypeAutoAggregate,
-            kAudioDeviceTransportTypeVirtual,
-        ]
-        if !allowNonStandard && excludedTransports.contains(transport) {
-            return nil
+        if !allowNonStandard {
+            if try backend.isHidden(deviceID: deviceID) {
+                return nil
+            }
+            if try !backend.canBeDefaultOutput(deviceID: deviceID) {
+                return nil
+            }
+            let transport = try backend.transportType(deviceID: deviceID)
+            let excludedTransports: Set<UInt32> = [
+                kAudioDeviceTransportTypeAggregate,
+                kAudioDeviceTransportTypeAutoAggregate,
+                kAudioDeviceTransportTypeVirtual,
+            ]
+            if excludedTransports.contains(transport) {
+                return nil
+            }
         }
 
         return ResolvedAudioOutputDevice(
@@ -368,6 +378,47 @@ final class CoreAudioHardwareBackend: AudioHardwareBackend {
         }
         return transport
     }
+    func isHidden(deviceID: AudioDeviceID) throws -> Bool {
+        var address = propertyAddress(
+            selector: kAudioDevicePropertyIsHidden
+        )
+        var isHidden: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        let status = AudioObjectGetPropertyData(
+            deviceID,
+            &address,
+            0,
+            nil,
+            &size,
+            &isHidden
+        )
+        if status != noErr {
+            return false
+        }
+        return isHidden != 0
+    }
+
+    func canBeDefaultOutput(deviceID: AudioDeviceID) throws -> Bool {
+        var address = propertyAddress(
+            selector: kAudioDevicePropertyDeviceCanBeDefaultDevice,
+            scope: kAudioObjectPropertyScopeOutput
+        )
+        var canBeDefault: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        let status = AudioObjectGetPropertyData(
+            deviceID,
+            &address,
+            0,
+            nil,
+            &size,
+            &canBeDefault
+        )
+        if status != noErr {
+            return true
+        }
+        return canBeDefault != 0
+    }
+
 
     func deviceUID(deviceID: AudioDeviceID) throws -> String {
         try stringProperty(

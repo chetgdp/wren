@@ -12,17 +12,20 @@ final class WrenMenuBar: NSObject {
         case setPaused(Bool)
         case stopSpeaking
         case setLaunchAtLogin(Bool)
+        case setRunLocalServer(Bool)
         case showSettings
         case quit
     }
 
-    private let statusItem: NSStatusItem
+    let statusItem: NSStatusItem
     let menu = NSMenu()
     private let statusView = WrenMenuStatusView()
     private let statusRow = NSMenuItem()
     private let loginView = WrenMenuLoginView()
     private let loginRow = NSMenuItem()
-    private let rateView = SliderMenuView(
+    private let localServerView = WrenMenuLoginView(title: "Run Local Server")
+    private let localServerRow = NSMenuItem()
+    let rateView = SliderMenuView(
         title: "Speaking Rate",
         min: LocalSpeakingRate.minimum,
         max: LocalSpeakingRate.maximum
@@ -54,13 +57,14 @@ final class WrenMenuBar: NSObject {
         menu.delegate = self
         statusRow.view = statusView
         loginRow.view = loginView
+        localServerRow.view = localServerView
         rateRow.view = rateView
-        statusItem.menu = menu
 
         if let button = statusItem.button {
             button.image = Self.logoImage()
             button.imagePosition = .imageOnly
         }
+        statusItem.menu = menu
 
         rateView.onChange = { [weak self] value in
             self?.onAction?(.setSpeakingRate(value))
@@ -68,7 +72,9 @@ final class WrenMenuBar: NSObject {
         loginView.onToggle = { [weak self] enabled in
             self?.onAction?(.setLaunchAtLogin(enabled))
         }
-
+        localServerView.onToggle = { [weak self] enabled in
+            self?.onAction?(.setRunLocalServer(enabled))
+        }
         buildMenuStructure()
     }
 
@@ -125,8 +131,8 @@ final class WrenMenuBar: NSObject {
 
         menu.addItem(.separator())
 
+        menu.addItem(localServerRow)
         menu.addItem(loginRow)
-
         settingsItem.title = "Settings…"
         settingsItem.image = Self.symbol("gearshape")
         settingsItem.target = self
@@ -185,7 +191,7 @@ final class WrenMenuBar: NSObject {
                 if item.state != state { item.state = state }
             }
         }
-        if previous?.voiceBadge != model.voiceBadge {
+        if voiceParent.badge?.stringValue != model.voiceBadge {
             voiceParent.badge = NSMenuItemBadge(string: model.voiceBadge)
         }
 
@@ -210,11 +216,14 @@ final class WrenMenuBar: NSObject {
                 }
                 if item.title != choice.title { item.title = choice.title }
                 item.representedObject = choice.target
+                if item.isEnabled != choice.isEnabled {
+                    item.isEnabled = choice.isEnabled
+                }
                 let state: NSControl.StateValue = choice.isChecked ? .on : .off
                 if item.state != state { item.state = state }
             }
         }
-        if previous?.outputBadge != model.outputBadge {
+        if outputParent.badge?.stringValue != model.outputBadge {
             outputParent.badge = NSMenuItemBadge(string: model.outputBadge)
         }
 
@@ -227,6 +236,15 @@ final class WrenMenuBar: NSObject {
         if previous?.login != model.login {
             loginView.render(model.login)
         }
+        if previous?.localServer != model.localServer {
+            localServerView.render(
+                isOn: model.localServer.isOn,
+                isEnabled: model.localServer.isEnabled,
+                detail: model.localServer.detail,
+                tone: model.localServer.tone
+            )
+        }
+        resizeCustomRows()
     }
 
     private func rebuildVoices(_ voices: [WrenMenuModel.VoiceChoice]) {
@@ -269,8 +287,8 @@ final class WrenMenuBar: NSObject {
             )
             item.target = self
             item.representedObject = choice.target
+            item.isEnabled = choice.isEnabled
             item.state = choice.isChecked ? .on : .off
-            outputSubmenu.addItem(item)
             outputItems[choice.target.key] = item
         }
     }
@@ -280,6 +298,7 @@ final class WrenMenuBar: NSObject {
         let width = max(menu.size.width, WrenMenuMetrics.minimumWidth)
         statusView.setMenuWidth(width)
         loginView.setMenuWidth(width)
+        localServerView.setMenuWidth(width)
         rateView.setMenuWidth(width)
     }
 

@@ -64,7 +64,7 @@ func jsonBody(_ request: URLRequest) -> [String: Any] {
 
 /// A small in-memory server modelled on the contract, for store flows.
 final class ContractModel: @unchecked Sendable {
-    var activeVoice = "c3po"
+    var activeVoice: String? = "c3po"
     var voices: [[String: Any]] = [
         ["id": "c3po", "display_name": "C-3PO"],
         ["id": "r2", "display_name": "R2"],
@@ -77,9 +77,8 @@ final class ContractModel: @unchecked Sendable {
             "ready": true,
             "backend": "qwentts",
             "model": "test",
-            "active_voice": activeVoice,
+            "active_voice": activeVoice ?? NSNull(),
             "effects": effects,
-            "default_rate": 1.0,
             "active_client": activeClient ?? NSNull(),
             "channels": [:] as [String: Any],
             "voices": voices,
@@ -212,7 +211,11 @@ func makeState(
     ),
     effects: Bool = false,
     devices: [AudioOutputDevice] = [],
-    desiredUID: String? = nil
+    desiredUID: String? = nil,
+    localServer: LocalServerState = LocalServerState(
+        isEnabled: true,
+        status: .disabled
+    )
 ) -> AppState {
     AppState(
         host: "server:8765",
@@ -222,7 +225,6 @@ func makeState(
         activeVoice: activeVoice,
         activeClient: activeClient,
         effects: effects,
-        defaultRate: 1.0,
         localPlayer: LocalPlayerState(speakingRate: 1.0, isPaused: false),
         audioOutput: AudioOutputState(
             devices: devices,
@@ -235,6 +237,7 @@ func makeState(
             isAvailable: true,
             isEnabled: false,
             error: nil
-        )
+        ),
+        localServer: localServer
     )
 }

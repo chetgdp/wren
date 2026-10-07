@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Run the wren synthesis server on this machine for clients on the tailnet.
+# Run the wren synthesis server on this machine. Binds loopback; tailnet
+# clients reach it through `tailscale serve` on 8765.
 set -euo pipefail
 
 repo="$(cd "$(dirname "$0")/.." && pwd)"
@@ -11,7 +12,7 @@ export DYLD_LIBRARY_PATH="$engine/build${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}
 
 cd "$repo"
 exec uv run tts/serve.py \
-  --host "${WREN_BIND:-0.0.0.0}" \
+  --host "${WREN_BIND:-127.0.0.1}" \
   --port "${WREN_PORT:-8765}" \
   --data-dir "$data" \
   --qwentts-bin "$engine/build/tts-server" \

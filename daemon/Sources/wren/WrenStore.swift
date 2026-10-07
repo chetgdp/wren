@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 
 enum ConnectionStatus: Equatable, Sendable {
@@ -27,10 +28,10 @@ struct AppState: Equatable, Sendable {
     var activeVoice: String?
     var activeClient: ClientInfo?
     var effects: Bool
-    var defaultRate: Double
     var localPlayer: LocalPlayerState
     var audioOutput: AudioOutputState
     var loginItem: LoginItemState
+    var localServer: LocalServerState
     /// Last failed user action, shown in Settings so failures are not
     /// silent. Cleared by the next successful action.
     var lastError: String?
@@ -41,34 +42,96 @@ struct AppState: Equatable, Sendable {
 }
 
 @MainActor
-final class WrenStore {
+final class WrenStore: ObservableObject {
     nonisolated static let rateKey = "playerRate"
     nonisolated static let outputUIDKey = "outputDeviceUID"
     nonisolated static let outputNameKey = "outputDeviceName"
 
-    private(set) var state: AppState {
+    struct Dependencies {
+        var client: DaemonClient
+        var defaults: UserDefaults = .standard
+        var clock: () -> Date = Date.init
+        var endpoint: EndpointPersisting = SystemEndpointStore()
+        var audioDevices: AudioOutputDeviceProviding =
+            CoreAudioOutputDeviceProvider()
+        var loginItem: LoginItemProviding = NativeLoginItem()
+        var hostname: String = ClientChannel.currentHostname()
+        var runsServices: Bool = true
+        var makePlayer: @MainActor (URL, String) -> SegmentPlayer = {
+            SegmentPlayer(base: $0, channel: $1)
+        }
+
+        static var live: Dependencies {
+            let host = Endpoint.resolveHost(
+                flag: nil,
+                environment: ProcessInfo.processInfo.environment,
+                saved: SystemEndpointStore().savedHost
+            )
+            return Dependencies(client: DaemonClient(host: host))
+        }
+    }
+
+    @Published private(set) var state: AppState {
         didSet {
             if state != oldValue { onState?(state) }
         }
     }
-    private var onState: (@MainActor (AppState) -> Void)?
 
-    private(set) var client: DaemonClient
+    private var onState: (@MainActor (AppState) -> Void)?
+    private var dependencies: Dependencies
+
+    private(set) var client: DaemonClient {
+        get { dependencies.client }
+        set { dependencies.client = newValue }
+    }
+
     private var player: SegmentPlayer?
     private let activityMonitor = ActivityMonitor()
-    private let endpoint: EndpointPersisting
-    private let audioDevices: AudioOutputDeviceProviding
-    private let loginItem: LoginItemProviding
-    private let userDefaults: UserDefaults
-    private let hostname: String
-    private let transport: DaemonClient.Transport?
-    private let runsServices: Bool
-
     private var pollTask: Task<Void, Never>?
+    private var activeGeneration: UInt = 0
+    private var pendingEffects: Bool?
 
-    /// - Parameter runsServices: false in tests so no poll loop, audio
-    ///   player, or HID monitor starts; tests drive `pollState` directly.
-    init(
+    init(dependencies: Dependencies = .live) {
+        self.dependencies = dependencies
+
+        let host = dependencies.client.host
+        let defaults = dependencies.defaults
+        let rate = defaults.double(forKey: Self.rateKey)
+        let initialRate = rate > 0 ? LocalSpeakingRate.clamped(rate) : 1.0
+
+        self.state = AppState(
+            host: host,
+            status: .connecting,
+            channel: ClientChannel.defaultChannel(
+                hostname: dependencies.hostname
+            ),
+            voices: [],
+            activeVoice: nil,
+            activeClient: nil,
+            effects: false,
+            localPlayer: LocalPlayerState(
+                speakingRate: initialRate,
+                isPaused: false
+            ),
+            audioOutput: Self.resolveAudioOutput(
+                provider: dependencies.audioDevices,
+                userDefaults: defaults
+            ),
+            loginItem: dependencies.loginItem.refresh(),
+            localServer: LocalServerState(
+                isEnabled: true,
+                status: .disabled
+            )
+        )
+
+        guard dependencies.runsServices else { return }
+        setupActivityMonitor()
+        setupAudioObserving()
+        startMonitoring()
+    }
+
+    /// Backwards-compatible convenience initializer.
+    convenience init(
         endpoint: EndpointPersisting = SystemEndpointStore(),
         environment: [String: String] = ProcessInfo.processInfo.environment,
         userDefaults: UserDefaults = .standard,
@@ -79,58 +142,25 @@ final class WrenStore {
         transport: DaemonClient.Transport? = nil,
         runsServices: Bool = true
     ) {
-        self.endpoint = endpoint
-        self.userDefaults = userDefaults
-        self.audioDevices = audioDevices
-        self.loginItem = loginItem
-        self.hostname = hostname
-        self.transport = transport
-        self.runsServices = runsServices
-
         let host = Endpoint.resolveHost(
             flag: nil,
             environment: environment,
             saved: endpoint.savedHost
         )
-        self.client = Self.makeClient(host: host, transport: transport)
-
-        let rate = userDefaults.double(forKey: Self.rateKey)
-        let initialRate = rate > 0 ? LocalSpeakingRate.clamped(rate) : 1.0
-
-        self.state = AppState(
-            host: host,
-            status: .connecting,
-            channel: ClientChannel.defaultChannel(hostname: hostname),
-            voices: [],
-            activeVoice: nil,
-            activeClient: nil,
-            effects: false,
-            defaultRate: 1.0,
-            localPlayer: LocalPlayerState(
-                speakingRate: initialRate,
-                isPaused: false
-            ),
-            audioOutput: Self.resolveAudioOutput(
-                provider: audioDevices,
-                userDefaults: userDefaults
-            ),
-            loginItem: loginItem.refresh()
+        let client = DaemonClient(host: host, transport: transport ?? {
+            try await URLSession.shared.data(for: $0)
+        })
+        let deps = Dependencies(
+            client: client,
+            defaults: userDefaults,
+            clock: Date.init,
+            endpoint: endpoint,
+            audioDevices: audioDevices,
+            loginItem: loginItem,
+            hostname: hostname,
+            runsServices: runsServices
         )
-
-        guard runsServices else { return }
-        setupActivityMonitor()
-        setupAudioObserving()
-        startMonitoring()
-    }
-
-    private static func makeClient(
-        host: String,
-        transport: DaemonClient.Transport?
-    ) -> DaemonClient {
-        if let transport {
-            return DaemonClient(host: host, transport: transport)
-        }
-        return DaemonClient(host: host)
+        self.init(dependencies: deps)
     }
 
     func observe(_ observer: @escaping @MainActor (AppState) -> Void) {
@@ -142,7 +172,7 @@ final class WrenStore {
         pollTask?.cancel()
         pollTask = nil
         activityMonitor.stop()
-        audioDevices.stopObserving()
+        dependencies.audioDevices.stopObserving()
         player?.stop()
         player = nil
     }
@@ -167,16 +197,37 @@ final class WrenStore {
         player?.stop()
         player = nil
         guard let url = URL(string: "http://\(state.host)") else { return }
-        let newPlayer = SegmentPlayer(base: url, channel: state.channel)
+        let newPlayer = dependencies.makePlayer(url, state.channel)
         newPlayer.setRate(state.localPlayer.speakingRate)
         player = newPlayer
         state.localPlayer.isPaused = false
-        newPlayer.start()
+        Task { [weak self] in
+            await self?.flushOwnChannel(for: newPlayer)
+            guard let self, self.player === newPlayer else { return }
+            newPlayer.start()
+        }
         // The saved device must apply at launch too, not only when the
         // user picks it from the menu.
         if let uid = state.audioOutput.desiredUID,
-           let resolved = try? audioDevices.resolve(uid: uid) {
+           let resolved = try? dependencies.audioDevices.resolve(uid: uid) {
             Task { try? await newPlayer.setOutputDevice(resolved.objectID) }
+        }
+    }
+
+    /// The server keeps a channel's clips across client restarts; audio
+    /// queued while this Mac was not playing is stale by the time it is.
+    private func flushOwnChannel(for owner: SegmentPlayer) async {
+        var delay: TimeInterval = 1.0
+        while !Task.isCancelled, player === owner {
+            do {
+                _ = try await client.stop(channel: state.channel)
+                return
+            } catch {
+                try? await Task.sleep(
+                    nanoseconds: UInt64(delay * 1_000_000_000)
+                )
+                delay = min(delay * 1.5, 15.0)
+            }
         }
     }
 
@@ -190,7 +241,7 @@ final class WrenStore {
     }
 
     private func setupAudioObserving() {
-        try? audioDevices.startObserving { [weak self] _ in
+        try? dependencies.audioDevices.startObserving { [weak self] _ in
             Task { @MainActor [weak self] in
                 self?.refreshAudioOutput()
             }
@@ -199,31 +250,44 @@ final class WrenStore {
 
     func refreshAudioOutput() {
         state.audioOutput = Self.resolveAudioOutput(
-            provider: audioDevices,
-            userDefaults: userDefaults
+            provider: dependencies.audioDevices,
+            userDefaults: dependencies.defaults
         )
     }
 
-    // MARK: Server state
+    func refreshLoginItem() {
+        state.loginItem = dependencies.loginItem.refresh()
+    }
+
+    func setLocalServer(_ localServer: LocalServerState) {
+        state.localServer = localServer
+    }
+
+    // MARK: - Server state
 
     /// Applies a /state body in one assignment so observers render once.
+    /// Never clobbers activeVoice with nil if we already have one.
     private func apply(_ res: DaemonStateResponse) {
         var next = state
         next.status = .connected
         next.voices = res.voices ?? next.voices
-        next.activeVoice = res.activeVoice
+        next.activeVoice = res.activeVoice ?? next.activeVoice
         next.activeClient = res.activeClient
         next.effects = res.effects ?? next.effects
-        next.defaultRate = res.defaultRate ?? next.defaultRate
         state = next
     }
 
     @discardableResult
     func pollState() async -> Bool {
+        let currentGen = activeGeneration
         let wasConnected = state.status == .connected
         do {
-            apply(try await client.state())
+            let res = try await client.state()
+            // Drop stale poll responses if a mutation incremented generation.
+            guard activeGeneration == currentGen else { return true }
+            apply(res)
         } catch {
+            guard activeGeneration == currentGen else { return false }
             state.status = .unreachable(String(describing: error))
             return false
         }
@@ -237,9 +301,12 @@ final class WrenStore {
         let host = Endpoint.normalize(rawHost).isEmpty
             ? Endpoint.defaultHost
             : Endpoint.normalize(rawHost)
-        endpoint.savedHost = host
+        dependencies.endpoint.savedHost = host
 
-        client = Self.makeClient(host: host, transport: transport)
+        client = DaemonClient(
+            host: host,
+            transport: client.transport
+        )
         var next = state
         next.host = host
         next.status = .connecting
@@ -247,7 +314,7 @@ final class WrenStore {
         next.lastError = nil
         state = next
         // The poll loop claims once the new server answers.
-        if runsServices { startMonitoring() }
+        if dependencies.runsServices { startMonitoring() }
     }
 
     /// Claims only when another client (or nobody) is active, so constant
@@ -261,30 +328,44 @@ final class WrenStore {
         await perform {
             _ = try await self.client.claimActive(
                 channel: self.state.channel,
-                label: self.hostname
+                label: self.dependencies.hostname
             )
             self.state.activeClient = ClientInfo(
                 channel: self.state.channel,
-                label: self.hostname
+                label: self.dependencies.hostname
             )
         }
     }
 
     func activateVoice(id: String) async {
+        activeGeneration &+= 1
+        let gen = activeGeneration
         await perform {
-            self.apply(try await self.client.activateVoice(id))
+            let res = try await self.client.activateVoice(id)
+            guard self.activeGeneration == gen else { return }
+            self.apply(res)
         }
     }
 
     func setEffects(_ enabled: Bool) async {
+        // Optimistic-safe toggle: record target state immediately.
+        state.effects = enabled
+        pendingEffects = enabled
+        activeGeneration &+= 1
+        let gen = activeGeneration
         await perform {
-            self.apply(try await self.client.updateSettings(
-                SettingsUpdateRequest(effects: enabled, defaultRate: nil)
-            ))
+            let res = try await self.client.updateSettings(
+                SettingsUpdateRequest(effects: enabled)
+            )
+            guard self.activeGeneration == gen else { return }
+            self.apply(res)
+            self.pendingEffects = nil
         }
     }
 
+
     func renameVoice(id: String, displayName: String) async {
+        activeGeneration &+= 1
         await perform {
             _ = try await self.client.renameVoice(
                 id: id,
@@ -295,6 +376,7 @@ final class WrenStore {
     }
 
     func deleteVoice(id: String) async {
+        activeGeneration &+= 1
         await perform {
             _ = try await self.client.deleteVoice(id: id)
             await self.pollState()
@@ -307,7 +389,8 @@ final class WrenStore {
         audioURL: URL,
         transcript: String
     ) async -> Bool {
-        await perform {
+        activeGeneration &+= 1
+        return await perform {
             _ = try await self.client.addVoice(
                 id: id,
                 name: name,
@@ -333,12 +416,12 @@ final class WrenStore {
         }
     }
 
-    // MARK: Local playback
+    // MARK: - Local playback
 
     func setSpeakingRate(_ rate: Double) {
         let clamped = LocalSpeakingRate.clamped(rate)
         player?.setRate(clamped)
-        userDefaults.set(clamped, forKey: Self.rateKey)
+        dependencies.defaults.set(clamped, forKey: Self.rateKey)
         state.localPlayer.speakingRate = clamped
     }
 
@@ -363,16 +446,19 @@ final class WrenStore {
     }
 
     func setOutputDevice(_ device: AudioOutputDevice?) async {
+        let defaults = dependencies.defaults
         if let device {
-            userDefaults.set(device.uid, forKey: Self.outputUIDKey)
-            userDefaults.set(device.name, forKey: Self.outputNameKey)
-            if let resolved = try? audioDevices.resolve(uid: device.uid) {
+            defaults.set(device.uid, forKey: Self.outputUIDKey)
+            defaults.set(device.name, forKey: Self.outputNameKey)
+            if let resolved = try? dependencies.audioDevices.resolve(
+                uid: device.uid
+            ) {
                 try? await player?.setOutputDevice(resolved.objectID)
             }
         } else {
-            userDefaults.removeObject(forKey: Self.outputUIDKey)
-            userDefaults.removeObject(forKey: Self.outputNameKey)
-            if let snapshot = try? audioDevices.snapshot() {
+            defaults.removeObject(forKey: Self.outputUIDKey)
+            defaults.removeObject(forKey: Self.outputNameKey)
+            if let snapshot = try? dependencies.audioDevices.snapshot() {
                 try? await player?.setOutputDevice(
                     snapshot.defaultDevice.objectID
                 )
@@ -382,7 +468,7 @@ final class WrenStore {
     }
 
     func setLaunchAtLogin(_ enabled: Bool) {
-        state.loginItem = loginItem.setEnabled(enabled)
+        state.loginItem = dependencies.loginItem.setEnabled(enabled)
     }
 
     static func resolveAudioOutput(

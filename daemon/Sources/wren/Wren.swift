@@ -75,15 +75,6 @@ struct SpeakOptions: ParsableArguments {
     @Flag(name: .long, help: "Skip markdown stripping.")
     var raw = false
 
-    @Option(name: .long, help: "Playback speed 0.5-3.0.")
-    var speed: Double?
-
-    func validate() throws {
-        if let speed, !(0.5...3.0).contains(speed) {
-            throw ValidationError("--speed must be between 0.5 and 3.0")
-        }
-    }
-
     /// No channel: the server routes CLI speech to the active Mac, which
     /// is the whole point of running `wren say` over SSH.
     func body(append: Bool) throws -> SpeakRequest {
@@ -91,7 +82,6 @@ struct SpeakOptions: ParsableArguments {
             text: try SpeakInput.resolve(arguments: text),
             append: append,
             raw: raw ? true : nil,
-            speed: speed,
             channel: nil
         )
     }
@@ -345,10 +335,7 @@ struct Effects: ParsableCommand {
 
     func run() throws {
         let client = options.client()
-        let update = SettingsUpdateRequest(
-            effects: setting == .on,
-            defaultRate: nil
-        )
+        let update = SettingsUpdateRequest(effects: setting == .on)
         let res = try request { try await client.updateSettings(update) }
         print(res.effects == true ? "effects on" : "effects off")
     }

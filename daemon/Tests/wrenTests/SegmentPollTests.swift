@@ -52,15 +52,6 @@ final class SegmentPollTests: XCTestCase {
         XCTAssertFalse(poll.notePlayed(1))
         XCTAssertEqual(poll.played, 3)
     }
-
-    func testResumeNeverRewinds() {
-        var poll = SegmentPoll()
-        _ = poll.handle(status: 200, epoch: 1, seq: 9)
-        _ = poll.notePlayed(9)
-        poll.resume(fromPlayed: 4)
-        XCTAssertEqual(poll.after, 9)
-        XCTAssertEqual(poll.played, 9)
-    }
 }
 
 final class SegmentPollChannelTests: XCTestCase {

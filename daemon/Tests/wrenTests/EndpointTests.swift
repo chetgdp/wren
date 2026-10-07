@@ -139,11 +139,10 @@ final class Counter: @unchecked Sendable {
 
 final class CLITests: XCTestCase {
     func testSayAndYellSendNoChannel() throws {
-        let say = try Say.parse(["hello", "there", "--speed", "1.5"])
+        let say = try Say.parse(["hello", "there"])
         let body = try say.speak.body(append: true)
         XCTAssertEqual(body.text, "hello there")
         XCTAssertEqual(body.append, true)
-        XCTAssertEqual(body.speed, 1.5)
         XCTAssertNil(body.channel)
 
         let yell = try Yell.parse(["now", "--raw"])
@@ -153,9 +152,6 @@ final class CLITests: XCTestCase {
         XCTAssertNil(loud.channel)
     }
 
-    func testSpeedOutOfRangeRejected() {
-        XCTAssertThrowsError(try Say.parse(["x", "--speed", "4"]))
-    }
 
     func testStopAllFlag() throws {
         XCTAssertTrue(try Stop.parse(["--all"]).all)

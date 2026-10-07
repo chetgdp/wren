@@ -63,7 +63,7 @@ first use (speak, segment poll, claim) and removed after 600 s with no use.
 ### `POST /speak`
 
 ```json
-{"text": "Hello.", "channel": "mac-air", "append": false, "speed": 1.2, "raw": false}
+{"text": "Hello.", "channel": "mac-air", "append": false, "raw": false}
 ```
 
 or with blocks instead of `text`:
@@ -77,7 +77,6 @@ or with blocks instead of `text`:
 - `channel` optional; default is the active client.
 - `append` true queues after current speech; false (default) replaces the
   channel's queue.
-- `speed` optional, 0.5 to 3.0; default is the `default_rate` setting.
 - `raw` true skips markdown sanitizing.
 
 Response `200 {"queued": 2, "channel": "extension"}`. `queued` is 0 when
@@ -147,7 +146,7 @@ characters. Response `{"active": "mac-air"}`.
 ```json
 {
   "ready": true, "backend": "qwentts", "model": "...",
-  "active_voice": "c3po_god", "effects": false, "default_rate": 1.4,
+  "active_voice": "c3po_god", "effects": false,
   "active_client": {"channel": "mac-pq9", "label": "pq9.local"},
   "channels": {
     "mac-pq9": {"speaking": false, "paused": false, "pending": 0,
@@ -199,8 +198,7 @@ Response `{"ok": true}`. 409 `voice_active` for the active voice.
 
 ### `PATCH /settings`
 
-`{"effects": true, "default_rate": 1.2}`; both optional, unknown keys are
-400. `default_rate` 0.5 to 3.0. Saved to disk. Response: the `/state` body.
+`{"effects": true}`; unknown keys are 400. Saved to disk. Response: the `/state` body.
 
 ## Storage
 
@@ -209,4 +207,4 @@ Linux `~/.local/share/wren`):
 
 - `voices/<id>/profile.json` (`{"id", "display_name"}`), `reference.wav`,
   `transcript.txt`
-- `settings.json`: `{"active_voice", "effects", "default_rate"}`
+- `settings.json`: `{"active_voice", "effects"}`

@@ -40,12 +40,32 @@ struct WrenMenuModel: Equatable {
         let target: OutputTarget
         let title: String
         let isChecked: Bool
+        let isEnabled: Bool
+
+        init(
+            target: OutputTarget,
+            title: String,
+            isChecked: Bool,
+            isEnabled: Bool = true
+        ) {
+            self.target = target
+            self.title = title
+            self.isChecked = isChecked
+            self.isEnabled = isEnabled
+        }
     }
 
     struct Login: Equatable {
         let isOn: Bool
         let isEnabled: Bool
         let error: String?
+    }
+
+    struct LocalServer: Equatable {
+        let isOn: Bool
+        let isEnabled: Bool
+        let detail: String?
+        let tone: Tone
     }
 
     /// The parts that require adding or removing menu items. When only
@@ -68,7 +88,7 @@ struct WrenMenuModel: Equatable {
     let outputBadge: String
     let isPaused: Bool
     let login: Login
-
+    let localServer: LocalServer
     var structure: Structure {
         Structure(
             voiceIDs: voices.map(\.id),
@@ -79,7 +99,7 @@ struct WrenMenuModel: Equatable {
     init(state: AppState) {
         isConnected = state.status == .connected
         status = Self.status(state)
-        clientTitle = SettingsViewModel.activeClientText(state)
+        clientTitle = SettingsModel.activeClientText(state)
         // Offering "Play here" only makes sense once the server answers.
         showsPlayHere = isConnected && !state.isPlayingHere
 
@@ -96,26 +116,47 @@ struct WrenMenuModel: Equatable {
         isPaused = state.localPlayer.isPaused
 
         let desired = state.audioOutput.desiredUID
-        outputChoices = [
+        let knownUIDs = Set(state.audioOutput.devices.map(\.uid))
+        let missingDesired = desired.flatMap { uid in
+            knownUIDs.contains(uid) ? nil : uid
+        }
+
+        var choices: [OutputChoice] = [
             OutputChoice(
                 target: .systemDefault,
                 title: "System Default",
-                isChecked: desired == nil
+                isChecked: desired == nil || missingDesired != nil
             ),
-        ] + state.audioOutput.devices.map { device in
+        ]
+        choices += state.audioOutput.devices.map { device in
             OutputChoice(
                 target: .device(device),
                 title: device.name,
                 isChecked: device.uid == desired
             )
         }
+        if let missingUID = missingDesired {
+            let missingName = state.audioOutput.desiredName
+                ?? "Missing Device"
+            let missingDevice = AudioOutputDevice(
+                uid: missingUID,
+                name: "\(missingName) (Unavailable)"
+            )
+            choices.append(OutputChoice(
+                target: .device(missingDevice),
+                title: "\(missingName) (Unavailable)",
+                isChecked: false,
+                isEnabled: false
+            ))
+        }
+        outputChoices = choices
         outputBadge = state.audioOutput.effectiveDevice?.name ?? "Default"
-
         login = Login(
             isOn: state.loginItem.isEnabled,
             isEnabled: state.loginItem.isAvailable,
             error: state.loginItem.error
         )
+        localServer = Self.localServer(state)
     }
 
     private static func status(_ state: AppState) -> Status {
@@ -134,6 +175,57 @@ struct WrenMenuModel: Equatable {
             )
         case .unreachable(let message):
             return Status(title: "Unreachable", detail: message, tone: .error)
+        }
+    }
+    private static func localServer(_ state: AppState) -> LocalServer {
+        let serverState = state.localServer
+        let isOn = serverState.isEnabled
+        let isLoopback = ServerSupervisor.isLoopbackHost(state.host)
+
+        switch serverState.status {
+        case .disabled:
+            return LocalServer(
+                isOn: false,
+                isEnabled: isLoopback,
+                detail: nil,
+                tone: .normal
+            )
+        case .unavailable(let reason):
+            return LocalServer(
+                isOn: isOn,
+                isEnabled: isLoopback,
+                detail: reason,
+                tone: .warning
+            )
+        case .external:
+            return LocalServer(
+                isOn: isOn,
+                isEnabled: isLoopback,
+                detail: "Using existing server",
+                tone: .normal
+            )
+        case .starting:
+            return LocalServer(
+                isOn: isOn,
+                isEnabled: isLoopback,
+                detail: "Loading model…",
+                tone: .normal
+            )
+        case .running:
+            return LocalServer(
+                isOn: isOn,
+                isEnabled: isLoopback,
+                detail: "Running",
+                tone: .normal
+            )
+        case .crashed(let reason, let retryIn):
+            let seconds = Int(retryIn.rounded())
+            return LocalServer(
+                isOn: isOn,
+                isEnabled: isLoopback,
+                detail: "Crashed: \(reason), retrying in \(seconds)s",
+                tone: .error
+            )
         }
     }
 }
