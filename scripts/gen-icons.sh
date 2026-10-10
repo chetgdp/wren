@@ -1,12 +1,12 @@
 #!/bin/sh
-# Render assets/logo.svg into every asset the app bundle needs.
+# Render assets/appicon.svg into every asset the app bundle needs.
 # Currently that is AppIcon.icns (all ten macOS iconset sizes). The icns is
 # committed so bundle.sh works on machines without resvg; re-run this after
 # swapping the logo.
 set -e
 cd "$(dirname "$0")/.."
 
-SVG="assets/logo.svg"
+SVG="assets/appicon.svg"
 OUT="assets/generated"
 ICONSET="$OUT/AppIcon.iconset"
 

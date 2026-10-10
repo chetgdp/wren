@@ -353,6 +353,7 @@ final class WrenMenuBar: NSObject {
               let image = NSImage(data: data)
         else { return nil }
         image.size = NSSize(width: 16, height: 16)
+        image.isTemplate = true
         return image
     }
 }
