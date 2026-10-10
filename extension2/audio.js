@@ -5,19 +5,19 @@ import {
 let state = {
   ctx: null, base: '', running: false,
   rate: 1.0, lastSeq: -1, lastEpoch: -1,
-  playedSeq: -1, pollAbort: null, nextTime: 0,
+  playedSeq: -1, pollAbort: null, pollWaiting: false, nextTime: 0,
   scheduled: [], reportTimer: null,
-  onPosition: null, onCursor: null,
+  onPosition: null, onCursor: null, master: null, paused: false,
 };
 
 function clampRate(r) {
   return Math.max(0.5, Math.min(3.0,
-    Math.round(r * 4) / 4));
+    Math.round(r * 20) / 20));
 }
 
 function makeSource(buf, when, offset, rate) {
   const gain = state.ctx.createGain();
-  gain.connect(state.ctx.destination);
+  gain.connect(state.master);
   const src = state.ctx.createBufferSource();
   src.buffer = buf;
   src.playbackRate.value = rate;
@@ -131,6 +131,10 @@ export function flush() {
 function notePlayed(seq) {
   state.playedSeq = seq;
   emitCursor();
+  // The server learns `played` only when a poll starts; restart a poll
+  // still waiting for headers so relative seeks see the current position.
+  // Aborting mid-body would lose a segment whose seq is already recorded.
+  if (state.pollWaiting) state.pollAbort?.abort();
 }
 
 function emitCursor() {
@@ -152,9 +156,13 @@ async function loop() {
       + `&played=${state.playedSeq}`
       + `&timeout=20`;
     try {
-      const res = await fetch(url, {
-        signal: ac.signal,
-      });
+      state.pollWaiting = true;
+      let res;
+      try {
+        res = await fetch(url, { signal: ac.signal });
+      } finally {
+        state.pollWaiting = false;
+      }
       if (!state.running) break;
       if (res.status === 204) continue;
       if (!res.ok) {
@@ -219,7 +227,7 @@ function report() {
     state.onPosition({
       block: cur?.block ?? null,
       playing: !!cur,
-      paused: state.ctx.state === 'suspended',
+      paused: state.paused,
       rate: state.rate,
       epoch: state.lastEpoch,
     });
@@ -232,7 +240,7 @@ function report() {
       state.onPosition({
         block: null,
         playing: false,
-        paused: state.ctx.state === 'suspended',
+        paused: state.paused,
         rate: state.rate,
         epoch: state.lastEpoch,
       });
@@ -244,6 +252,7 @@ function internalSetRate(target) {
   const newRate = clampRate(target);
   if (newRate === state.rate) return;
   state.rate = newRate;
+  if (!state.ctx) return;
 
   const now = state.ctx.currentTime;
   const live = state.scheduled.filter(
@@ -314,10 +323,17 @@ export async function start(opts) {
   }
   state.onPosition = opts.onPosition || null;
   state.onCursor = opts.onCursor || null;
-  if (!state.ctx) state.ctx = new AudioContext();
+  if (!state.ctx) {
+    state.ctx = new AudioContext();
+    state.master = state.ctx.createGain();
+    state.master.connect(state.ctx.destination);
+  }
   if (opts.flush) flush();
-  if (state.ctx.state === 'suspended')
+  if (state.ctx.state === 'suspended') {
+    state.paused = false;
+    state.master.gain.value = 1;
     await state.ctx.resume();
+  }
   if (!state.running) {
     state.running = true;
     loop();
@@ -336,19 +352,22 @@ export function stop() {
 
 export async function toggle() {
   if (!state.ctx) return { paused: true, block: -1 };
-  if (state.ctx.state === 'suspended') {
-    await state.ctx.resume();
-  } else {
+  // ctx.state lags a pending suspend/resume, so a quick second press
+  // would read the old state; track the intent instead.
+  state.paused = !state.paused;
+  const now = state.ctx.currentTime;
+  const cur = state.scheduled.find(
+    s => !s.stopped && s.start <= now && s.end > now);
+  if (state.paused) {
+    // suspend() can take a noticeable while to stop output; the gain
+    // change applies on the next render quantum.
+    state.master.gain.setValueAtTime(0, now);
     await state.ctx.suspend();
+  } else {
+    await state.ctx.resume();
+    state.master.gain.setValueAtTime(1, state.ctx.currentTime);
   }
-  const cur = state.scheduled.find(s => {
-    const now = state.ctx.currentTime;
-    return !s.stopped && s.start <= now && s.end > now;
-  });
-  return {
-    paused: state.ctx.state === 'suspended',
-    block: cur?.block ?? null,
-  };
+  return { paused: state.paused, block: cur?.block ?? null };
 }
 
 export function setRate({ value, delta }) {
@@ -356,5 +375,7 @@ export function setRate({ value, delta }) {
     ? value
     : state.rate + (delta || 0);
   internalSetRate(target);
+  // While idle no report timer runs, so the UI would never hear about it.
+  if (state.ctx) report();
   return { rate: state.rate };
 }

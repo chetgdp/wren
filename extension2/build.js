@@ -59,3 +59,13 @@ console.log(
   `chrome: ${cLoc} files -> ${chromeDir}\n` +
   `firefox: ${fLoc} files -> ${ffDir}`
 );
+
+const { execFileSync } = require("child_process");
+for (const [dir, name] of [[chromeDir, "wren_chrome.zip"],
+                           [ffDir, "wren_firefox.zip"]]) {
+  const out = path.join(SRC, name);
+  // zip appends to an existing archive, keeping files dropped from dist.
+  fs.rmSync(out, { force: true });
+  execFileSync("zip", ["-qr", out, "."], { cwd: dir });
+  console.log(`zip: ${out}`);
+}

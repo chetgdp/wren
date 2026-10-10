@@ -518,3 +518,164 @@ def test_channel_gc_clears_active(server):
     mgr.gc(now=time.monotonic() + serve.CHANNEL_GC_SECONDS + 1)
     assert server.get("/health")["active_client"] is None
     assert "gone" not in server.get("/state")["channels"]
+
+
+def test_segment_store_position_transitions(tmp_path):
+    from speaker import SegmentStore
+
+    clip = tmp_path / "clip.wav"
+    with wave.open(str(clip), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(24000)
+        w.writeframes(b"\0\0" * 2400)
+
+    store = SegmentStore()
+    # 4 segments with blocks (0, 0), (1, 1), (2, 3), (4, 4)
+    blocks = [(0, 0), (1, 1), (2, 3), (4, 4)]
+    for b in blocks:
+        store.submit(clip, b)
+
+    # None before any report
+    assert store.position() is None
+
+    # Never-reported client fetching segments still gets None
+    store.next_after(0, 0)
+    assert store.position() is None
+
+    # Report played 1: next segment (seq 2, block (1,1)) is playing if fetched
+    store.next_after(1, 0)  # fetches seq 2
+    store.report_played(1)
+    assert store.position() == 1
+
+    # Report played 2: next segment (seq 3, block (2,3)) is playing if fetched
+    store.next_after(2, 0)  # fetches seq 3
+    store.report_played(2)
+    assert store.position() == 2
+
+    # Report all played: nothing buffered left, falls back to _played_block lo
+    store.next_after(3, 0)  # fetches seq 4
+    store.report_played(4)
+    assert store.position() == 4
+
+    # Invalidate clears position
+    store.invalidate()
+    assert store.position() is None
+
+    # Stale reports pre-dating invalidate are ignored
+    store.report_played(4)
+    assert store.position() is None
+
+    # Segment with block None is skipped in position resolution
+    store.submit(clip, None)
+    store.next_after(4, 0)
+    # Force epoch advancement report
+    store.report_played(5)
+    assert store.position() is None
+
+
+def test_seek_relative_to_playback(server):
+    ch = "relseek"
+    blocks = [f"Block {i}." for i in range(5)]
+    _, body = server.post("/speak", {"blocks": blocks, "channel": ch})
+    assert body["queued"] == 5
+
+    # Fetch the first segment; determine its block range
+    status, headers, _ = server.segment(ch, after=0)
+    assert status == 200
+    seq1 = int(headers["X-Seq"])
+    lo1, _ = [int(x) for x in headers["X-Block"].split(",")]
+
+    # Fetch second segment while reporting seq1 played
+    status, headers, _ = server.segment(ch, after=seq1, played=seq1)
+    assert status == 200
+    seq2 = int(headers["X-Seq"])
+    lo2, _ = [int(x) for x in headers["X-Block"].split(",")]
+
+    # Playing segment is seq2; delta +1 must be relative to lo2
+    status, body = server.post("/seek", {"delta": 1, "channel": ch})
+    assert status == 200
+    expected_target = min(lo2 + 1, 4)
+    assert body["block"] == expected_target
+
+    # Next segment after seek should start at or cover the seek target
+    status, headers, _ = server.segment(ch, after=0)
+    assert status == 200
+    new_lo, _ = [int(x) for x in headers["X-Block"].split(",")]
+    assert new_lo == expected_target
+
+    # Seek delta -1 relative to the new playback
+    new_seq = int(headers["X-Seq"])
+    # Fetch another segment or report played
+    status, headers2, _ = server.segment(ch, after=new_seq, played=new_seq)
+    if status == 200:
+        playing_lo = int(headers2["X-Block"].split(",")[0])
+    else:
+        playing_lo = new_lo
+    status, body = server.post("/seek", {"delta": -1, "channel": ch})
+    assert status == 200
+    assert body["block"] == max(0, playing_lo - 1)
+
+
+def test_seek_clamping(server):
+    ch = "clampseek"
+    blocks = ["Zero.", "One.", "Two."]
+    server.post("/speak", {"blocks": blocks, "channel": ch})
+
+    status, headers, _ = server.segment(ch, after=0)
+    assert status == 200
+    seq1 = int(headers["X-Seq"])
+    # Fetch seq2 and report seq1 played
+    server.segment(ch, after=seq1, played=seq1)
+
+    # Huge negative delta clamps to 0
+    status, body = server.post("/seek", {"delta": -50, "channel": ch})
+    assert status == 200
+    assert body["block"] == 0
+
+    # Huge positive delta clamps to max block (2)
+    status, body = server.post("/seek", {"delta": 50, "channel": ch})
+    assert status == 200
+    assert body["block"] == 2
+
+
+def test_seek_chaining_without_playback(server):
+    ch = "chainseek"
+    blocks = ["Zero.", "One.", "Two.", "Three.", "Four."]
+    server.post("/speak", {"blocks": blocks, "channel": ch})
+
+    # Without playback reports, first seek delta=1 targets lo + 1 = 1
+    status, body = server.post("/seek", {"delta": 1, "channel": ch})
+    assert status == 200
+    assert body["block"] == 1
+
+    # Second seek without playback reports chains from last seek target: 1 + 1 = 2
+    status, body = server.post("/seek", {"delta": 1, "channel": ch})
+    assert status == 200
+    assert body["block"] == 2
+
+
+def test_seek_playback_overrides_older_seek_target(server):
+    ch = "overrideseek"
+    blocks = ["Zero.", "One.", "Two.", "Three.", "Four."]
+    server.post("/speak", {"blocks": blocks, "channel": ch})
+
+    # Absolute seek to block 4
+    status, body = server.post("/seek", {"block": 4, "channel": ch})
+    assert status == 200
+    assert body["block"] == 4
+
+    # Client plays the segment produced by the seek (target was 4)
+    status, headers, _ = server.segment(ch, after=0)
+    assert status == 200
+    seq = int(headers["X-Seq"])
+    played_lo = int(headers["X-Block"].split(",")[0])
+    assert played_lo == 4
+
+    # Report played for this segment
+    server.segment(ch, after=seq, played=seq, timeout=0.1)
+
+    # Now delta -1 should step from current playback (4 - 1 = 3)
+    status, body = server.post("/seek", {"delta": -1, "channel": ch})
+    assert status == 200
+    assert body["block"] == 3

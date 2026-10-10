@@ -52,6 +52,9 @@ async function ensureOffscreen() {
 }
 
 function sendPosition(pos) {
+  // The player owns the rate; persisting here covers every input path.
+  if (cfg && pos.rate != null && pos.rate !== cfg.rate)
+    chrome.storage.sync.set({rate: pos.rate});
   if (speakTabId)
     chrome.tabs.sendMessage(speakTabId,
       {cmd: 'position', ...pos}).catch(() => {});

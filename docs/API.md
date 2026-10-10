@@ -95,6 +95,7 @@ sanitizing leaves no text. 503 `not_ready` if the engine cannot speak.
 
 `{"delta": -1}` moves by blocks (non-zero integer, default 1), or
 `{"block": 4}` jumps to a block index. `channel` optional.
+`delta` is relative to the block being played (from `played` reports), falling back to the last seek target.
 Response `{"ok": true, "block": 4}` or `{"ok": false, "error": "nothing to seek"}`.
 
 ### `GET /segment`

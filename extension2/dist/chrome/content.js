@@ -70,7 +70,7 @@ function extractReadable() {
 let hl = {
   elements: [], sentences: [], rangeCache: new Map(),
   currentBlock: 0, lit: [], selectedKey: null,
-  seekSeq: 0, latestEpoch: null
+  seekSeq: 0, latestEpoch: null, seekHoldEpoch: null
 };
 
 const HL_NAME = "voice-ml-sentence";
@@ -100,6 +100,7 @@ function clearHighlight() {
   hl.rangeCache = new Map();
   hl.currentBlock = 0;
   hl.latestEpoch = null;
+  hl.seekHoldEpoch = null;
 }
 
 // invalidate range cache on DOM mutation
@@ -219,7 +220,6 @@ function highlight(range, instant) {
 
 let overlayEl = null;
 let pollTimer = null;
-let rateSaveTimer = null;
 
 function injectOverlay() {
   if (window.__voiceMlOverlay) {
@@ -249,14 +249,17 @@ function injectOverlay() {
     button:hover{color:#fff}
     .rate{min-width:36px;text-align:center}
     svg{width:14px;height:14px;fill:currentColor}
+    .spin{display:inline-block;width:10px;height:10px;
+      border:2px solid #666;border-top-color:#ddd;border-radius:50%;
+      animation:vm-spin .8s linear infinite}
+    @keyframes vm-spin{to{transform:rotate(360deg)}}
   `;
   shadow.appendChild(style);
 
   const root = document.createElement("div");
   root.className = "root";
 
-  const status = document.createElement("span");
-  status.textContent = "▶";
+  const spinnerHtml = `<span class="spin" title="loading speech"></span>`;
 
   const rateDown = document.createElement("button");
   rateDown.textContent = "−";
@@ -287,23 +290,24 @@ function injectOverlay() {
     `<rect x="5" y="5" width="14" height="14"/></svg>`;
   stopBtn.onclick = () => api.stop();
 
-  root.append(
-    status, rateDown, rateSpan, rateUp, pauseBtn, stopBtn
-  );
+  root.append(rateDown, rateSpan, rateUp, pauseBtn, stopBtn);
   shadow.appendChild(root);
   document.body.appendChild(overlayEl);
 
   let idlePolls = 0;
 
+  let shown = "pause";
   function updateDisplay() {
     const cs = window.__voiceMlClientState;
-    if (cs.paused) {
-      status.textContent = "⏸";
-      pauseBtn.innerHTML = playSvg;
-    } else if (cs.playing) {
-      status.textContent = "▶";
-      pauseBtn.innerHTML = pauseSvg;
-    }
+    if (cs.rate != null) rateSpan.textContent = cs.rate.toFixed(2) + "×";
+    // The button shows the action it performs, or a spinner while
+    // speech for a new position is still being synthesized.
+    const want = hl.seekHoldEpoch != null ? "load"
+      : cs.paused ? "play" : "pause";
+    if (want === shown) return;
+    shown = want;
+    pauseBtn.innerHTML = want === "load" ? spinnerHtml
+      : want === "play" ? playSvg : pauseSvg;
   }
 
   function poll() {
@@ -337,11 +341,17 @@ function injectOverlay() {
   const api = {
     reset() { idlePolls = 0; },
     poll,
+    updateDisplay,
     togglePause() {
-      chrome.runtime.sendMessage({ cmd: "player-toggle" });
       const cs = window.__voiceMlClientState;
       cs.paused = !cs.paused;
+      hl.togglePending = true;
       updateDisplay();
+      chrome.runtime.sendMessage({ cmd: "player-toggle" }, r => {
+        hl.togglePending = false;
+        if (r?.paused != null) cs.paused = r.paused;
+        updateDisplay();
+      });
     },
     stop() {
       chrome.runtime.sendMessage(
@@ -351,17 +361,8 @@ function injectOverlay() {
       removeOverlay();
     },
     rateDelta(dir) {
-      const delta = dir * 0.25;
       chrome.runtime.sendMessage(
-        { cmd: "player", action: "rate", delta },
-        resp => {
-          if (resp?.rate == null) return;
-          rateSpan.textContent = resp.rate.toFixed(2) + "×";
-          clearTimeout(rateSaveTimer);
-          rateSaveTimer = setTimeout(() => {
-            chrome.storage.sync.set({ rate: resp.rate });
-          }, 500);
-        }
+        { cmd: "player", action: "rate", delta: dir * 0.05 }
       );
     }
   };
@@ -406,32 +407,54 @@ function readPage(fromSelection) {
   }
   hl.elements = sentElements;
   hl.sentences = sentences;
+  hl.currentBlock = 0;
+  hl.seekHoldEpoch = hl.latestEpoch ?? -1;
   injectOverlay();
   window.__voiceMlClientState.playing = true;
+  window.__voiceMlOverlay?.updateDisplay();
   chrome.runtime.sendMessage(
     { path: '/speak', body: { blocks: sentences } }
-  );
+  ).then(r => { if (r?.error) endLoading(); }, endLoading);
+}
+
+function endLoading() {
+  hl.seekHoldEpoch = null;
+  window.__voiceMlOverlay?.updateDisplay();
 }
 
 let seekSequence = 0;
-async function seek(body) {
+async function seek(block) {
   const seq = ++seekSequence;
-  const r = await chrome.runtime.sendMessage(
-    { path: '/seek', body });
-  if (seq !== seekSequence || !r?.ok) return;
+  // Move the highlight and silence old audio now; the voice follows when
+  // the server has synthesized from the new block.
+  hl.seekHoldEpoch ??= hl.latestEpoch ?? -1;
+  highlight([block, block], true);
+  window.__voiceMlOverlay?.updateDisplay();
   chrome.runtime.sendMessage(
     { cmd: 'player', action: 'flush' }).catch(() => {});
-  if (r.block != null)
-    highlight([r.block, r.block], true);
+  const r = await chrome.runtime.sendMessage(
+    { path: '/seek', body: { block } }).catch(() => null);
+  if (seq !== seekSequence) return;
+  if (!r?.ok) {
+    endLoading();
+    return;
+  }
   window.__voiceMlOverlay?.poll();
+}
+
+function seekBase() {
+  return Math.min(Math.max(hl.currentBlock, 0), hl.elements.length - 1);
+}
+
+function sentenceSeek(dir) {
+  if (!hl.elements.length) return;
+  seek(Math.min(Math.max(seekBase() + dir, 0),
+    hl.elements.length - 1));
 }
 
 function paragraphSeek(dir) {
   if (!hl.elements.length) return;
-  const cur = Math.min(
-    Math.max(hl.currentBlock, 0),
-    hl.elements.length - 1
-  );
+  const cur = seekBase();
   const el = hl.elements[cur];
   let target = null;
   if (dir > 0) {
@@ -452,11 +475,11 @@ function paragraphSeek(dir) {
         target--;
     }
   }
-  seek({ block: target });
+  seek(target);
 }
 
 document.addEventListener("keydown", e => {
-  const t = e.target;
+  const t = e.composedPath()[0] || e.target;
   if (t.isContentEditable
       || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))
     return;
@@ -489,11 +512,11 @@ document.addEventListener("keydown", e => {
       break;
     case "j":
       e.preventDefault();
-      seek({ delta: -1 });
+      sentenceSeek(-1);
       break;
     case "k":
       e.preventDefault();
-      seek({ delta: 1 });
+      sentenceSeek(1);
       break;
     case "J":
       e.preventDefault();
@@ -527,11 +550,17 @@ chrome.runtime.onMessage.addListener((msg, _, reply) => {
     }
     window.__voiceMlClientState = {
       playing: msg.playing,
-      paused: msg.paused,
+      // A position sent before the toggle landed would flip the button back.
+      paused: hl.togglePending
+        ? window.__voiceMlClientState.paused : msg.paused,
       rate: msg.rate,
       epoch,
     };
-    if (msg.block) highlight(msg.block);
+    const held = hl.seekHoldEpoch != null
+      && (epoch == null || epoch <= hl.seekHoldEpoch);
+    if (!held) hl.seekHoldEpoch = null;
+    window.__voiceMlOverlay?.updateDisplay();
+    if (!held && msg.block) highlight(msg.block);
   } else if (msg.cmd === 'inject-overlay') {
     injectOverlay();
     reply({ ok: true });

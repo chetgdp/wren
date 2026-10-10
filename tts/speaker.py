@@ -68,7 +68,7 @@ class SegmentStore:
         self._played = 0
         self._epoch_base = 0
         self._durations = {}
-
+        self._played_block = None
     def submit(self, path, block):
         seconds = wav_seconds(path)
         with open(path, "rb") as f:
@@ -95,6 +95,7 @@ class SegmentStore:
             self._epoch_base = self._seq
             self._played = self._seq
             self._durations.clear()
+            self._played_block = None
             self._cond.notify_all()
 
     def report_played(self, seq):
@@ -108,12 +109,17 @@ class SegmentStore:
             # Played clips are never re-fetched within an epoch; keeping
             # them would replay them to a restarted client and hold memory
             # until the byte cap.
+            last_dropped_block = None
             kept = []
             for entry in self._segments:
                 if entry[0] <= seq:
                     self._bytes -= len(entry[2])
+                    if entry[1] is not None:
+                        last_dropped_block = entry[1]
                 else:
                     kept.append(entry)
+            if last_dropped_block is not None:
+                self._played_block = last_dropped_block
             self._segments = kept
 
     def unplayed(self):
@@ -125,6 +131,25 @@ class SegmentStore:
     def unfetched(self):
         with self._cond:
             return sum(1 for s, _, _ in self._segments if s > self._fetched)
+
+
+    def position(self):
+        """Block lo index of the segment currently playing (played+1 if
+        buffered and fetched), or the last played segment if all fetched
+        audio finished. Returns None when the client has never reported
+        playback this epoch or when blocks are unindexed."""
+        with self._cond:
+            if self._played > self._epoch_base:
+                target_seq = self._played + 1
+                if target_seq <= self._fetched:
+                    for s, block, _ in self._segments:
+                        if s == target_seq:
+                            if block is not None:
+                                return block[0]
+                            break
+                if self._played_block is not None:
+                    return self._played_block[0]
+            return None
 
     def next_after(self, seq, timeout):
         """First buffered segment with seq > the given one, waiting up to
@@ -507,7 +532,7 @@ class Speaker:
         self._play_q = queue.Queue()
         self._blocks = None  # last blocks-speak, kept for /seek
         self._blocks_snapshot = None
-        self._last_played = None
+        self._seek_target = None
         self._counter = 0
         self._last_synth_epoch = -1
         # Worker-owned: parked batch, an item rescued mid-coalesce, and the
@@ -570,11 +595,12 @@ class Speaker:
         self.store.invalidate()
         # A paused channel would otherwise sit on the new audio.
         self._pause.clear()
-        self._last_played = None
+        self._seek_target = None
 
     def seek(self, delta=None, target=None):
         """Jump within the last blocks-speak by preempting and requeueing
-        from the target: delta blocks relative to the last seek/landing, or
+        from the target: delta blocks relative to the playing block
+        (falling back to the last seek target, then first block), or
         an absolute block index. Returns the clamped landing index, or None
         when there is nothing seekable (plain-text speech)."""
         with self._lock:
@@ -583,7 +609,9 @@ class Speaker:
                 return None
             lo, hi = blocks[0][0], blocks[-1][0]
             if target is None:
-                cur = self._last_played if self._last_played is not None else lo
+                cur = self.store.position()
+                if cur is None:
+                    cur = self._seek_target if self._seek_target is not None else lo
                 target = cur + delta
             target = min(max(lo, target), hi)
             snapshot = self._blocks_snapshot
@@ -594,8 +622,8 @@ class Speaker:
             self._preempt_locked()
             for idx, chunk in chunks:
                 self._synth_q.put(_QueueItem(self._epoch, idx, chunk, lease))
-            # The base for a follow-up relative seek.
-            self._last_played = target
+            # The fallback base for follow-up relative seeks before new playback.
+            self._seek_target = target
         self._worker.wake()
         return target
 
