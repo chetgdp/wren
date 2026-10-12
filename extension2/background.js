@@ -14,11 +14,23 @@ chrome.storage.onChanged.addListener((ch, area) => {
 
 const CH = ["/speak","/stop","/pause","/resume","/seek"];
 
+// Browsers sharing one server channel each play every segment, so two
+// installed browsers echoed each other.
+let channelId = null;
+function channel() {
+  return channelId ??= chrome.storage.local.get("channel").then(v => {
+    if (v.channel) return v.channel;
+    const id = "ext-" + crypto.randomUUID().slice(0, 8);
+    chrome.storage.local.set({channel: id});
+    return id;
+  });
+}
+
 async function call(path, body) {
   const c = await config();
   const isGet = path === '/health';
   if (!isGet && CH.includes(path))
-    body = {channel: 'extension', ...body};
+    body = {channel: await channel(), ...body};
   const opts = {method: isGet ? 'GET' : 'POST'};
   if (!isGet && body)
     opts.body = JSON.stringify(body);
@@ -69,11 +81,11 @@ async function ensureClientPlayback(flush) {
   if (IS_CHROME) {
     await ensureOffscreen();
     chrome.runtime.sendMessage({cmd: "player",
-      action: "start", base: c.base,
+      action: "start", base: c.base, channel: await channel(),
       rate: c.rate, flush, cursor});
   } else {
     if (!audioModule) audioModule = await import("./audio.js");
-    audioModule.start({base: c.base,
+    audioModule.start({base: c.base, channel: await channel(),
       rate: c.rate, flush, cursor,
       onPosition: sendPosition, onCursor});
   }
@@ -184,6 +196,7 @@ chrome.runtime.onMessage.addListener(
       (async () => {
         try {
           const res = await call(msg.path, msg.body);
+          if (msg.path === '/health') res.channel = await channel();
           if (msg.path === '/speak')
             afterSpeak(res, sender.tab?.id,
               !!msg.body?.append);

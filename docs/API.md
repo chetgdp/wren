@@ -50,8 +50,9 @@ Every error is the HTTP status plus:
 A channel is one playback queue, named `[a-z0-9_-]{1,32}`. It is created on
 first use (speak, segment poll, claim) and removed after 600 s with no use.
 
-- Each client uses its own channel: Wren.app uses `mac-<hostname>`, the
-  browser extension uses `extension`.
+- Each client uses its own channel: Wren.app uses `mac-<hostname>`, each
+  browser running the extension uses a random `ext-<8 hex>` kept in its
+  local storage.
 - The server keeps one **active client**. Playback requests without a
   `channel` go to it. With no active client they fail with 409
   `no_active_client`.
@@ -69,7 +70,7 @@ first use (speak, segment poll, claim) and removed after 600 s with no use.
 or with blocks instead of `text`:
 
 ```json
-{"blocks": ["First sentence.", "Second sentence."], "channel": "extension"}
+{"blocks": ["First sentence.", "Second sentence."], "channel": "ext-3f9a1c2b"}
 ```
 
 - `text` (string) or `blocks` (list of strings). Blocks keep their index;
@@ -79,7 +80,7 @@ or with blocks instead of `text`:
   channel's queue.
 - `raw` true skips markdown sanitizing.
 
-Response `200 {"queued": 2, "channel": "extension"}`. `queued` is 0 when
+Response `200 {"queued": 2, "channel": "ext-3f9a1c2b"}`. `queued` is 0 when
 sanitizing leaves no text. 503 `not_ready` if the engine cannot speak.
 
 ### `POST /stop`

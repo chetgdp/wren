@@ -3,7 +3,7 @@ import {
 } from './soundtouch.js';
 
 let state = {
-  ctx: null, base: '', running: false,
+  ctx: null, base: '', channel: '', running: false,
   rate: 1.0, lastSeq: -1, lastEpoch: -1,
   playedSeq: -1, pollAbort: null, pollWaiting: false, nextTime: 0,
   scheduled: [], reportTimer: null,
@@ -151,7 +151,7 @@ async function loop() {
     const ac = new AbortController();
     state.pollAbort = ac;
     const url = `${state.base}/segment`
-      + `?channel=extension`
+      + `?channel=${state.channel}`
       + `&after=${state.lastSeq}`
       + `&played=${state.playedSeq}`
       + `&timeout=20`;
@@ -313,6 +313,7 @@ function internalSetRate(target) {
 
 export async function start(opts) {
   state.base = opts.base;
+  if (opts.channel) state.channel = opts.channel;
   if (opts.rate != null)
     state.rate = clampRate(opts.rate);
   if (opts.cursor) {

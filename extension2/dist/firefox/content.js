@@ -315,7 +315,7 @@ function injectOverlay() {
       { path: "/health" },
       resp => {
         if (chrome.runtime.lastError) return;
-        const ch = resp?.channels?.extension;
+        const ch = resp?.channels?.[resp.channel];
         if (!ch || !(ch.active ?? (ch.speaking || ch.pending > 0))) {
           idlePolls++;
           if (idlePolls >= 6) removeOverlay();
@@ -484,6 +484,10 @@ document.addEventListener("keydown", e => {
       || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))
     return;
   if (e.metaKey || e.ctrlKey || e.altKey) return;
+
+  // The overlay lives from read start until stop, so it covers pause and
+  // the gaps between sentences where `playing` reads false.
+  if ("jkJK<>".includes(e.key) && !window.__voiceMlOverlay) return;
 
   switch (e.key) {
     case "i": {
